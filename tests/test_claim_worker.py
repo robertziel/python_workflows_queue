@@ -198,6 +198,33 @@ def test_run_once_returns_false_when_nothing_to_claim():
     assert worker.run_once() is False
 
 
+def test_run_once_parks_input_node_via_outbox_not_module_import():
+    """Regression: an ``__input__`` job must be PARKED by the worker — marked
+    awaiting_input + an ``awaiting_input`` outbox event for NodePool to drain —
+    NOT handed to execute_node, which would ``import`` the sentinel module and
+    die with ModuleNotFoundError. This is the claim→park contract the
+    queue_workflows extraction dropped."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="pick_perspective",
+        node_module="__input__pick_perspective", queue="cpu",
+        inputs={"widget": "choose_one", "target": "perspective"},
+    )
+    worker = claim_worker.ClaimWorker(queue="cpu", host="test-host")
+    # Must NOT raise ModuleNotFoundError; the job is handled (claimed + parked).
+    assert worker.run_once() is True
+    assert node_queue.get_node_job(job_id)["status"] == "awaiting_input"
+    # And it emitted the outbox event NodePool drains → on_node_awaiting_input.
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT kind FROM workflow_dispatch_events "
+            "WHERE run_id = %s AND node_id = %s",
+            (run_id, "pick_perspective"),
+        )
+        kinds = [r["kind"] for r in cur.fetchall()]
+    assert "awaiting_input" in kinds
+
+
 def test_run_once_skips_job_under_cancelled_run():
     run_id = _make_run(status="cancelled")
     job_id = node_queue.enqueue_node_job(

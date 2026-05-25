@@ -444,6 +444,24 @@ class ClaimWorker:
             self.queue, job_id, job.get("node_id"), job.get("required_model"),
         )
 
+        # Input/await nodes carry a sentinel module name (``__input__<widget>``)
+        # and execute NO node module — they park the run for user input. Mirror
+        # the completed/failed OUTBOX pattern in node_executor: in one txn, mark
+        # the job awaiting_input + enqueue an ``awaiting_input`` dispatch event.
+        # NodePool._drain_dispatch_events (which holds the workflow loader) then
+        # calls dispatcher.on_node_awaiting_input to build the input_spec.
+        # Calling the dispatcher directly here would bypass the durable outbox
+        # AND require the loader in every claim-worker process. Without this
+        # guard the worker hands the sentinel to execute_node →
+        # ``import workflows.nodes.__input__*`` → ModuleNotFoundError.
+        if (job.get("node_module") or "").startswith("__input__"):
+            with connection() as conn, conn.cursor() as cur:
+                node_queue.mark_awaiting_input_in_txn(cur, job_id)
+                node_queue.enqueue_dispatch_event_in_txn(
+                    cur, job["run_id"], job["node_id"], "awaiting_input",
+                )
+            return True
+
         # A cancel-watcher feeds cooperative node bodies the run-cancel signal.
         from queue_workflows.cancel_watcher import _start_run_cancel_watcher
         cancel_event = threading.Event()
