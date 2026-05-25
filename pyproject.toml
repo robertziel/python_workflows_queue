@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "queue_workflows"
-version = "0.1.0"
+version = "0.2.0"
 description = "Postgres-as-queue workflow engine (SKIP LOCKED claim, lease reclaim, DAG dispatch, GPU warm-model cache)."
 readme = "README.md"
 requires-python = ">=3.10"
