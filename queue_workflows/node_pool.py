@@ -1,0 +1,400 @@
+"""Node-per-job orchestrator (Postgres-as-queue).
+
+This module owns the *background threads* the orchestrator container runs:
+
+- ``_dispatch_loop`` — periodic sweep that finds freshly-queued ``mode='node'``
+  runs and expands their DAG via :func:`dispatcher.start_run`. Each
+  newly-ready node is INSERTed as a ``workflow_node_jobs`` row; the
+  migration-0006 trigger NOTIFYs a claim worker. The same loop drains the
+  dispatch-event outbox and runs the lease-reclaim sweeps (node-job + ingest).
+- ``InputListener`` — polls ``workflow_input_submissions``; when Rails inserts
+  a user's value for an ``awaiting_input`` node, calls
+  :func:`dispatcher.resume_after_input` to unblock the DAG.
+
+The hw-metrics sampler is NOT run here — it lives in the gpu claim worker.
+
+The actual node bodies run in the ``claim_worker`` loops in the worker
+containers (one process == one worker, ``SELECT … FOR UPDATE SKIP LOCKED``
+claim). On startup the pool reclaims any expired-lease ``running`` rows left by
+a worker that died across the restart (:meth:`_await_recovery`).
+
+The builtin-model registration is an INJECTED hook (plan §2b-4):
+``register_builtins`` is a ``Callable[[], None] | None`` (default None = skip),
+NOT an import of any host's ``builtin_models``. The host's orchestrator passes
+its registrar (or relies on ``config.builtin_model_registrar``).
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import threading
+from typing import Callable
+
+from queue_workflows import dispatcher, input_listener, node_queue, run_store
+from queue_workflows.db import connection
+
+log = logging.getLogger(__name__)
+
+
+# ── Config ────────────────────────────────────────────────────────────────
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def cpu_worker_count() -> int:
+    """Configured CPU-worker count (for the Rails queue snapshot fallback when
+    no worker_heartbeats rows exist yet)."""
+    return _int_env("AI_LEADS_WORKFLOW_CPU_WORKERS", 5)
+
+
+def gpu_worker_count() -> int:
+    return _int_env("AI_LEADS_WORKFLOW_GPU_WORKERS", 1)
+
+
+# ── Pool ──────────────────────────────────────────────────────────────────
+
+
+class NodePool:
+    """Orchestrator background threads + input listener."""
+
+    expand_poll_s: float = 0.5
+
+    def __init__(
+        self,
+        *, cpu_workers: int | None = None, gpu_workers: int | None = None,
+        register_builtins: Callable[[], None] | None = None,
+    ):
+        self._cpu_n = cpu_workers if cpu_workers is not None else cpu_worker_count()
+        self._gpu_n = gpu_workers if gpu_workers is not None else gpu_worker_count()
+        # Injected registrar — Callable run once at start(), or None to skip.
+        # (The plan §2b-4 inversion: the engine never imports a host's
+        # builtin_models; the host passes its registrar here.)
+        self._register_builtins = register_builtins
+        self._dispatch_stop = threading.Event()
+        self._dispatch_thread: threading.Thread | None = None
+        self._input_listener: input_listener.InputListener | None = None
+
+        # Lease-reclaim sweep — re-queues ``running`` rows whose PG lease lapsed
+        # (a dead/wedged worker that stopped renewing). ~5 s cadence
+        # (interval-gated, NOT the 0.5 s dispatch tick).
+        self._reclaim_interval_s: float = float(
+            os.environ.get("AI_LEADS_LEASE_RECLAIM_INTERVAL_S", "5")
+        )
+        self._reclaim_last_run: float = 0.0
+
+        # Ingest-lease reclaim sweep (twin of the node-job reclaim above) —
+        # re-queues ``ingest_jobs`` rows whose lease lapsed. The SOLE recovery
+        # for a dead/wedged fetch/load claim worker. Own ``last_run`` so the two
+        # sweeps don't suppress each other.
+        self._ingest_reclaim_interval_s: float = float(
+            os.environ.get("AI_LEADS_LEASE_RECLAIM_INTERVAL_S", "5")
+        )
+        self._ingest_reclaim_last_run: float = 0.0
+
+    def start(self) -> None:
+        if self._register_builtins is not None:
+            try:
+                self._register_builtins()
+            except Exception:
+                log.exception("[node-pool] builtin model registration failed")
+
+        # Health gate: refuse to start the dispatch thread until the recovery
+        # sweep has reconciled stale ``running`` rows. A hard raise is correct
+        # — the orchestrator's restart policy is the recovery mechanism.
+        self._await_recovery()
+
+        self._dispatch_thread = threading.Thread(
+            target=self._dispatch_loop, daemon=True, name="node-pool-dispatch",
+        )
+        self._dispatch_thread.start()
+
+        # Input listener — polls ``workflow_input_submissions`` and calls
+        # dispatcher.resume_after_input so downstream nodes get enqueued.
+        # Non-fatal on boot failure.
+        try:
+            self._input_listener = input_listener.InputListener()
+            self._input_listener.start()
+        except Exception:
+            log.exception("[node-pool] input_listener failed to start")
+
+        log.info("[node-pool] started (cpu=%d, gpu=%d)", self._cpu_n, self._gpu_n)
+
+    def stop(self) -> None:
+        self._dispatch_stop.set()
+        if self._input_listener is not None:
+            self._input_listener.stop()
+            self._input_listener.join(timeout=2.0)
+            self._input_listener = None
+        if self._dispatch_thread is not None:
+            self._dispatch_thread.join(timeout=2.0)
+            self._dispatch_thread = None
+        log.info("[node-pool] stopped")
+
+    @property
+    def cpu_workers(self) -> int:
+        return self._cpu_n
+
+    @property
+    def gpu_workers(self) -> int:
+        return self._gpu_n
+
+    def current_gpu_model(self) -> str | None:
+        """The orchestrator can't see a worker's in-process model cache
+        directly; the Rails snapshot reads ``current_model`` off
+        ``worker_heartbeats``. This in-process inspector is unused, kept as a
+        None stub."""
+        return None
+
+    # Cap retries before flagging a dispatch event as poisonous.
+    _DISPATCH_MAX_ATTEMPTS: int = 10
+
+    def _drain_dispatch_events(self) -> None:
+        """Pop unprocessed events, invoke the dispatcher callback, record
+        success or increment ``attempts`` on failure.
+
+        The SELECT + per-event finalisation runs inside a single transaction
+        with ``FOR UPDATE SKIP LOCKED`` so two concurrent drainers can't claim
+        the same row. Dispatcher callbacks open their own DB connections, so
+        they don't deadlock against the locks the outer cursor holds.
+        """
+        with connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, run_id, node_id, kind, attempts, error
+                  FROM workflow_dispatch_events
+                 WHERE processed_at IS NULL
+                 ORDER BY created_at ASC
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT 50
+                """,
+            )
+            events = list(cur.fetchall())
+            for evt in events:
+                evt_id = evt["id"]
+                kind = evt["kind"]
+                run_id = evt["run_id"]
+                node_id = evt["node_id"]
+                try:
+                    if kind == "completed":
+                        dispatcher.on_node_completed(run_id, node_id)
+                    elif kind == "failed":
+                        dispatcher.on_node_failed(run_id, node_id)
+                    elif kind == "awaiting_input":
+                        dispatcher.on_node_awaiting_input(run_id, node_id)
+                    else:
+                        log.error(
+                            "[node-pool] unknown dispatch event kind=%r id=%s",
+                            kind, evt_id,
+                        )
+                        cur.execute(
+                            "UPDATE workflow_dispatch_events "
+                            "SET attempts = attempts + 1, error = %s "
+                            "WHERE id = %s",
+                            (f"unknown kind={kind!r}", evt_id),
+                        )
+                        continue
+                    cur.execute(
+                        "UPDATE workflow_dispatch_events "
+                        "SET processed_at = now() WHERE id = %s",
+                        (evt_id,),
+                    )
+                except Exception as exc:
+                    attempts = int(evt.get("attempts") or 0) + 1
+                    err_text = f"{type(exc).__name__}: {exc}"
+                    log.warning(
+                        "[node-pool] dispatch event %s failed (attempts=%d): %s",
+                        evt_id, attempts, err_text,
+                    )
+                    cur.execute(
+                        "UPDATE workflow_dispatch_events "
+                        "SET attempts = attempts + 1, error = %s "
+                        "WHERE id = %s",
+                        (err_text[:8000], evt_id),
+                    )
+                    if attempts >= self._DISPATCH_MAX_ATTEMPTS:
+                        # Poisonous event — flip the run to ``failed`` so
+                        # operators see something instead of a silent stall.
+                        log.error(
+                            "[node-pool] dispatch event %s exhausted retries; "
+                            "marking run %s failed",
+                            evt_id, run_id,
+                        )
+                        cur.execute(
+                            "UPDATE workflow_runs "
+                            "SET status = 'failed', "
+                            "    finished_at = now(), "
+                            "    error = %s "
+                            "WHERE id = %s "
+                            "  AND status NOT IN ("
+                            "      'completed', 'failed', 'cancelled'"
+                            "  )",
+                            (
+                                f"dispatch callback {kind!r} for node "
+                                f"{node_id!r} failed after "
+                                f"{attempts} attempts: {err_text[:500]}",
+                                run_id,
+                            ),
+                        )
+                        cur.execute(
+                            "UPDATE workflow_dispatch_events "
+                            "SET processed_at = now() WHERE id = %s",
+                            (evt_id,),
+                        )
+
+    def _await_recovery(
+        self,
+        *,
+        max_attempts: int | None = None,
+        backoff_s: float | None = None,
+    ) -> None:
+        """Startup recovery — reclaim every expired lease before the dispatch
+        thread starts, with bounded exponential-backoff retries. Raises
+        ``RuntimeError`` when every attempt fails — the caller must propagate
+        so the worker container restarts via its orchestrator.
+
+        Configurable via env:
+            ``AI_LEADS_NODE_POOL_RECOVERY_RETRIES`` (default 5)
+            ``AI_LEADS_NODE_POOL_RECOVERY_BACKOFF_S`` (default 2.0)
+        """
+        if max_attempts is None:
+            max_attempts = _int_env("AI_LEADS_NODE_POOL_RECOVERY_RETRIES", 5)
+        if backoff_s is None:
+            raw = os.environ.get(
+                "AI_LEADS_NODE_POOL_RECOVERY_BACKOFF_S", "",
+            ).strip()
+            try:
+                backoff_s = float(raw) if raw else 2.0
+            except ValueError:
+                backoff_s = 2.0
+
+        last_exc: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                reclaimed = node_queue.reclaim_expired_leases()
+                if reclaimed:
+                    log.info(
+                        "[node-pool] recovery: reclaimed %d expired-lease job(s)",
+                        len(reclaimed),
+                    )
+                else:
+                    log.info("[node-pool] recovery ok")
+                return
+            except Exception as exc:
+                last_exc = exc
+                log.warning(
+                    "[node-pool] recovery attempt %d/%d failed: %r",
+                    attempt + 1, max_attempts, exc,
+                )
+                if attempt < max_attempts - 1 and backoff_s > 0:
+                    # Cap exponential backoff at 30 s.
+                    wait = min(backoff_s * (2 ** attempt), 30.0)
+                    # Respect ``stop()`` mid-backoff.
+                    if self._dispatch_stop.wait(wait):
+                        raise RuntimeError(
+                            "node pool stopped during recovery backoff"
+                        ) from last_exc
+        raise RuntimeError(
+            f"node pool refused to start: recovery failed after "
+            f"{max_attempts} attempts"
+        ) from last_exc
+
+    def _dispatch_loop(self) -> None:
+        """Periodically find node-mode runs in ``queued`` and expand them into
+        initial node-jobs via :func:`dispatcher.start_run`."""
+        while not self._dispatch_stop.is_set():
+            try:
+                self._tick()
+            except Exception:
+                log.exception("[node-pool] dispatcher tick failed")
+            if self._dispatch_stop.wait(self.expand_poll_s):
+                return
+
+    def _tick(self) -> None:
+        # 1) Expand new node-mode runs.
+        with connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM workflow_runs "
+                "WHERE mode = 'node' AND status = 'queued' "
+                "ORDER BY priority ASC, queued_at ASC NULLS LAST LIMIT 50"
+            )
+            ids = [r["id"] for r in cur.fetchall()]
+        for run_id in ids:
+            try:
+                n = dispatcher.start_run(run_id)
+                if n > 0:
+                    run_store.update_run(run_id, status="running")
+            except Exception:
+                log.exception("[node-pool] start_run %s failed", run_id)
+
+        # 2) Drain durable dispatcher fan-out events. Workers write a
+        # ``workflow_dispatch_events`` row in the same txn as their terminal
+        # UPDATE, so a callback that fails synchronously on the worker is
+        # retried on the next tick instead of stalling the run.
+        try:
+            self._drain_dispatch_events()
+        except Exception:
+            log.exception("[node-pool] dispatch-event drain failed")
+
+        # 3) Lease-reclaim sweep — re-queues ``running`` rows whose PG lease
+        # lapsed. Interval-gated to ~5 s; the reclaim flips rows back to
+        # ``queued`` and migration-0006's trigger fires the ``node_job_ready``
+        # NOTIFY so an idle claim worker re-grabs it.
+        try:
+            self._sweep_expired_leases()
+        except Exception:
+            log.exception("[node-pool] lease-reclaim sweep failed")
+
+        # 4) Ingest-lease reclaim sweep — the ``ingest_jobs`` twin of step 3.
+        try:
+            self._sweep_expired_ingest_leases()
+        except Exception:
+            log.exception("[node-pool] ingest-lease-reclaim sweep failed")
+
+    def _sweep_expired_leases(self) -> None:
+        """Re-queue ``running`` rows whose PG lease has lapsed.
+
+        Interval-gated (``_reclaim_interval_s``, default 5 s) so the 0.5 s
+        dispatch loop doesn't run the reclaim UPDATE every tick.
+        """
+        import time as _time
+
+        now = _time.time()
+        if now - self._reclaim_last_run < self._reclaim_interval_s:
+            return
+        self._reclaim_last_run = now
+
+        reclaimed = node_queue.reclaim_expired_leases()
+        for row in reclaimed:
+            log.warning(
+                "[node-pool] reclaimed expired-lease job %s "
+                "(run=%s node=%s) → re-queued",
+                row.get("id"), row.get("run_id"), row.get("node_id"),
+            )
+
+    def _sweep_expired_ingest_leases(self) -> None:
+        """Re-queue ``ingest_jobs`` rows whose PG lease has lapsed — the ingest
+        twin of :meth:`_sweep_expired_leases`. This is the only recovery for a
+        dead/wedged fetch/load claim worker."""
+        import time as _time
+
+        now = _time.time()
+        if now - self._ingest_reclaim_last_run < self._ingest_reclaim_interval_s:
+            return
+        self._ingest_reclaim_last_run = now
+
+        reclaimed = node_queue.reclaim_expired_ingest_leases()
+        for row in reclaimed:
+            log.warning(
+                "[node-pool] reclaimed expired-lease ingest job %s "
+                "(task=%s queue=%s) → re-queued",
+                row.get("id"), row.get("task_name"), row.get("queue"),
+            )
