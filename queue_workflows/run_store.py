@@ -124,26 +124,31 @@ def delete_run(run_id: str) -> None:
 
 
 def reenqueue_running_for_resume() -> int:
-    """Startup hook: orphan ``running`` rows flip back to ``queued`` at
-    priority=10. Cap at 5 auto-resumes — beyond that the run moves to
-    ``failed`` to break crash loops. Returns the number of rows touched.
+    """Startup hook: orphan ``running`` rows ALWAYS flip back to ``queued`` at
+    priority=10 for resume — never auto-failed. Returns the number of rows
+    touched.
+
+    A row is ``running`` here only because a worker died mid-execution (crash,
+    watchdog hard-exit, or an operator fleet-restart) without marking its node
+    terminal. Such a run must go back to the queue so it can finish — possibly
+    on a *different* host (e.g. the Blackwell qwen stall hangs a box-c but
+    completes on box-b). The old behaviour capped at 5 resumes then marked the
+    run ``failed`` ("[auto-resume cap reached]"), which conflated a poison-pill
+    run with a healthy one that merely rode through restarts/host-specific hangs
+    — and killed the healthy case. ``resume_count`` is still bumped (visibility:
+    an operator can spot a run stuck resuming and cancel it), but it no longer
+    trips an auto-fail. Genuine node failures still fail the run via the normal
+    node-failure path (``node_executor`` mark_failed + outbox), not here.
 
     Plain-SQL port of ai_leads' ``queries.reenqueue_running_for_resume``."""
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
             UPDATE workflow_runs
-            SET status = CASE WHEN resume_count >= 5 THEN 'failed'
-                              ELSE 'queued' END,
-                error = CASE WHEN resume_count >= 5
-                             THEN COALESCE(error, '') || ' [auto-resume cap reached]'
-                             ELSE error END,
+            SET status = 'queued',
                 priority = 10,
                 resume_count = resume_count + 1,
-                queued_at = CASE WHEN resume_count >= 5 THEN queued_at
-                                 ELSE now() END,
-                finished_at = CASE WHEN resume_count >= 5 THEN now()
-                                   ELSE finished_at END,
+                queued_at = now(),
                 updated_at = now()
             WHERE status = 'running'
             RETURNING id

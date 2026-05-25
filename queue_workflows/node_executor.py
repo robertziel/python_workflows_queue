@@ -70,6 +70,7 @@ def _invoke(
     handle: Any,
     cancel_event: Any = None,
     model_load_seconds: float | None = None,
+    status_callback: Any = None,
 ):
     """Import the node module for ``module_name`` (via the engine's
     configurable resolver) and dispatch to its ``run(...)`` with the inputs +
@@ -101,7 +102,10 @@ def _invoke(
         elif name == "model_handle":
             kwargs["model_handle"] = handle
         elif name == "status_callback":
-            kwargs["status_callback"] = None
+            # A node that declares ``status_callback`` opts into progress
+            # reporting; the claim worker wires its StallWatchdog.beat here so
+            # each reported step pushes the no-progress deadline out.
+            kwargs["status_callback"] = status_callback
         elif name == "cancel_event":
             kwargs["cancel_event"] = cancel_event
         elif name == "model_load_seconds":
@@ -229,6 +233,7 @@ def execute_node(
     *,
     model_cache: Any = None,
     cancel_event: Any = None,
+    status_callback: Any = None,
 ) -> str:
     """Run one already-claimed ``workflow_node_jobs`` row to a terminal
     state. Returns one of ``"completed"`` / ``"failed"`` / ``"skipped"``.
@@ -277,6 +282,15 @@ def execute_node(
             err = f"model load failed: {type(exc).__name__}: {exc}"
             log.exception("[execute_node] %s %s", job_id, err)
             return _finalise_failed(job, err, t0)
+        # Model is warm — beat the stall watchdog so its no-progress window
+        # opens HERE (after the multi-minute cold load), not at claim time. From
+        # now on the node's per-step ``status_callback`` beats keep it alive; a
+        # post-load inference hang (GPU at 0 %) stops beating and trips it.
+        if status_callback is not None:
+            try:
+                status_callback()
+            except Exception:
+                log.exception("[execute_node] %s post-load stall beat failed", job_id)
 
     # Re-resolve $from refs at execution time — picks up any upstream
     # sibling context_delta changes between enqueue and now. Snapshot the
@@ -307,6 +321,7 @@ def execute_node(
                 handle=handle,
                 cancel_event=cancel_event,
                 model_load_seconds=model_load_seconds,
+                status_callback=status_callback,
             )
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"

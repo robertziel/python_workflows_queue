@@ -34,6 +34,7 @@ render can't camp on a memory-pressured GPU worker.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import socket
@@ -64,6 +65,19 @@ LOAD_BUDGET_S = 3600             # 1 h — full landing-zone → Postgres sweep
 LEASE_S = node_queue.DEFAULT_LEASE_S          # 600 s
 LEASE_RENEW_INTERVAL_S = 10.0
 NOTIFY_POLL_TIMEOUT_S = 1.0                   # safety poll for a dropped NOTIFY
+
+# No-progress (stall) deadline for a GPU node. The wall-clock budget above only
+# catches a job that runs too LONG; this catches one that makes NO PROGRESS — a
+# Blackwell qwen inference hang sits model-resident at 0 % GPU and would camp
+# the full 8100 s budget. A node beats this deadline once per diffusion step
+# (via ``status_callback``); the executor beats once more right after the model
+# load completes — which ARMS the watchdog. It is inert before that first beat,
+# so a multi-minute cold model load (observed ~6 min) can't false-trip it. The
+# window only spans the gap between two diffusion steps (~12 s), so it can be
+# tight: no beat for this long once armed ⇒ hung ⇒ fail + hard-exit so the lease
+# reclaim re-queues the job onto a healthy host.
+STALL_TIMEOUT_S = 120.0                        # ≫ inter-step gap (~12 s); load is excluded
+STALL_POLL_S = 5.0
 
 # Worker capacity heartbeat refresh cadence. Rails' queue gauge treats a row
 # whose ``last_seen`` is older than 30 s as stale, so a 10 s refresh keeps us
@@ -187,6 +201,36 @@ class LeaseRenewer:
 # ── watchdog ─────────────────────────────────────────────────────────────
 
 
+def _fail_job_and_exit(
+    *, job_id: str, table: str, error: str,
+    on_exit: Callable[[int], None], exit_code: int,
+) -> None:
+    """Mark a doomed job ``failed`` (+ the dispatch-event outbox row for DAG
+    node-jobs) then call ``on_exit``. Shared by :class:`Watchdog` (budget) and
+    :class:`StallWatchdog` (no-progress) so the outbox-atomicity contract — the
+    terminal mark and the ``failed`` event in ONE txn — is written in exactly
+    one place. A mark failure is swallowed + logged: the hard-exit must still
+    happen so the lease can expire and a reclaim re-queue the row."""
+    try:
+        if table == "ingest_jobs":
+            # Ingest job: no parent run, no dispatch-event outbox — just mark
+            # the row failed so a reclaim/operator sees it.
+            node_queue.mark_ingest_failed(job_id, error=error)
+        else:
+            # DAG node-job: mark failed + write the dispatch-event row in ONE
+            # txn so the run fails through to downstream nodes even though we're
+            # about to hard-exit.
+            with connection() as conn, conn.cursor() as cur:
+                row = node_queue.mark_failed_in_txn(cur, job_id, error=error)
+                if row is not None:
+                    node_queue.enqueue_dispatch_event_in_txn(
+                        cur, row["run_id"], row["node_id"], "failed",
+                    )
+    except Exception:
+        log.exception("[watchdog] %s could not mark failed before exit", job_id)
+    on_exit(exit_code)
+
+
 class Watchdog:
     """Daemon thread enforcing a wall-clock budget on a single running job. On
     trip: mark the row failed with the budget-exceeded reason, then call
@@ -233,26 +277,93 @@ class Watchdog:
             f"watchdog hard-stopped the worker"
         )
         log.error("[watchdog] %s %s", self._job_id, err)
-        try:
-            if self._table == "ingest_jobs":
-                # Ingest job: no parent run, no dispatch-event outbox — just
-                # mark the row failed so a reclaim/operator sees it.
-                node_queue.mark_ingest_failed(self._job_id, error=err)
-            else:
-                # DAG node-job: mark failed + write the dispatch-event row in
-                # ONE txn (the outbox atomicity contract) so the run fails
-                # through to downstream nodes even though we're about to
-                # hard-exit.
-                with connection() as conn, conn.cursor() as cur:
-                    row = node_queue.mark_failed_in_txn(cur, self._job_id, error=err)
-                    if row is not None:
-                        node_queue.enqueue_dispatch_event_in_txn(
-                            cur, row["run_id"], row["node_id"], "failed",
-                        )
-        except Exception:
-            log.exception("[watchdog] %s could not mark failed before exit",
-                          self._job_id)
-        self._on_exit(self._exit_code)
+        _fail_job_and_exit(
+            job_id=self._job_id, table=self._table, error=err,
+            on_exit=self._on_exit, exit_code=self._exit_code,
+        )
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+
+# ── stall (no-progress) watchdog ───────────────────────────────────────────
+
+
+class StallWatchdog:
+    """Daemon thread enforcing a NO-PROGRESS deadline on one running job.
+
+    Where :class:`Watchdog` is a fixed wall-clock budget (catches a job running
+    too *long*), this catches a job making *no progress*: it arms a short
+    deadline that every :meth:`beat` pushes out. A GPU node beats once per
+    diffusion step (threaded in as ``status_callback``); the executor also beats
+    once when the model finishes loading, so the cold-load phase gets its own
+    fresh window. If no beat arrives within ``stall_timeout_s`` the node is hung
+    (model resident, GPU at 0 %) — :func:`_fail_job_and_exit` marks it failed +
+    writes the outbox event, then hard-exits so ``reclaim_expired_leases``
+    re-queues it onto a healthy host. ``beat`` is tolerant of extra args so it
+    can be wired straight in as a node ``status_callback``."""
+
+    def __init__(
+        self, *, job_id: str, stall_timeout_s: float = STALL_TIMEOUT_S,
+        on_exit: Callable[[int], None] | None = None,
+        poll_s: float = STALL_POLL_S, exit_code: int = 76,
+        table: str = "workflow_node_jobs",
+    ) -> None:
+        if table not in _LEASE_TABLES:
+            raise ValueError(f"stall-watchdog table must be in {sorted(_LEASE_TABLES)}, got {table!r}")
+        self._job_id = job_id
+        self._stall_timeout_s = float(stall_timeout_s)
+        self._on_exit = on_exit or os._exit
+        self._poll_s = float(poll_s)
+        self._exit_code = int(exit_code)
+        self._table = table
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+        # None ⇒ not yet armed: the watchdog stays inert until the first beat
+        # (the executor's after-model-load beat), so a long cold load is never
+        # policed by the no-progress deadline.
+        self._deadline: float | None = None
+
+    def beat(self, *args: Any, **kwargs: Any) -> None:
+        """Record progress: arm (on the first call) / push the no-progress
+        deadline out by one window. Thread-safe; ignores any args so it doubles
+        as a node ``status_callback``."""
+        with self._lock:
+            self._deadline = time.monotonic() + self._stall_timeout_s
+
+    def start(self) -> None:
+        # Note: NO initial beat — the watchdog arms on the first beat, not at
+        # start, so the model-load phase before that beat is never policed here.
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True,
+            name=f"stall-watchdog-{self._job_id[:8]}",
+        )
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                deadline = self._deadline
+            if deadline is not None and time.monotonic() >= deadline:
+                self._trip()
+                return
+            # Wake on stop OR at the next poll boundary, whichever first.
+            self._stop.wait(self._poll_s)
+
+    def _trip(self) -> None:
+        err = (
+            f"no progress for {int(self._stall_timeout_s)}s "
+            f"(no GPU step beat) — stall watchdog hard-stopped the worker"
+        )
+        log.error("[stall-watchdog] %s %s", self._job_id, err)
+        _fail_job_and_exit(
+            job_id=self._job_id, table=self._table, error=err,
+            on_exit=self._on_exit, exit_code=self._exit_code,
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -437,9 +548,22 @@ class ClaimWorker:
             return self._run_ingest(job)
         return self._run_node(job)
 
+    @staticmethod
+    def _node_reports_progress(module_name: str) -> bool:
+        """True iff the node's ``run(...)`` declares a ``status_callback`` param
+        — its opt-in to no-progress policing. A node that doesn't report
+        progress can't be told apart from a hung one, so the StallWatchdog is
+        NOT armed for it (it's left to the wall-clock :class:`Watchdog`)."""
+        try:
+            mod = get_config().resolve_node_module(module_name)
+            return "status_callback" in inspect.signature(mod.run).parameters
+        except Exception:
+            return False
+
     def _run_node(self, job: dict) -> bool:
         """Execute a claimed DAG node-job (cpu/gpu) under a cancel-watcher +
-        lease-renewer + watchdog."""
+        lease-renewer + wall-clock watchdog (+ a no-progress StallWatchdog for
+        gpu nodes that report per-step progress)."""
         job_id = job["id"]
         log.info(
             "[claim-worker:%s] claimed %s (node=%s model=%s)",
@@ -477,6 +601,27 @@ class ClaimWorker:
         watchdog = Watchdog(job_id=job_id, budget_s=budget_for(job))
         renewer.start()
         watchdog.start()
+        # No-progress watchdog: armed only for gpu nodes that report per-step
+        # progress (declare a ``status_callback``). Its ``beat`` is threaded to
+        # the node as ``status_callback`` and pulsed once by the executor after
+        # the model load; a post-load inference hang stops the beats and trips
+        # it long before the 8100 s wall-clock budget would.
+        #
+        # EXCLUDE video models: a video backend (wan/ltx/hunyuan) steps slowly
+        # and reports progress only per beat-segment (minutes apart), so the
+        # tight 120 s window would false-trip a healthy render. Video jobs keep
+        # their 1800 s wall-clock budget as the backstop instead.
+        is_video = (job.get("required_model") or "") in get_config().video_model_ids
+        stall: StallWatchdog | None = None
+        status_callback: Callable[..., None] | None = None
+        if (
+            self.queue == "gpu"
+            and not is_video
+            and self._node_reports_progress(job["node_module"])
+        ):
+            stall = StallWatchdog(job_id=job_id)
+            status_callback = stall.beat
+            stall.start()
         # GPU busy-bracket: hold ``ModelCache._active`` > 0 for the job's
         # lifetime so the cache's idle reaper can't unload the warm model
         # mid-inference. ``mark_idle`` is in the finally so it ALWAYS releases.
@@ -491,10 +636,13 @@ class ClaimWorker:
         try:
             node_executor.execute_node(
                 job, model_cache=self.model_cache, cancel_event=cancel_event,
+                status_callback=status_callback,
             )
         finally:
             if busy:
                 self.model_cache.mark_idle()
+            if stall is not None:
+                stall.stop()
             watchdog.stop()
             renewer.stop()
             cancel_event.set()

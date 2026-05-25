@@ -127,6 +127,110 @@ def test_watchdog_does_not_trip_when_stopped_before_budget():
     assert node_queue.get_node_job(job_id)["status"] == "running"
 
 
+# ── stall (no-progress) watchdog ─────────────────────────────────────────────
+# The wall-clock Watchdog only catches a job that runs LONGER than its budget
+# (8100 s for a generic GPU job). A node that HANGS — model resident, GPU at
+# 0 %, no denoise step in minutes (the Blackwell qwen inference stall) — would
+# camp the whole budget before the wall-clock watchdog frees it. The
+# StallWatchdog trips on NO PROGRESS: every ``beat()`` (one per diffusion step,
+# threaded via ``status_callback``, plus one from the executor right after the
+# model load completes) pushes a short deadline out. It stays INERT until the
+# FIRST beat so a multi-minute cold model load can't false-trip it; once armed,
+# no beat within ``stall_timeout_s`` ⇒ mark failed + hard-exit so the lease
+# reclaim re-queues the job onto a healthy host.
+
+
+def test_stall_watchdog_trips_after_first_beat_then_silence():
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="gpu",
+        required_model="qwen_edit",
+    )
+    node_queue.claim_next_gpu_job(0, host="h")
+
+    exits: list[int] = []
+    wd = claim_worker.StallWatchdog(
+        job_id=job_id, stall_timeout_s=0.05,
+        on_exit=lambda code: exits.append(code), poll_s=0.01,
+    )
+    wd.start()
+    wd.beat()  # the executor's after-model-load beat arms enforcement
+    deadline = time.time() + 3.0
+    while time.time() < deadline and not exits:
+        time.sleep(0.02)
+    wd.stop()
+
+    assert exits, "stall watchdog must hard-exit when progress stops after arming"
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "failed"
+    assert "no progress" in (row["error"] or "").lower()
+
+
+def test_stall_watchdog_inert_until_first_beat():
+    """Before the first beat the watchdog does NOT enforce — so a long cold
+    model load (minutes with no beats) can never false-trip it."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="gpu",
+    )
+    node_queue.claim_next_gpu_job(0, host="h")
+
+    exits: list[int] = []
+    wd = claim_worker.StallWatchdog(
+        job_id=job_id, stall_timeout_s=0.05,
+        on_exit=lambda code: exits.append(code), poll_s=0.01,
+    )
+    wd.start()
+    time.sleep(0.2)  # well past the timeout, but no beat has armed it yet
+    assert exits == [], "must stay inert until the first progress beat"
+    assert node_queue.get_node_job(job_id)["status"] == "running"
+    wd.stop()
+
+
+def test_stall_watchdog_beat_resets_deadline_and_keeps_job_running():
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="gpu",
+    )
+    node_queue.claim_next_gpu_job(0, host="h")
+
+    exits: list[int] = []
+    wd = claim_worker.StallWatchdog(
+        job_id=job_id, stall_timeout_s=0.2,
+        on_exit=lambda code: exits.append(code), poll_s=0.01,
+    )
+    wd.start()
+    # Beat faster than the timeout for well over one timeout-window total —
+    # a deadline that resets on every beat must never trip here.
+    for _ in range(8):
+        time.sleep(0.05)
+        wd.beat()
+    assert exits == [], "periodic beats must hold the deadline open"
+    assert node_queue.get_node_job(job_id)["status"] == "running"
+    wd.stop()
+
+
+def test_stall_watchdog_does_not_trip_when_stopped_before_timeout():
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="gpu",
+    )
+    node_queue.claim_next_gpu_job(0, host="h")
+
+    exits: list[int] = []
+    wd = claim_worker.StallWatchdog(
+        job_id=job_id, stall_timeout_s=5.0,
+        on_exit=lambda code: exits.append(code), poll_s=0.01,
+    )
+    wd.start()
+    wd.beat()
+    time.sleep(0.1)
+    wd.stop()
+    time.sleep(0.1)
+    assert exits == []
+    assert node_queue.get_node_job(job_id)["status"] == "running"
+
+
 # ── lease renewal ──────────────────────────────────────────────────────────
 
 
@@ -264,6 +368,91 @@ def test_gpu_claim_serves_modelless_job_regardless_of_capability():
     )
     claimed = node_queue.claim_next_gpu_job(0, host="h", known_models=["model_A"])
     assert claimed is not None and claimed["id"] == job_id
+
+
+def test_node_reports_progress_gate_keys_on_status_callback_param():
+    """A node opts into no-progress policing purely by declaring a
+    ``status_callback`` param — that's the gate the worker checks before arming
+    a StallWatchdog."""
+    def with_cb(*, out=None, status_callback=None):
+        return {}
+
+    def without_cb(*, out=None, inputs=None):
+        return {}
+
+    _install_fake_node("_cw_with_cb", with_cb)
+    _install_fake_node("_cw_without_cb", without_cb)
+    assert claim_worker.ClaimWorker._node_reports_progress("_cw_with_cb") is True
+    assert claim_worker.ClaimWorker._node_reports_progress("_cw_without_cb") is False
+
+
+def test_run_node_threads_a_callable_status_callback_to_gpu_node():
+    """End-to-end wiring: a gpu node that declares ``status_callback`` receives
+    a CALLABLE (the StallWatchdog beat), not ``None`` — so each reported step
+    pushes the no-progress deadline out. (Pre-fix the executor hard-wired
+    ``status_callback=None``, so no node could ever beat.)"""
+    run_id = _make_run()
+    seen: dict = {}
+
+    def run(*, out=None, model_handle=None, status_callback=None, cancel_event=None):
+        seen["is_callable"] = callable(status_callback)
+        if status_callback:
+            status_callback(7)  # a per-step beat, with an arg
+        return {"context_delta": {"ok": True}}
+
+    _install_fake_node("_cw_gpu_progress", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="_cw_gpu_progress", queue="gpu",
+    )
+
+    class _Cache:
+        current_model = None
+
+        def require_model(self, model_id):
+            return object()
+
+        def mark_busy(self): ...
+        def mark_idle(self): ...
+
+    worker = claim_worker.ClaimWorker(queue="gpu", host="box-a2", model_cache=_Cache())
+    assert worker.run_once() is True
+    assert seen.get("is_callable") is True
+    assert node_queue.get_node_job(job_id)["status"] == "completed"
+
+
+def test_stall_watchdog_not_armed_for_video_models():
+    """A video-model gpu job is NOT stall-policed: video backends step slowly
+    and report progress only per beat-segment (minutes apart), which would
+    false-trip the 120 s window. Their backstop is the 1800 s wall-clock budget.
+    So a progress-reporting node on a video model receives status_callback=None
+    (watchdog not armed). Regression guard: a live fence_render_narrative video
+    render was hard-stopped at 120 s by an over-eager arm."""
+    run_id = _make_run()
+    seen: dict = {}
+
+    def run(*, out=None, model_handle=None, status_callback=None, cancel_event=None):
+        seen["status_callback"] = status_callback
+        return {"context_delta": {"ok": True}}
+
+    _install_fake_node("_cw_video", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="v", node_module="_cw_video", queue="gpu",
+        required_model="wan_i2v",  # in the autouse fixture's video_model_ids
+    )
+
+    class _Cache:
+        current_model = "wan_i2v"
+
+        def require_model(self, model_id):
+            return object()
+
+        def mark_busy(self): ...
+        def mark_idle(self): ...
+
+    worker = claim_worker.ClaimWorker(queue="gpu", host="box-a", model_cache=_Cache())
+    assert worker.run_once() is True
+    assert seen.get("status_callback") is None, "video model must NOT arm the stall watchdog"
+    assert node_queue.get_node_job(job_id)["status"] == "completed"
 
 
 def test_run_once_skips_job_under_cancelled_run():
