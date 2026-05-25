@@ -94,6 +94,18 @@ class EngineConfig:
     #: (wired lazily in ``get_resolve_ref`` to keep this module a leaf).
     resolve_ref: Callable[[Any, dict], Any] | None = None
 
+    # ── per-node invoke wrapper (host setup/teardown around each node run) ──────
+    #: ``Callable[[dict, dict], ContextManager[Callable[[dict], dict] | None]]`` —
+    #: given ``(job, run)``, returns a context manager wrapping the node invoke.
+    #: ``__enter__`` does host setup (e.g. pin a run-context ContextVar, capture a
+    #: live flag) and yields a ``finalize(context_delta) -> context_delta`` callable
+    #: that ``execute_node`` applies ONLY on success (e.g. stamp a per-node marker);
+    #: ``__exit__`` does teardown on EVERY exit path (success / failure / skip).
+    #: Default ``None`` ⇒ no wrapping (the engine runs the node directly). Lets a
+    #: host thread per-node execution state (e.g. a smoke/mock ``_mocked`` stamp)
+    #: without forking ``execute_node``.
+    invoke_context: Callable[[dict, dict], Any] | None = None
+
     # ── ingest queue names + budget (host-configurable; G1) ────────────────────
     #: Ingest-family queue names. Migration 0008 dropped the fetch/load DB CHECK;
     #: the host validates ``queue`` against THIS set before enqueue (mirroring the

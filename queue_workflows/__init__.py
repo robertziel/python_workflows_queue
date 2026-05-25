@@ -45,6 +45,7 @@ __all__ = [
     "set_node_resolver",
     "set_builtin_model_registrar",
     "set_workflow_provider",
+    "set_invoke_context",
     "register_ingest_task",
     "set_ingest_schedule",
     "get_config",
@@ -163,6 +164,22 @@ def set_workflow_provider(
         cfg.pipeline_schema_loader = pipeline_schema
         if resolve_ref is not None:
             cfg.resolve_ref = resolve_ref
+
+
+# ── per-node invoke wrapper (host setup/teardown around each node run) ──
+
+
+def set_invoke_context(factory: Callable[[dict, dict], Any]) -> None:
+    """Set the per-node invoke wrapper — a ``Callable[[job, run], ContextManager]``
+    whose context manager brackets each node invoke: ``__enter__`` does host setup
+    (e.g. pin a run-context ContextVar + capture a live mock flag) and yields a
+    ``finalize(context_delta) -> context_delta`` callable applied ONLY on success
+    (e.g. stamp a per-node ``_mocked`` marker); ``__exit__`` does teardown on every
+    exit path. Default unset ⇒ the engine runs nodes directly (no wrapping). See
+    :class:`queue_workflows.config.EngineConfig.invoke_context`."""
+    cfg = get_config()
+    with cfg._lock:
+        cfg.invoke_context = factory
 
 
 # ── ingest task + schedule registration (periodic work) ──

@@ -32,6 +32,7 @@ set.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import os
@@ -286,41 +287,55 @@ def execute_node(
     except Exception:
         log.exception("[execute_node] %s could not record resolved_inputs", job_id)
 
-    try:
-        result = _invoke(
-            module_name=job["node_module"],
-            inputs=fresh_inputs,
-            out=_out_dir_for(job, run),
-            handle=handle,
-            cancel_event=cancel_event,
-            model_load_seconds=model_load_seconds,
-        )
-    except Exception as exc:
-        err = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-        log.error(err)
-        return _finalise_failed(job, err, t0)
-
-    context_delta = result.get("context_delta", {})
-    with _db_connection() as conn, conn.cursor() as cur:
-        row = node_queue.mark_completed_in_txn(
-            cur, job_id,
-            context_delta=context_delta,
-            seconds=time.time() - t0,
-            vm_rss_mb_peak=_rss_mb(),
-        )
-        if row is None:
-            log.warning(
-                "[execute_node] %s already terminal; skipping completion event",
-                job_id,
-            )
-            return "skipped"
-        node_queue.enqueue_dispatch_event_in_txn(
-            cur, job["run_id"], job["node_id"], "completed",
-        )
-    _update_run_thumbnail(
-        job["run_id"], job["node_id"], run, context_delta,
+    # Optional host wrapper around the invoke (config.invoke_context): its
+    # __enter__ does host setup (e.g. pin a run-context ContextVar + capture a
+    # live mock flag) and yields a finalize(context_delta)->context_delta applied
+    # on success; __exit__ tears down on EVERY return path below. Default unset ⇒
+    # nullcontext(None) ⇒ identical behavior to running the node directly.
+    cfg = get_config()
+    _invoke_cm = (
+        cfg.invoke_context(job, run)
+        if cfg.invoke_context is not None
+        else contextlib.nullcontext(None)
     )
-    return "completed"
+    with _invoke_cm as _finalize:
+        try:
+            result = _invoke(
+                module_name=job["node_module"],
+                inputs=fresh_inputs,
+                out=_out_dir_for(job, run),
+                handle=handle,
+                cancel_event=cancel_event,
+                model_load_seconds=model_load_seconds,
+            )
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            log.error(err)
+            return _finalise_failed(job, err, t0)
+
+        context_delta = result.get("context_delta", {})
+        if _finalize is not None:
+            context_delta = _finalize(context_delta)
+        with _db_connection() as conn, conn.cursor() as cur:
+            row = node_queue.mark_completed_in_txn(
+                cur, job_id,
+                context_delta=context_delta,
+                seconds=time.time() - t0,
+                vm_rss_mb_peak=_rss_mb(),
+            )
+            if row is None:
+                log.warning(
+                    "[execute_node] %s already terminal; skipping completion event",
+                    job_id,
+                )
+                return "skipped"
+            node_queue.enqueue_dispatch_event_in_txn(
+                cur, job["run_id"], job["node_id"], "completed",
+            )
+        _update_run_thumbnail(
+            job["run_id"], job["node_id"], run, context_delta,
+        )
+        return "completed"
 
 
 def _finalise_failed(job: dict, error: str, t0: float) -> str:
