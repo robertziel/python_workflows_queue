@@ -111,6 +111,20 @@ class NodePool:
         )
         self._dead_worker_last_run: float = 0.0
 
+        # Node-event retention (migration 0011): the append-only
+        # ``workflow_node_events`` forensic log is the only table here with no
+        # natural terminal-state bound, so prune rows older than N days on a
+        # slow (hourly) interval-gated sweep. ON DELETE CASCADE from
+        # workflow_runs already covers purge / restart_from / session-delete;
+        # this only catches events for runs that are never deleted.
+        self._node_event_retention_days: int = int(
+            os.environ.get("AI_LEADS_NODE_EVENT_RETENTION_DAYS", "30")
+        )
+        self._node_event_prune_interval_s: float = float(
+            os.environ.get("AI_LEADS_NODE_EVENT_PRUNE_INTERVAL_S", "3600")
+        )
+        self._node_event_prune_last_run: float = 0.0
+
     def start(self) -> None:
         if self._register_builtins is not None:
             try:
@@ -380,6 +394,13 @@ class NodePool:
         except Exception:
             log.exception("[node-pool] dead-worker sweep failed")
 
+        # 6) Node-event retention — prune workflow_node_events older than the
+        # retention window (append-only growth control; hourly-gated).
+        try:
+            self._sweep_node_event_retention()
+        except Exception:
+            log.exception("[node-pool] node-event retention sweep failed")
+
     def _sweep_expired_leases(self) -> None:
         """Re-queue ``running`` rows whose PG lease has lapsed.
 
@@ -462,4 +483,28 @@ class NodePool:
                 "must be bounced (host-supervisor should restart it)",
                 row.get("host_label"), row.get("queue"),
                 row.get("last_seen"), row.get("running_jobs"),
+            )
+
+    def _sweep_node_event_retention(self) -> None:
+        """Prune ``workflow_node_events`` rows older than the retention window.
+
+        Interval-gated (``_node_event_prune_interval_s``, default 1 h) — the
+        append-only event log (migration 0011) is the only table here without a
+        natural terminal bound, so an age-based sweep keeps it from growing
+        unboundedly for runs that are never deleted. ``ON DELETE CASCADE`` from
+        ``workflow_runs`` already covers purge / restart_from / session-delete.
+        Retention via ``AI_LEADS_NODE_EVENT_RETENTION_DAYS`` (default 30).
+        """
+        import time as _time
+
+        now = _time.time()
+        if now - self._node_event_prune_last_run < self._node_event_prune_interval_s:
+            return
+        self._node_event_prune_last_run = now
+
+        deleted = node_queue.prune_node_events(self._node_event_retention_days)
+        if deleted:
+            log.info(
+                "[node-pool] pruned %d node-event row(s) older than %d days",
+                deleted, self._node_event_retention_days,
             )

@@ -191,3 +191,31 @@ def test_execute_node_emits_failed_event(monkeypatch):
     failed = [e for e in _events(run_id) if e["event_type"] == "failed"]
     assert len(failed) == 1
     assert "kaboom" in (failed[0]["error"] or "")
+
+
+# ── retention sweep (NodePool, Phase 2) ────────────────────────────────────
+
+
+def test_nodepool_retention_sweep_prunes_old_events():
+    """NodePool._sweep_node_event_retention prunes rows past the window and is
+    interval-gated (an immediate second call is a no-op)."""
+    from queue_workflows import node_pool
+
+    run_id = make_run()
+    node_queue.record_node_event(run_id=run_id, node_id="n", event_type="claimed")
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "INSERT INTO workflow_node_events (run_id, node_id, event_type, created_at) "
+            "VALUES (%s, 'n', 'completed', now() - make_interval(days => 40))",
+            (run_id,),
+        )
+    assert len(_events(run_id)) == 2
+
+    pool = node_pool.NodePool(register_builtins=None)
+    pool._sweep_node_event_retention()  # last_run=0 → runs; prunes the 40-day row
+    rows = _events(run_id)
+    assert len(rows) == 1 and rows[0]["event_type"] == "claimed"
+
+    # Interval-gated: a second immediate call is a no-op (and must not error).
+    pool._sweep_node_event_retention()
+    assert len(_events(run_id)) == 1
