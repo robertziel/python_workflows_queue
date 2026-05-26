@@ -29,7 +29,7 @@ import signal
 import sys
 import threading
 
-from queue_workflows import db, run_store
+from queue_workflows import db, node_queue, run_store
 from queue_workflows.config import get_config
 from queue_workflows.node_pool import NodePool
 
@@ -69,6 +69,22 @@ def main(argv: list[str] | None = None) -> int:
             log.info("[orchestrator] re-queued %d stale running run(s) for resume", n)
     except Exception:
         log.exception("[orchestrator] reenqueue_running_for_resume failed")
+
+    # ...and re-queue every orphan ``running`` NODE JOB. A restart bounces the
+    # whole fleet, so any job still ``running`` lost its worker — flip it back
+    # to ``queued`` NOW rather than waiting out its (up to 600 s) lease, so the
+    # fresh workers resume it immediately. A worker that somehow outlived the
+    # restart self-terminates via its JobStatusWatcher when claimed_by clears,
+    # so a re-queued row is never double-run.
+    try:
+        rows = node_queue.reclaim_all_running_for_resume()
+        if rows:
+            log.info(
+                "[orchestrator] re-queued %d orphan running node-job(s) for resume",
+                len(rows),
+            )
+    except Exception:
+        log.exception("[orchestrator] reclaim_all_running_for_resume failed")
 
     log.info("[orchestrator] starting NodePool")
     pool = NodePool(register_builtins=get_config().builtin_model_registrar)

@@ -231,6 +231,76 @@ def test_stall_watchdog_does_not_trip_when_stopped_before_timeout():
     assert node_queue.get_node_job(job_id)["status"] == "running"
 
 
+# ── job-status watcher (abandon a job taken from us) ─────────────────────────
+# When a job is re-queued / reassigned out from under a worker (restart-resume,
+# lease reclaim), the worker must hard-exit so it doesn't double-run the row a
+# fresh claimant is now executing. Scoped to claimed_by, NOT bare status, so the
+# worker's OWN mark_completed/mark_failed (which keep claimed_by) don't trip it.
+
+
+def test_job_status_watcher_kills_when_job_requeued():
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="gpu",
+    )
+    node_queue.claim_next_gpu_job(0, host="box-a")  # running, claimed_by=box-a
+
+    exits: list[int] = []
+    w = claim_worker.JobStatusWatcher(
+        job_id=job_id, claimed_by="box-a",
+        on_exit=lambda c: exits.append(c), poll_s=0.02,
+    )
+    w.start()
+    node_queue.reclaim_all_running_for_resume()  # external re-queue clears claimed_by
+    deadline = time.time() + 3.0
+    while time.time() < deadline and not exits:
+        time.sleep(0.02)
+    w.stop()
+    assert exits, "must hard-exit when the job is re-queued out from under it"
+
+
+def test_job_status_watcher_quiet_while_job_ours_and_running():
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="gpu",
+    )
+    node_queue.claim_next_gpu_job(0, host="box-a")
+
+    exits: list[int] = []
+    w = claim_worker.JobStatusWatcher(
+        job_id=job_id, claimed_by="box-a",
+        on_exit=lambda c: exits.append(c), poll_s=0.02,
+    )
+    w.start()
+    time.sleep(0.15)
+    w.stop()
+    assert exits == []
+
+
+def test_job_status_watcher_ignores_own_completion():
+    """A normal completion sets status but KEEPS claimed_by, so the watcher must
+    NOT fire — only an external hand-off (claimed_by cleared/changed) kills."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="gpu",
+    )
+    node_queue.claim_next_gpu_job(0, host="box-a")
+
+    exits: list[int] = []
+    w = claim_worker.JobStatusWatcher(
+        job_id=job_id, claimed_by="box-a",
+        on_exit=lambda c: exits.append(c), poll_s=0.02,
+    )
+    w.start()
+    with connection() as conn, conn.cursor() as cur:
+        node_queue.mark_completed_in_txn(
+            cur, job_id, context_delta={}, seconds=1.0, vm_rss_mb_peak=None,
+        )
+    time.sleep(0.15)
+    w.stop()
+    assert exits == [], "own completion keeps claimed_by → must not self-kill"
+
+
 # ── lease renewal ──────────────────────────────────────────────────────────
 
 
@@ -767,13 +837,21 @@ def test_heartbeat_thread_refreshes_then_stops(_heartbeat_enabled):
         )
         before = cur.fetchone()["last_seen"]
 
-    time.sleep(0.1)
-    with connection() as c, c.cursor() as cur:
-        cur.execute(
-            "SELECT last_seen FROM worker_heartbeats "
-            "WHERE host_label='box-b' AND queue='cpu'"
-        )
-        after = cur.fetchone()["last_seen"]
+    # Poll until the daemon's next upsert advances last_seen. A fixed sleep
+    # flakes under load: the 0.02s-interval thread may not get scheduled (or two
+    # upserts collide on the same now()) inside a tight fixed window.
+    after = before
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        time.sleep(0.05)
+        with connection() as c, c.cursor() as cur:
+            cur.execute(
+                "SELECT last_seen FROM worker_heartbeats "
+                "WHERE host_label='box-b' AND queue='cpu'"
+            )
+            after = cur.fetchone()["last_seen"]
+        if after > before:
+            break
     assert after > before
 
     emitter.stop()

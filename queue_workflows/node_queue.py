@@ -533,6 +533,40 @@ def reclaim_expired_leases() -> list[dict[str, Any]]:
         return list(cur.fetchall())
 
 
+def reclaim_all_running_for_resume() -> list[dict[str, Any]]:
+    """Re-queue EVERY ``running`` node job back to ``queued`` — the restart
+    hook, not the lease-expiry path (:func:`reclaim_expired_leases`).
+
+    Called on orchestrator boot: a force-recreate restart (or a crash) has just
+    bounced the whole fleet, so any ``running`` row is orphaned — its worker is
+    gone. Flip them all back to ``queued`` immediately (clearing the lease
+    bookkeeping, jumping the queue via ``LEAST(priority, 10)``) instead of
+    waiting up to the full 600 s lease for the expiry sweep, so the fresh
+    workers pick the work straight back up. The status flip fires the
+    ``node_job_ready`` NOTIFY so an idle worker grabs it at once.
+
+    Safe against a worker that somehow survived the restart and still holds a
+    row: clearing ``claimed_by`` trips that worker's :class:`JobStatusWatcher`
+    (it polls its row and hard-exits the instant the row is no longer
+    claimed-by-it), so the row is never run twice.
+
+    Returns the reclaimed rows' ``id`` / ``run_id`` / ``node_id``."""
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE workflow_node_jobs
+            SET status = 'queued',
+                started_at = NULL,
+                claimed_by = NULL,
+                lease_expires_at = NULL,
+                priority = LEAST(priority, 10)
+            WHERE status = 'running'
+            RETURNING id, run_id, node_id
+            """,
+        )
+        return list(cur.fetchall())
+
+
 # ── Worker capacity heartbeat (DRY upsert) ──────────────────────────────────
 #
 # Single home for the ``worker_heartbeats`` INSERT … ON CONFLICT so the two

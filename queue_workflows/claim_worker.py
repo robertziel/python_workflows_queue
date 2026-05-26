@@ -372,6 +372,75 @@ class StallWatchdog:
             self._thread = None
 
 
+# ── job-status watcher (abandon a job taken from us) ───────────────────────
+
+
+class JobStatusWatcher:
+    """Daemon thread that HARD-EXITS the worker the instant its claimed job is
+    no longer ``claimed_by`` this host — i.e. another actor re-queued it
+    (orchestrator restart-resume / lease reclaim) or reassigned it to a peer.
+    Polls ``workflow_node_jobs`` every ``poll_s``; on a miss it calls
+    ``on_exit`` (default ``os._exit``). systemd then restarts the worker and it
+    claims fresh work.
+
+    This is what makes re-queuing a *running* job SAFE: the displaced worker
+    kills itself instead of racing the new claimant to a double-run. ``os._exit``
+    is the only way to abandon a node body wedged deep in a CUDA kernel.
+
+    Scoped to ``claimed_by`` (not bare ``status``) on purpose: the worker's OWN
+    terminal mark — ``mark_completed`` / ``mark_failed`` set ``status`` but leave
+    ``claimed_by`` intact — must NOT trip it; only an external hand-off (which
+    clears or changes ``claimed_by``) does."""
+
+    def __init__(
+        self, *, job_id: str, claimed_by: str,
+        on_exit: Callable[[int], None] | None = None,
+        poll_s: float = 2.0, exit_code: int = 77,
+    ) -> None:
+        self._job_id = job_id
+        self._claimed_by = claimed_by
+        self._on_exit = on_exit or os._exit
+        self._poll_s = float(poll_s)
+        self._exit_code = int(exit_code)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True,
+            name=f"job-status-{self._job_id[:8]}",
+        )
+        self._thread.start()
+
+    def _loop(self) -> None:
+        # Wait first, then check — gives the claim a moment to settle and wakes
+        # instantly on stop().
+        while not self._stop.wait(self._poll_s):
+            try:
+                row = node_queue.get_node_job(self._job_id)
+            except Exception:
+                log.exception("[job-status-watcher] %s poll failed; retrying",
+                              self._job_id)
+                continue
+            if row is None or row.get("claimed_by") != self._claimed_by:
+                log.warning(
+                    "[job-status-watcher] %s no longer ours "
+                    "(status=%s claimed_by=%s) — hard-exiting so a fresh worker "
+                    "resumes it",
+                    self._job_id,
+                    None if row is None else row.get("status"),
+                    None if row is None else row.get("claimed_by"),
+                )
+                self._on_exit(self._exit_code)
+                return
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+
 # ── worker capacity heartbeat ────────────────────────────────────────────────
 
 
@@ -599,8 +668,12 @@ class ClaimWorker:
             job_id=job_id, claimed_by=self.host, lease_s=self.lease_s,
         )
         watchdog = Watchdog(job_id=job_id, budget_s=budget_for(job))
+        # Abandon-watcher: hard-exit if this job is re-queued / reassigned out
+        # from under us (restart-resume, lease reclaim) so it's never double-run.
+        status_watcher = JobStatusWatcher(job_id=job_id, claimed_by=self.host)
         renewer.start()
         watchdog.start()
+        status_watcher.start()
         # No-progress watchdog: armed only for gpu nodes that report per-step
         # progress (declare a ``status_callback``). Its ``beat`` is threaded to
         # the node as ``status_callback`` and pulsed once by the executor after
@@ -641,6 +714,7 @@ class ClaimWorker:
         finally:
             if busy:
                 self.model_cache.mark_idle()
+            status_watcher.stop()
             if stall is not None:
                 stall.stop()
             watchdog.stop()

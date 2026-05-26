@@ -261,3 +261,33 @@ def test_ingest_sweep_does_not_reclaim_fresh_lease():
     row = node_queue.get_ingest_job(job_id)
     assert row["status"] == "running"
     assert row["claimed_by"] == "host-x"
+
+
+# ── reclaim ALL running (the restart-resume hook, NOT lease-expiry) ──────────
+
+
+def test_reclaim_all_requeues_running_regardless_of_lease():
+    """``reclaim_all_running_for_resume`` re-queues EVERY running row — even one
+    with a FRESH lease the expiry sweep deliberately leaves alone. That's the
+    restart case: the fleet was just bounced, so the worker is gone even though
+    the lease hasn't lapsed yet — don't make the row wait out 600s."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="a", node_module="x", queue="gpu",
+        required_model="qwen_edit", priority=100,
+    )
+    force_lease(job_id, expires_in_s=600)  # fresh — the expiry sweep won't touch it
+    assert node_queue.reclaim_expired_leases() == []  # sanity: not yet expired
+
+    rows = node_queue.reclaim_all_running_for_resume()
+    assert any(r["id"] == job_id for r in rows)
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "queued"
+    assert row["claimed_by"] is None
+    assert row["lease_expires_at"] is None
+    assert row["started_at"] is None
+    assert row["priority"] <= 10
+
+
+def test_reclaim_all_noop_when_nothing_running():
+    assert node_queue.reclaim_all_running_for_resume() == []
