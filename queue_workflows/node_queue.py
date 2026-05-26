@@ -24,12 +24,15 @@ generic.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from queue_workflows.db import connection
+
+log = logging.getLogger(__name__)
 
 
 # ── Types ────────────────────────────────────────────────────────────────
@@ -1021,6 +1024,119 @@ def count_unprocessed_dispatch_events() -> int:
             "WHERE processed_at IS NULL"
         )
         return int(cur.fetchone()["n"])
+
+
+# ── Node-event history (per-node, per-attempt) ─────────────────────────────
+#
+# Append-only log (migration 0011). ``record_node_event_in_txn`` rides the SAME
+# transaction as the terminal / requeue state change (outbox-atomicity, exactly
+# like ``enqueue_dispatch_event_in_txn``). ``record_node_event`` opens its OWN
+# connection and is BEST-EFFORT — it swallows every error so an event-write blip
+# can never fail the load-bearing claim / terminal / watchdog path.
+
+#: The migration-0011 CHECK set, mirrored here so a bad type fails loudly in
+#: Python (before the surrounding txn aborts on the DB CHECK).
+NODE_EVENT_TYPES = frozenset({
+    "claimed", "model_load_start", "model_load_done", "progress_beat",
+    "stall_suspected", "stall_trip", "gpu_health_trip", "budget_trip",
+    "requeued", "reassigned", "lease_renew", "completed", "failed",
+    "cancelled", "error",
+})
+
+
+def record_node_event_in_txn(
+    cur,
+    *,
+    run_id: str,
+    node_id: str,
+    event_type: str,
+    job_id: str | None = None,
+    attempt: int = 0,
+    host_label: str | None = None,
+    queue: str | None = None,
+    model: str | None = None,
+    elapsed_s: float | None = None,
+    error: str | None = None,
+    detail: dict[str, Any] | None = None,
+) -> int:
+    """Append one node event in the caller's transaction (outbox-atomicity).
+
+    Used by the terminal (completed/failed/cancelled) + requeue paths so the
+    event lands atomically with the state change — mirroring
+    :func:`enqueue_dispatch_event_in_txn`. ``event_type`` must be in
+    :data:`NODE_EVENT_TYPES` (validated here so a bad type raises in Python
+    rather than aborting the surrounding txn on the DB CHECK). ``attempt`` is
+    the node-job's ``watchdog_retries`` at emit time — the cross-attempt key."""
+    if event_type not in NODE_EVENT_TYPES:
+        raise ValueError(f"unknown node event_type: {event_type!r}")
+    cur.execute(
+        """
+        INSERT INTO workflow_node_events
+            (run_id, node_id, job_id, attempt, event_type,
+             host_label, queue, model, elapsed_s, error, detail)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            run_id, node_id, job_id, int(attempt or 0), event_type,
+            host_label, queue, model, elapsed_s,
+            (error[:8000] if error else error),
+            _as_json(detail or {}),
+        ),
+    )
+    return int(cur.fetchone()["id"])
+
+
+def record_node_event(
+    *,
+    run_id: str,
+    node_id: str,
+    event_type: str,
+    job_id: str | None = None,
+    attempt: int = 0,
+    host_label: str | None = None,
+    queue: str | None = None,
+    model: str | None = None,
+    elapsed_s: float | None = None,
+    error: str | None = None,
+    detail: dict[str, Any] | None = None,
+) -> int | None:
+    """Best-effort append of one node event on its OWN connection.
+
+    For the non-terminal emit sites (claim, model-load, watchdog
+    suspected/trip, reassign, lease-renew) that must NOT widen or fail the
+    load-bearing path. Swallows EVERY exception (logs once) and returns ``None``
+    on failure — an event-history blip can never take down a node run. The
+    terminal / requeue sites use :func:`record_node_event_in_txn` instead
+    (atomic with the state change)."""
+    try:
+        with connection() as conn, conn.cursor() as cur:
+            return record_node_event_in_txn(
+                cur, run_id=run_id, node_id=node_id, event_type=event_type,
+                job_id=job_id, attempt=attempt, host_label=host_label,
+                queue=queue, model=model, elapsed_s=elapsed_s, error=error,
+                detail=detail,
+            )
+    except Exception:  # noqa: BLE001 — best-effort; never propagate
+        log.exception(
+            "[node-event] failed to record %s for run=%s node=%s (ignored)",
+            event_type, run_id, node_id,
+        )
+        return None
+
+
+def prune_node_events(older_than_days: int = 30) -> int:
+    """Delete node events older than ``older_than_days`` (append-only growth
+    control; ``ON DELETE CASCADE`` already covers run-delete / purge). Called
+    from an interval-gated NodePool sweep. Returns rows deleted."""
+    days = max(int(older_than_days), 1)
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM workflow_node_events "
+            "WHERE created_at < now() - make_interval(days => %s)",
+            (days,),
+        )
+        return cur.rowcount or 0
 
 
 def cancel_queued_jobs_for_run(run_id: str) -> int:

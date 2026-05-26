@@ -71,6 +71,7 @@ _ENGINE_TABLES = (
     "workflow_node_jobs",
     "workflow_run_files",
     "workflow_dispatch_events",
+    "workflow_node_events",
     "workflow_input_submissions",
     "workflow_runs",
     "worker_heartbeats",
