@@ -306,6 +306,47 @@ def _clear_busy_ghost(host_label: str | None, queue: str | None) -> None:
         )
 
 
+def _trip_event_type(label: str) -> str:
+    """Map a watchdog's label tag to its node-event type (migration 0011)."""
+    lbl = (label or "").lower()
+    if "stall" in lbl:
+        return "stall_trip"
+    if "gpu" in lbl:
+        return "gpu_health_trip"
+    return "budget_trip"
+
+
+def _emit_node_event(
+    job_id: str,
+    event_type: str,
+    *,
+    host_label: str | None = None,
+    queue: str | None = None,
+    error: str | None = None,
+    detail: dict | None = None,
+    row: dict | None = None,
+) -> None:
+    """Best-effort node event from a claim / watchdog site that holds a job_id
+    (and usually the row already). Fetches the row for run_id / node_id /
+    attempt / model when not supplied; NEVER raises (forensic only — the
+    underlying node_queue.record_node_event swallows too). Skips ingest jobs and
+    vanished rows (no DAG run_id ⇒ nothing to attach the event to)."""
+    try:
+        r = row if row is not None else node_queue.get_node_job(job_id)
+        if not r or not r.get("run_id"):
+            return
+        node_queue.record_node_event(
+            run_id=r["run_id"], node_id=r["node_id"], job_id=job_id,
+            attempt=int(r.get("watchdog_retries") or 0), event_type=event_type,
+            host_label=host_label, queue=queue, model=r.get("required_model"),
+            error=error, detail=detail,
+        )
+    except Exception:
+        log.exception(
+            "[node-event] emit %s for %s failed (ignored)", event_type, job_id,
+        )
+
+
 def _fail_job_and_exit(
     *, job_id: str, table: str, error: str,
     on_exit: Callable[[int], None], exit_code: int,
@@ -336,6 +377,11 @@ def _fail_job_and_exit(
                     node_queue.enqueue_dispatch_event_in_txn(
                         cur, row["run_id"], row["node_id"], "failed",
                     )
+            if row is not None:
+                _emit_node_event(
+                    job_id, "failed", host_label=host_label, queue=queue,
+                    error=error, row=row,
+                )
     except Exception:
         log.exception("[watchdog] %s could not mark failed before exit", job_id)
     _clear_busy_ghost(host_label, queue)
@@ -374,7 +420,14 @@ def _requeue_job_and_exit(
     correct — an ingest job has no DAG run to keep alive, and ``ingest_jobs`` has
     its own ``reclaim_expired_ingest_leases`` re-queue.)"""
     try:
-        node_queue.requeue_job_for_retry(job_id)
+        _requeued = node_queue.requeue_job_for_retry(job_id)
+        if _requeued is not None:
+            _emit_node_event(
+                job_id, "requeued", host_label=host_label, queue=queue,
+                error=error, row=_requeued,
+                detail={"retry": int(_requeued.get("watchdog_retries") or 0),
+                        "cap": _watchdog_max_retries()},
+            )
     except Exception:
         log.exception(
             "[watchdog] %s could not re-queue before exit (lease reclaim will "
@@ -440,7 +493,16 @@ def _watchdog_trip(
             "[%s] %s could not read watchdog_retries; assuming 0 (re-queue)",
             label, job_id,
         )
+        row = None
         retries = 0
+
+    # Forensic: record the trip itself (stall / gpu-health / budget) regardless
+    # of the requeue-vs-fail outcome below — the matching requeued / failed
+    # event is emitted by the chosen exit path.
+    _emit_node_event(
+        job_id, _trip_event_type(label), host_label=host_label, queue=queue,
+        error=error, row=row,
+    )
 
     if retries < cap:
         attempt = retries + 1
@@ -735,6 +797,17 @@ class StallWatchdog:
             "step, NOT killing; resetting the window",
             self._job_id, int(self._stall_timeout_s), max_util, ram_anchor, ram_now,
         )
+        # Highest-value invisible signal today: the stall was SUSPECTED but the
+        # worker is healthy (loading / slow step), so we did NOT kill it. Record
+        # it so the "why did this node look stuck but wasn't" story is in-app.
+        _emit_node_event(
+            self._job_id, "stall_suspected",
+            host_label=self._host_label, queue=self._queue,
+            error=(f"no beat for {int(self._stall_timeout_s)}s but GPU/RAM "
+                   f"active — not killing"),
+            detail={"max_sm_pct": max_util, "ram_anchor_mb": ram_anchor,
+                    "ram_now_mb": ram_now},
+        )
         return False
 
     def _trip(self) -> None:
@@ -1026,6 +1099,13 @@ class JobStatusWatcher:
                     None if row is None else row.get("status"),
                     None if row is None else row.get("claimed_by"),
                 )
+                if row is not None:
+                    _emit_node_event(
+                        self._job_id, "reassigned",
+                        host_label=self._claimed_by, row=row,
+                        detail={"new_claimed_by": row.get("claimed_by"),
+                                "status": row.get("status")},
+                    )
                 self._on_exit(self._exit_code)
                 return
 
@@ -1242,6 +1322,9 @@ class ClaimWorker:
         log.info(
             "[claim-worker:%s] claimed %s (node=%s model=%s)",
             self.queue, job_id, job.get("node_id"), job.get("required_model"),
+        )
+        _emit_node_event(
+            job_id, "claimed", host_label=self.host, queue=self.queue, row=job,
         )
 
         # Input/await nodes carry a sentinel module name (``__input__<widget>``)

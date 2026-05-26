@@ -278,6 +278,11 @@ def execute_node(
             t0_model = time.time()
             handle = model_cache.require_model(required_model)
             model_load_seconds = time.time() - t0_model
+            node_queue.record_node_event(
+                event_type="model_load_done", elapsed_s=model_load_seconds,
+                detail={"model_load_s": round(model_load_seconds, 2)},
+                **_event_base(job),
+            )
         except Exception as exc:
             err = f"model load failed: {type(exc).__name__}: {exc}"
             log.exception("[execute_node] %s %s", job_id, err)
@@ -331,11 +336,12 @@ def execute_node(
         context_delta = result.get("context_delta", {})
         if _finalize is not None:
             context_delta = _finalize(context_delta)
+        seconds = time.time() - t0
         with _db_connection() as conn, conn.cursor() as cur:
             row = node_queue.mark_completed_in_txn(
                 cur, job_id,
                 context_delta=context_delta,
-                seconds=time.time() - t0,
+                seconds=seconds,
                 vm_rss_mb_peak=_rss_mb(),
             )
             if row is None:
@@ -347,19 +353,42 @@ def execute_node(
             node_queue.enqueue_dispatch_event_in_txn(
                 cur, job["run_id"], job["node_id"], "completed",
             )
+        # Forensic node event — best-effort, AFTER the load-bearing terminal txn
+        # commits, so an event-write blip can never roll back the completion.
+        node_queue.record_node_event(
+            event_type="completed", elapsed_s=seconds, **_event_base(job),
+        )
         _update_run_thumbnail(
             job["run_id"], job["node_id"], run, context_delta,
         )
         return "completed"
 
 
+def _event_base(job: dict) -> dict[str, Any]:
+    """Common node-event fields pulled from a workflow_node_jobs row, so every
+    emit site carries uniform host / attempt / model / queue context.
+    ``attempt`` = watchdog_retries at emit time (the cross-attempt key)."""
+    return {
+        "run_id": job["run_id"],
+        "node_id": job["node_id"],
+        "job_id": job.get("id"),
+        "attempt": int(job.get("watchdog_retries") or 0),
+        # claimed_by is the real host identity (the engine leaves host_label NULL
+        # in practice and uses claimed_by) — fall back to host_label just in case.
+        "host_label": job.get("claimed_by") or job.get("host_label"),
+        "queue": job.get("queue"),
+        "model": job.get("required_model"),
+    }
+
+
 def _finalise_failed(job: dict, error: str, t0: float) -> str:
     """Write the terminal ``failed`` row + ``failed`` dispatch event in
     one txn. Returns ``"failed"`` (or ``"skipped"`` if the row was
     already terminal)."""
+    seconds = time.time() - t0
     with _db_connection() as conn, conn.cursor() as cur:
         row = node_queue.mark_failed_in_txn(
-            cur, job["id"], error=error, seconds=time.time() - t0,
+            cur, job["id"], error=error, seconds=seconds,
         )
         if row is None:
             log.warning(
@@ -370,6 +399,10 @@ def _finalise_failed(job: dict, error: str, t0: float) -> str:
         node_queue.enqueue_dispatch_event_in_txn(
             cur, job["run_id"], job["node_id"], "failed",
         )
+    # Forensic node event — best-effort, after the terminal txn commits.
+    node_queue.record_node_event(
+        event_type="failed", elapsed_s=seconds, error=error, **_event_base(job),
+    )
     return "failed"
 
 

@@ -144,3 +144,50 @@ def test_prune_node_events_drops_old_rows():
     assert deleted == 1
     rows = _events(run_id)
     assert len(rows) == 1 and rows[0]["event_type"] == "claimed"
+
+
+# ── emit-site integration (execute_node terminal paths) ────────────────────
+
+
+def test_execute_node_emits_completed_event(monkeypatch):
+    """A real execute_node run leaves a durable ``completed`` node event with a
+    populated elapsed_s — the terminal emit is wired (best-effort, post-commit)."""
+    from queue_workflows import dispatcher, node_executor
+
+    run_id = make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="cpu",
+    )
+    job = node_queue.get_node_job(job_id)
+    monkeypatch.setattr(
+        node_executor, "_invoke", lambda **kw: {"context_delta": {"ok": True}},
+    )
+    monkeypatch.setattr(dispatcher, "on_node_completed", lambda *a, **k: 0)
+
+    assert node_executor.execute_node(job) == "completed"
+    types = [e["event_type"] for e in _events(run_id)]
+    assert "completed" in types
+    ce = next(e for e in _events(run_id) if e["event_type"] == "completed")
+    assert ce["elapsed_s"] is not None
+
+
+def test_execute_node_emits_failed_event(monkeypatch):
+    """A node body that raises leaves a durable ``failed`` node event carrying
+    the error text."""
+    from queue_workflows import node_executor
+
+    run_id = make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="cpu",
+    )
+    job = node_queue.get_node_job(job_id)
+
+    def boom(**kw):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(node_executor, "_invoke", boom)
+
+    assert node_executor.execute_node(job) == "failed"
+    failed = [e for e in _events(run_id) if e["event_type"] == "failed"]
+    assert len(failed) == 1
+    assert "kaboom" in (failed[0]["error"] or "")
