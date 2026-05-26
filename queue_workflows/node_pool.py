@@ -100,6 +100,17 @@ class NodePool:
         )
         self._ingest_reclaim_last_run: float = 0.0
 
+        # Dead-worker sweep — flags a worker whose ``worker_heartbeats`` row has
+        # gone stale WHILE it still owns a ``running`` job (a GPU-hardware-hang
+        # that wedged the worker PROCESS even though the lease-reclaim already
+        # re-queued the JOB). The orchestrator is a separate process, so it can
+        # see the frozen heartbeat the wedged worker's own GIL-blocked threads
+        # cannot act on. Interval-gated like the reclaim sweeps; own ``last_run``.
+        self._dead_worker_interval_s: float = float(
+            os.environ.get("AI_LEADS_DEAD_WORKER_SWEEP_INTERVAL_S", "5")
+        )
+        self._dead_worker_last_run: float = 0.0
+
     def start(self) -> None:
         if self._register_builtins is not None:
             try:
@@ -359,6 +370,16 @@ class NodePool:
         except Exception:
             log.exception("[node-pool] ingest-lease-reclaim sweep failed")
 
+        # 5) Dead-worker sweep — flag a worker whose heartbeat froze while it
+        # still owns a ``running`` job (a GPU-hardware-hang that wedged the
+        # worker PROCESS even though step 3 already re-queued its JOB). Surfaces
+        # the wedged worker for a host-supervisor to bounce — the orchestrator
+        # can't safely cross-host-kill it.
+        try:
+            self._sweep_dead_workers()
+        except Exception:
+            log.exception("[node-pool] dead-worker sweep failed")
+
     def _sweep_expired_leases(self) -> None:
         """Re-queue ``running`` rows whose PG lease has lapsed.
 
@@ -397,4 +418,48 @@ class NodePool:
                 "[node-pool] reclaimed expired-lease ingest job %s "
                 "(task=%s queue=%s) → re-queued",
                 row.get("id"), row.get("task_name"), row.get("queue"),
+            )
+
+    def _sweep_dead_workers(self) -> None:
+        """Flag a worker whose ``worker_heartbeats`` row has gone stale WHILE it
+        still owns a ``running`` job, and surface it for a host-supervisor to
+        bounce.
+
+        This closes the gap the lease-reclaim alone can't: a GPU-hardware-hang
+        can wedge the worker PROCESS (a torch/HIP call blocked in a dead GPU
+        context) so its in-process watchdog can't act and its heartbeat freezes,
+        even after :meth:`_sweep_expired_leases` has re-queued the JOB onto a
+        healthy host. The orchestrator runs in a SEPARATE process — independent
+        of the wedged worker's blocked Python threads — so it can observe the
+        frozen heartbeat and flag the dead worker.
+
+        Recovery split:
+          * the JOB is already recovered by the lease-reclaim sweep (step 3);
+          * the dead PROCESS is flagged here — a clear ERROR log + a durable
+            ``worker_heartbeats.last_flagged_dead_at`` marker an operator /
+            host-supervisor polls. The orchestrator does NOT kill the worker: a
+            cross-host container kill isn't safe/feasible from here (no docker
+            socket, different host). See ``docs`` / module note for the
+            host-supervisor hook that consumes the flag.
+
+        Interval-gated (``_dead_worker_interval_s``, default 5 s) so the 0.5 s
+        dispatch loop doesn't run the detector UPDATE every tick. The detector
+        is itself idempotent (re-flags only after a recovered worker goes stale
+        again), so the gate is purely a load optimisation."""
+        import time as _time
+
+        now = _time.time()
+        if now - self._dead_worker_last_run < self._dead_worker_interval_s:
+            return
+        self._dead_worker_last_run = now
+
+        flagged = node_queue.flag_stale_workers_holding_running_jobs()
+        for row in flagged:
+            log.error(
+                "[node-pool] DEAD WORKER: %s/%s heartbeat stale since %s but "
+                "still owns %s running job(s) — worker PROCESS is wedged (GPU "
+                "hang?); job(s) re-queued by lease-reclaim, but the container "
+                "must be bounced (host-supervisor should restart it)",
+                row.get("host_label"), row.get("queue"),
+                row.get("last_seen"), row.get("running_jobs"),
             )

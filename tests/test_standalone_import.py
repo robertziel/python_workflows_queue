@@ -78,6 +78,8 @@ def test_migrations_dir_ships_the_sql():
         "0006_pg_queue_lease.sql",
         "0007_ingest_jobs.sql",
         "0008_multitenant_ingest.sql",
+        "0009_worker_heartbeats_dead_flag.sql",
+        "0010_node_job_watchdog_retries.sql",
     ]
 
 

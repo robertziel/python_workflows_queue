@@ -23,20 +23,31 @@ Daemon threads bracket each claimed job:
   * :class:`LeaseRenewer` — every ~10 s pushes ``lease_expires_at`` out so a
     long job keeps its lease; scoped to ``id AND claimed_by`` so it can't
     extend a lease a reclaim already handed to another worker.
-  * :class:`Watchdog` — a wall-clock budget. On trip it marks the row failed
-    then HARD-exits the process; the lease then lets
-    ``reclaim_expired_leases`` re-queue it. Applied to CPU + ingest jobs only.
+  * :class:`Watchdog` — a wall-clock budget. On trip it RE-QUEUES the node for a
+    retry on a fresh worker (DAG jobs; run stays alive) under a per-job cap, then
+    fails the run once the cap is reached — and HARD-exits the process either way.
+    Applied to CPU + ingest jobs only (ingest trips always mark failed — no run).
   * :class:`GpuHealthWatchdog` — the GPU guard, HEALTH-driven not wall-clock:
     it replaces the fixed budget for GPU jobs and kills ONLY a truly-wedged
     worker (no per-container GPU work AND static container RAM over a 5-min
     window). A busy GPU or a > 5 GB RAM move keeps the job alive no matter how
-    long it runs — there is NO fixed time cap for GPU renders.
+    long it runs — there is NO fixed time cap for GPU renders. It arms AT job
+    start with a generous load-grace first window (so a load-phase hang, and a
+    GPU node that never beats, are both bounded), then falls to the 5-min
+    cadence on the first beat.
   * :class:`StallWatchdog` — a tight no-progress deadline kept for non-video
-    GPU nodes (defense in depth: catches a fast 0%-GPU hang in ~2 min).
+    GPU nodes (defense in depth: catches a fast 0%-GPU hang in ~2 min). Its trip
+    is GATED on the physical signal: a no-beat timeout only SUSPECTS a stall, then
+    it confirms GPU-idle AND RAM-static before killing, so a loading / preparing /
+    slow-but-working node is never a false positive.
 
 GPU jobs are policed by HEALTH, never by elapsed time — a long-but-healthy
 render is never killed; a wedged one is caught by the health watchdog (and, for
-non-video, the stall watchdog) and re-queued via the lease reclaim.
+non-video, the stall watchdog). A trip RE-QUEUES the node for a retry on a fresh
+worker (the run stays ``running``) up to ``AI_LEADS_WATCHDOG_MAX_RETRIES`` times,
+then fails the run — so a single transient wedge no longer kills a whole workflow.
+On a hard-exit the trip path also clears this worker's ``current_model`` busy-ghost
+so a killed worker doesn't keep inflating the GPU-busy gauge.
 """
 
 from __future__ import annotations
@@ -81,8 +92,12 @@ NOTIFY_POLL_TIMEOUT_S = 1.0                   # safety poll for a dropped NOTIFY
 # load completes — which ARMS the watchdog. It is inert before that first beat,
 # so a multi-minute cold model load (observed ~6 min) can't false-trip it. The
 # window only spans the gap between two diffusion steps (~12 s), so it can be
-# tight: no beat for this long once armed ⇒ hung ⇒ fail + hard-exit so the lease
-# reclaim re-queues the job onto a healthy host.
+# tight. CRITICAL (Part A): no beat for this long once armed is only a SUSPECTED
+# stall, not a verdict — the watchdog then CONFIRMS against the physical GPU/RAM
+# signal (GPU idle AND RAM static) and trips ONLY if the worker is genuinely
+# doing nothing; a loading / preparing / slow-but-working node (busy GPU or moving
+# RAM) is re-armed, never killed. A confirmed wedge re-queues the node + hard-exits
+# so the lease reclaim retries it on a healthy host (run stays alive, under a cap).
 STALL_TIMEOUT_S = 120.0                        # ≫ inter-step gap (~12 s); load is excluded
 STALL_POLL_S = 5.0
 
@@ -121,6 +136,31 @@ def _env_int(name: str, default: int) -> int:
 GPU_HEALTH_INTERVAL_S = _env_float("AI_LEADS_GPU_HEALTH_INTERVAL_S", 300.0)
 GPU_IDLE_PCT = _env_int("AI_LEADS_GPU_IDLE_PCT", 5)
 GPU_HEALTH_RAM_DELTA_MB = _env_int("AI_LEADS_GPU_HEALTH_RAM_DELTA_MB", 5120)  # 5 GiB
+# First-window length when the watchdog arms AT job start (before any beat).
+# Generous (20 min) so a healthy-but-slow cold model load — which moves RAM as
+# weights load and so can't trip the "GPU idle AND RAM static" rule anyway — is
+# never policed tightly; it only bounds a load that is GENUINELY hung (idle GPU
+# AND static RAM) past this grace. The first beat (executor post-load / per
+# step) collapses the window to the normal GPU_HEALTH_INTERVAL_S cadence.
+GPU_HEALTH_LOAD_GRACE_S = _env_float("AI_LEADS_GPU_HEALTH_LOAD_GRACE_S", 1200.0)  # 20 min
+
+# ── watchdog re-queue-with-cap policy ───────────────────────────────────────
+# A watchdog trip RE-QUEUES the node for a retry on a fresh worker (flip
+# running→queued, clear the lease, bump priority to the front, increment the
+# per-job ``watchdog_retries`` counter — see node_queue.requeue_job_for_retry)
+# rather than failing the whole run. A node that wedges EVERY time would loop
+# forever, so the retry is CAPPED: once a job's ``watchdog_retries`` reaches this
+# many, the trip falls back to the old mark-failed path (→ run fails). The cap is
+# read at trip-time (not captured at import) so an ops env-override takes effect
+# without a process restart, and so tests can flip it per-case.
+WATCHDOG_MAX_RETRIES = _env_int("AI_LEADS_WATCHDOG_MAX_RETRIES", 3)
+
+
+def _watchdog_max_retries() -> int:
+    """The watchdog re-queue cap, read live from ``AI_LEADS_WATCHDOG_MAX_RETRIES``
+    (default 3). Read at trip-time so an env-override needs no restart."""
+    return _env_int("AI_LEADS_WATCHDOG_MAX_RETRIES", WATCHDOG_MAX_RETRIES)
+
 
 # Worker capacity heartbeat refresh cadence. Rails' queue gauge treats a row
 # whose ``last_seen`` is older than 30 s as stale, so a 10 s refresh keeps us
@@ -244,16 +284,43 @@ class LeaseRenewer:
 # ── watchdog ─────────────────────────────────────────────────────────────
 
 
+def _clear_busy_ghost(host_label: str | None, queue: str | None) -> None:
+    """Best-effort: clear THIS worker's ``current_model`` busy-ghost before a hard
+    exit (Part C). ``os._exit`` skips ``_run_node``'s ``finally`` — so
+    ``ModelCache.mark_idle`` and the heartbeat refresh never run, and the worker's
+    last ``worker_heartbeats`` row keeps advertising a ``current_model`` even
+    though the process is dead, inflating Rails' "N/M GPU busy" gauge (the user's
+    "3/2 GPU busy" after a kill). Null it out + age ``last_seen`` past the gauge's
+    30 s window so the dead worker drops out at once. Swallows everything — a hung
+    DB write must NEVER block the hard-exit. No-op when the worker identity wasn't
+    threaded through (e.g. a unit test constructing a watchdog with just a
+    ``job_id``), or for a CPU/ingest worker that never advertised a model."""
+    if not host_label or not queue:
+        return
+    try:
+        node_queue.clear_worker_current_model(host_label, queue)
+    except Exception:
+        log.exception(
+            "[watchdog] could not clear current_model busy-ghost for %s/%s "
+            "before exit (gauge will age it out within ~30s)", host_label, queue,
+        )
+
+
 def _fail_job_and_exit(
     *, job_id: str, table: str, error: str,
     on_exit: Callable[[int], None], exit_code: int,
+    host_label: str | None = None, queue: str | None = None,
 ) -> None:
     """Mark a doomed job ``failed`` (+ the dispatch-event outbox row for DAG
     node-jobs) then call ``on_exit``. Shared by :class:`Watchdog` (budget) and
     :class:`StallWatchdog` (no-progress) so the outbox-atomicity contract — the
     terminal mark and the ``failed`` event in ONE txn — is written in exactly
     one place. A mark failure is swallowed + logged: the hard-exit must still
-    happen so the lease can expire and a reclaim re-queue the row."""
+    happen so the lease can expire and a reclaim re-queue the row.
+
+    Before exiting it also clears this worker's ``current_model`` busy-ghost
+    (:func:`_clear_busy_ghost`) so the dead worker doesn't keep inflating the
+    GPU-busy gauge (Part C)."""
     try:
         if table == "ingest_jobs":
             # Ingest job: no parent run, no dispatch-event outbox — just mark
@@ -271,14 +338,142 @@ def _fail_job_and_exit(
                     )
     except Exception:
         log.exception("[watchdog] %s could not mark failed before exit", job_id)
+    _clear_busy_ghost(host_label, queue)
     on_exit(exit_code)
+
+
+def _requeue_job_and_exit(
+    *, job_id: str, table: str, error: str,
+    on_exit: Callable[[int], None], exit_code: int,
+    host_label: str | None = None, queue: str | None = None,
+) -> None:
+    """Re-queue a watchdog-tripped DAG node-job for a RETRY on a fresh worker,
+    then call ``on_exit`` — the re-queue twin of :func:`_fail_job_and_exit`.
+
+    Instead of failing the run, flip the row ``running`` → ``queued`` (clearing
+    the lease, bumping priority to the front, incrementing ``watchdog_retries``)
+    via :func:`node_queue.requeue_job_for_retry`. Writes NO dispatch event — the
+    run stays ``running``; only this node re-runs. The ``node_job_ready`` NOTIFY
+    fired by the status flip wakes an idle worker to re-claim it.
+
+    Same exit/atomicity discipline as :func:`_fail_job_and_exit`: a re-queue
+    failure is swallowed + logged, but the hard-exit STILL happens — leaving the
+    row ``running`` with a lease that the orchestrator's ``reclaim_expired_leases``
+    will eventually re-queue anyway, so the node is never silently stranded.
+
+    SAFETY (no double-run): the re-queue sets ``status='queued'`` and clears
+    ``claimed_by``, then this process hard-exits. The fresh re-claim is the same
+    CAS-guarded ``queued → running`` UPDATE as any claim; and any OTHER worker
+    that still thought it held this row self-exits the instant its
+    :class:`JobStatusWatcher` sees ``claimed_by`` no longer equals it. So at most
+    one worker ever runs the re-queued node, and node bodies are idempotent on
+    their out_dir.
+
+    Only meaningful for ``workflow_node_jobs`` — ``requeue_job_for_retry`` targets
+    that table. (Ingest jobs never reach here: they take the fail path, which is
+    correct — an ingest job has no DAG run to keep alive, and ``ingest_jobs`` has
+    its own ``reclaim_expired_ingest_leases`` re-queue.)"""
+    try:
+        node_queue.requeue_job_for_retry(job_id)
+    except Exception:
+        log.exception(
+            "[watchdog] %s could not re-queue before exit (lease reclaim will "
+            "recover it)", job_id,
+        )
+    _clear_busy_ghost(host_label, queue)
+    on_exit(exit_code)
+
+
+def _watchdog_trip(
+    *, job_id: str, table: str, error: str, label: str,
+    on_exit: Callable[[int], None], exit_code: int,
+    host_label: str | None = None, queue: str | None = None,
+) -> None:
+    """Decide a watchdog trip's outcome: RE-QUEUE the node for a retry (under the
+    cap) or FAIL the run (cap reached), then hard-exit. Shared by all three
+    watchdogs so the policy lives in exactly one place.
+
+    ``host_label`` / ``queue`` identify the tripping worker so both outcome paths
+    can clear its ``current_model`` busy-ghost before the hard-exit (Part C).
+
+    Policy:
+
+      * DAG node-job (``workflow_node_jobs``): read the row's current
+        ``watchdog_retries`` (migration 0010). If it's ``< AI_LEADS_WATCHDOG_MAX_
+        RETRIES`` (default 3) the trip is treated as a TRANSIENT wedge —
+        :func:`_requeue_job_and_exit` re-queues the node + retries it on a fresh
+        worker, and the RUN stays alive. Once the counter has reached the cap the
+        node is wedging persistently, so we fall back to :func:`_fail_job_and_exit`
+        (mark failed + ``failed`` dispatch event → the run fails) rather than loop
+        forever.
+      * Ingest job (``ingest_jobs``): always :func:`_fail_job_and_exit` — there's
+        no DAG run to keep alive and no ``watchdog_retries`` column; the row is
+        marked failed and the ingest lease-reclaim handles re-queue separately.
+
+    Logs the chosen path + the attempt count clearly so an operator can see, per
+    trip, whether the node was retried (and which attempt) or finally failed.
+    ``label`` is the tripping watchdog's tag (e.g. ``stall-watchdog``) for the log
+    line."""
+    if table == "ingest_jobs":
+        log.error(
+            "[%s] %s tripped on an ingest job → marking failed (ingest jobs "
+            "have no run to keep alive; lease-reclaim re-queues separately)",
+            label, job_id,
+        )
+        _fail_job_and_exit(
+            job_id=job_id, table=table, error=error,
+            on_exit=on_exit, exit_code=exit_code,
+            host_label=host_label, queue=queue,
+        )
+        return
+
+    cap = _watchdog_max_retries()
+    # Read the current re-queue count to decide retry vs fail. A read failure
+    # (or a vanished row) is treated as 0 prior retries so we PREFER the
+    # non-destructive re-queue — never fail a run just because the count read
+    # blipped.
+    try:
+        row = node_queue.get_node_job(job_id)
+        retries = int((row or {}).get("watchdog_retries") or 0)
+    except Exception:
+        log.exception(
+            "[%s] %s could not read watchdog_retries; assuming 0 (re-queue)",
+            label, job_id,
+        )
+        retries = 0
+
+    if retries < cap:
+        attempt = retries + 1
+        log.warning(
+            "[%s] %s tripped (%s) — RE-QUEUEING for retry %d/%d on a fresh "
+            "worker; the run stays alive",
+            label, job_id, error, attempt, cap,
+        )
+        _requeue_job_and_exit(
+            job_id=job_id, table=table, error=error,
+            on_exit=on_exit, exit_code=exit_code,
+            host_label=host_label, queue=queue,
+        )
+    else:
+        log.error(
+            "[%s] %s tripped (%s) — watchdog retry cap reached (%d/%d); "
+            "FAILING the run",
+            label, job_id, error, retries, cap,
+        )
+        _fail_job_and_exit(
+            job_id=job_id, table=table, error=error,
+            on_exit=on_exit, exit_code=exit_code,
+            host_label=host_label, queue=queue,
+        )
 
 
 class Watchdog:
     """Daemon thread enforcing a wall-clock budget on a single running job. On
-    trip: mark the row failed with the budget-exceeded reason, then call
-    ``on_exit`` (default: hard ``os._exit``). A hard exit kills exactly the
-    over-budget job; the lease then lets the reclaim sweep re-queue it.
+    trip: route through :func:`_watchdog_trip` — for a DAG node-job, RE-QUEUE it
+    for a retry on a fresh worker under the cap (``AI_LEADS_WATCHDOG_MAX_RETRIES``,
+    default 3), then mark failed once the cap is reached; for an ingest job, mark
+    failed — then call ``on_exit`` (default: hard ``os._exit``). A hard exit kills
+    exactly the over-budget job.
 
     Applied to CPU + ingest jobs only — GPU jobs are policed by health
     (:class:`GpuHealthWatchdog`), not by a wall-clock cap, so a long-but-healthy
@@ -289,6 +484,7 @@ class Watchdog:
         on_exit: Callable[[int], None] | None = None,
         poll_s: float = 1.0, exit_code: int = 75,
         table: str = "workflow_node_jobs",
+        host_label: str | None = None, queue: str | None = None,
     ) -> None:
         if table not in _LEASE_TABLES:
             raise ValueError(f"watchdog table must be in {sorted(_LEASE_TABLES)}, got {table!r}")
@@ -298,6 +494,8 @@ class Watchdog:
         self._poll_s = float(poll_s)
         self._exit_code = int(exit_code)
         self._table = table
+        self._host_label = host_label
+        self._queue = queue
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -322,10 +520,15 @@ class Watchdog:
             f"exceeded wall-clock budget ({int(self._budget_s)}s) — "
             f"watchdog hard-stopped the worker"
         )
-        log.error("[watchdog] %s %s", self._job_id, err)
-        _fail_job_and_exit(
-            job_id=self._job_id, table=self._table, error=err,
+        # Re-queue-with-cap (DAG node-jobs) for uniformity with the no-progress /
+        # health watchdogs: a CPU over-budget MAY be a genuine runaway, but the
+        # cap bounds it either way — at most AI_LEADS_WATCHDOG_MAX_RETRIES retries
+        # then the run fails. Ingest over-budget still marks failed (no run to
+        # keep alive) — _watchdog_trip branches on the table.
+        _watchdog_trip(
+            job_id=self._job_id, table=self._table, error=err, label="watchdog",
             on_exit=self._on_exit, exit_code=self._exit_code,
+            host_label=self._host_label, queue=self._queue,
         )
 
     def stop(self) -> None:
@@ -338,25 +541,71 @@ class Watchdog:
 # ── stall (no-progress) watchdog ───────────────────────────────────────────
 
 
+#: How many GPU/RAM samples the StallWatchdog takes to CONFIRM a worker is truly
+#: wedged before it trips on a no-beat timeout (Part A — gate the trip on the
+#: physical signal). A few samples spaced ``STALL_CONFIRM_POLL_S`` apart so a
+#: single noisy reading can't flip the verdict either way.
+STALL_CONFIRM_SAMPLES = _env_int("AI_LEADS_STALL_CONFIRM_SAMPLES", 3)
+STALL_CONFIRM_POLL_S = _env_float("AI_LEADS_STALL_CONFIRM_POLL_S", 1.0)
+
+
 class StallWatchdog:
-    """Daemon thread enforcing a NO-PROGRESS deadline on one running job.
+    """Daemon thread enforcing a NO-PROGRESS deadline on one running job, GATED on
+    the physical GPU/RAM signal so a LOADING / PREPARING / slow-but-working node
+    is never killed.
 
     Where :class:`Watchdog` is a fixed wall-clock budget (catches a job running
     too *long*), this catches a job making *no progress*: it arms a short
     deadline that every :meth:`beat` pushes out. A GPU node beats once per
     diffusion step (threaded in as ``status_callback``); the executor also beats
     once when the model finishes loading, so the cold-load phase gets its own
-    fresh window. If no beat arrives within ``stall_timeout_s`` the node is hung
-    (model resident, GPU at 0 %) — :func:`_fail_job_and_exit` marks it failed +
-    writes the outbox event, then hard-exits so ``reclaim_expired_leases``
-    re-queues it onto a healthy host. ``beat`` is tolerant of extra args so it
-    can be wired straight in as a node ``status_callback``."""
+    fresh window.
+
+    **The no-beat timeout is necessary but NOT sufficient to trip** (the fix for
+    the user's false-positive: "should not kill if the GPU model is being loaded
+    or preparing to start; only if it does nothing"). When ``stall_timeout_s``
+    elapses with no beat, the watchdog does NOT trip outright — beat-absence alone
+    can't tell a wedged node from one in a legitimately slow step, mid-load, or
+    preparing. Instead it CONFIRMS with the SAME ``gpu_health`` samplers + the SAME
+    "GPU idle AND RAM static" predicate :class:`GpuHealthWatchdog` uses, over a
+    short confirmation window (``confirm_samples`` reads, ``confirm_poll_s``
+    apart):
+
+      * GPU busy at ANY sample (``max sm% > idle_pct``) ⇒ the node IS doing GPU
+        work (a slow step) ⇒ NOT wedged — reset the deadline, log, don't trip.
+      * RAM moving (``|Δ| > ram_delta_mb`` across the window) ⇒ the node is
+        loading weights / staging / preparing ⇒ NOT wedged — reset, log, don't
+        trip. (A multi-GB model load moves RAM far beyond the 5 GB delta, so a
+        cold/lazy load can NEVER false-trip.)
+      * ONLY when GPU stayed idle AND RAM stayed static across the whole
+        confirmation window — genuinely "doing nothing" — does it trip.
+
+    On a confirmed trip :func:`_watchdog_trip` RE-QUEUES the node for a retry on a
+    fresh worker (run stays alive) under the cap (``AI_LEADS_WATCHDOG_MAX_RETRIES``,
+    default 3), then marks it failed once the cap is reached, hard-exiting in
+    either case. ``beat`` is tolerant of extra args so it can be wired straight in
+    as a node ``status_callback``.
+
+    GPU/RAM samplers are injected (``gpu_sampler`` / ``ram_sampler``), defaulting
+    to :mod:`queue_workflows.gpu_health` — the exact same samplers
+    :class:`GpuHealthWatchdog` uses, so the two watchdogs' "is this worker idle?"
+    verdict is consistent. Tests feed fakes + a tight confirmation window.
+    ``host_label`` / ``queue`` are threaded so the trip path can clear this
+    worker's ``current_model`` busy-ghost on hard-exit (Part C)."""
 
     def __init__(
         self, *, job_id: str, stall_timeout_s: float = STALL_TIMEOUT_S,
         on_exit: Callable[[int], None] | None = None,
         poll_s: float = STALL_POLL_S, exit_code: int = 76,
         table: str = "workflow_node_jobs",
+        idle_pct: int = GPU_IDLE_PCT,
+        ram_delta_mb: int = GPU_HEALTH_RAM_DELTA_MB,
+        confirm_samples: int = STALL_CONFIRM_SAMPLES,
+        confirm_poll_s: float = STALL_CONFIRM_POLL_S,
+        gpu_sampler: Callable[[], int] | None = None,
+        ram_sampler: Callable[[], int | None] | None = None,
+        host_label: str | None = None,
+        queue: str | None = None,
     ) -> None:
         if table not in _LEASE_TABLES:
             raise ValueError(f"stall-watchdog table must be in {sorted(_LEASE_TABLES)}, got {table!r}")
@@ -366,6 +615,18 @@ class StallWatchdog:
         self._poll_s = float(poll_s)
         self._exit_code = int(exit_code)
         self._table = table
+        self._idle_pct = int(idle_pct)
+        self._ram_delta_mb = int(ram_delta_mb)
+        self._confirm_samples = max(1, int(confirm_samples))
+        self._confirm_poll_s = float(confirm_poll_s)
+        if gpu_sampler is None or ram_sampler is None:
+            from queue_workflows import gpu_health
+            gpu_sampler = gpu_sampler or gpu_health.gpu_util_pct
+            ram_sampler = ram_sampler or gpu_health.container_ram_mb
+        self._gpu_sampler = gpu_sampler
+        self._ram_sampler = ram_sampler
+        self._host_label = host_label
+        self._queue = queue
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -378,6 +639,12 @@ class StallWatchdog:
         """Record progress: arm (on the first call) / push the no-progress
         deadline out by one window. Thread-safe; ignores any args so it doubles
         as a node ``status_callback``."""
+        with self._lock:
+            self._deadline = time.monotonic() + self._stall_timeout_s
+
+    def _rearm(self) -> None:
+        """Open a fresh no-progress window (used after a no-beat timeout that the
+        physical-signal confirmation cleared as 'busy/loading, not wedged')."""
         with self._lock:
             self._deadline = time.monotonic() + self._stall_timeout_s
 
@@ -395,20 +662,94 @@ class StallWatchdog:
             with self._lock:
                 deadline = self._deadline
             if deadline is not None and time.monotonic() >= deadline:
-                self._trip()
-                return
+                # No beat for the window — but that ALONE doesn't mean wedged.
+                # Confirm against the physical GPU/RAM signal before tripping.
+                if self._confirm_wedged():
+                    self._trip()
+                    return
+                # Busy / loading / preparing — a false alarm. Re-arm the window
+                # and keep watching; do NOT kill a working node.
+                self._rearm()
             # Wake on stop OR at the next poll boundary, whichever first.
             self._stop.wait(self._poll_s)
 
+    def _sample_gpu(self) -> int:
+        try:
+            return int(self._gpu_sampler() or 0)
+        except Exception:
+            log.exception("[stall-watchdog] %s gpu sample failed; treating as 0", self._job_id)
+            return 0
+
+    def _sample_ram(self) -> int | None:
+        try:
+            v = self._ram_sampler()
+            return None if v is None else int(v)
+        except Exception:
+            log.exception("[stall-watchdog] %s ram sample failed; treating as None", self._job_id)
+            return None
+
+    def _confirm_wedged(self) -> bool:
+        """The no-beat timeout fired — is the worker TRULY doing nothing, or just
+        loading / preparing / in a slow step? Sample the physical signal over a
+        short window and apply the SAME "GPU idle AND RAM static" rule the
+        :class:`GpuHealthWatchdog` uses.
+
+        Returns ``True`` (⇒ trip) ONLY when, across the whole confirmation window,
+        the MAX GPU util stayed ``<= idle_pct`` AND RAM never moved more than
+        ``ram_delta_mb`` from its first reading. A busy GPU at any sample (slow
+        step) or a RAM move beyond the delta (weights loading / staging /
+        preparing) ⇒ returns ``False`` (NOT wedged) and the caller re-arms.
+
+        A genuinely-loading model moves RAM by GBs >> the delta, so a cold/lazy
+        load can never be confirmed as wedged here — exactly the false positive
+        the user reported. Interruptible: bails to ``False`` if stopped mid-window
+        (the node finished / was reclaimed)."""
+        ram_anchor = self._sample_ram()
+        max_util = self._sample_gpu()
+        ram_now = ram_anchor
+        for i in range(self._confirm_samples - 1):
+            if self._stop.wait(self._confirm_poll_s):
+                return False  # stopped → don't trip
+            util = self._sample_gpu()
+            if util > max_util:
+                max_util = util
+            ram_now = self._sample_ram()
+        gpu_idle = max_util <= self._idle_pct
+        ram_moved = (
+            ram_anchor is not None
+            and ram_now is not None
+            and abs(ram_now - ram_anchor) > self._ram_delta_mb
+        )
+        if gpu_idle and not ram_moved:
+            log.warning(
+                "[stall-watchdog] %s no beat for %ds AND confirmed idle "
+                "(max sm%% %d <= %d, RAM anchor=%sMB now=%sMB static) — WEDGED, "
+                "tripping",
+                self._job_id, int(self._stall_timeout_s), max_util,
+                self._idle_pct, ram_anchor, ram_now,
+            )
+            return True
+        log.info(
+            "[stall-watchdog] %s no beat for %ds BUT GPU/RAM active "
+            "(max sm%% %d, RAM anchor=%sMB now=%sMB) — loading/preparing/slow "
+            "step, NOT killing; resetting the window",
+            self._job_id, int(self._stall_timeout_s), max_util, ram_anchor, ram_now,
+        )
+        return False
+
     def _trip(self) -> None:
         err = (
-            f"no progress for {int(self._stall_timeout_s)}s "
-            f"(no GPU step beat) — stall watchdog hard-stopped the worker"
+            f"no progress for {int(self._stall_timeout_s)}s (no GPU step beat) "
+            f"AND confirmed GPU-idle + static-RAM — stall watchdog hard-stopped "
+            f"a wedged worker"
         )
-        log.error("[stall-watchdog] %s %s", self._job_id, err)
-        _fail_job_and_exit(
+        # Transient-wedge detector (the user's reconstruct/beat_keyframes case):
+        # re-queue + retry on a fresh worker under the cap, then fail.
+        _watchdog_trip(
             job_id=self._job_id, table=self._table, error=err,
+            label="stall-watchdog",
             on_exit=self._on_exit, exit_code=self._exit_code,
+            host_label=self._host_label, queue=self._queue,
         )
 
     def stop(self) -> None:
@@ -438,15 +779,25 @@ class GpuHealthWatchdog:
     — i.e. no GPU work AND no memory movement ⇒ wedged. If the GPU was busy at
     any point, OR RAM moved more than the delta (staging / decode / model
     swap), the job is HEALTHY: the window resets and it keeps running, no matter
-    how long. On trip it reuses :func:`_fail_job_and_exit` (the same
-    outbox-atomic mark-failed + hard-exit contract as the other watchdogs) so
-    ``reclaim_expired_leases`` re-queues the row onto a healthy host.
+    how long. On trip it routes through :func:`_watchdog_trip` (the same policy as
+    the other watchdogs): RE-QUEUE the node for a retry on a fresh worker under
+    the cap (``AI_LEADS_WATCHDOG_MAX_RETRIES``, default 3) so the run stays alive,
+    then mark failed once the cap is reached — hard-exiting in either case.
 
-    Arming mirrors :class:`StallWatchdog`: the watchdog is INERT until the first
-    :meth:`beat` (the executor's post-model-load beat), so a multi-minute cold
-    model load is never policed. A node progress ``beat`` (its
-    ``status_callback``) also resets the window as an extra liveness signal.
-    ``beat`` tolerates any args so it doubles as a node ``status_callback``.
+    Arming: the watchdog arms AT job start (:meth:`start`) with a generous
+    ``load_grace_s`` (20 min) FIRST window — NOT inert-until-first-beat. That is
+    safe precisely because the trip rule is "GPU idle AND RAM static": a healthy
+    model load MOVES RAM (weights, multiple GB) so it can't trip even while armed
+    during load, and a healthy render keeps the GPU busy so it can't trip
+    regardless. Only a GENUINELY hung load (idle GPU AND static RAM past the
+    grace) trips. This closes the gap the removed wall-clock cap left: a hang
+    DURING load (before any beat), and a GPU node with no ``required_model`` /
+    no ``status_callback`` that never beats at all, are now both bounded. The
+    first :meth:`beat` (the executor's post-model-load beat, then per-step node
+    progress beats) collapses the window to the normal ``interval_s`` (5-min)
+    cadence. A node progress ``beat`` also resets the window as an extra liveness
+    signal. ``beat`` tolerates any args so it doubles as a node
+    ``status_callback``.
 
     GPU/RAM samplers are injected (``gpu_sampler`` / ``ram_sampler``) so tests
     feed fakes instead of shelling out to ``nvidia-smi``; production defaults to
@@ -456,6 +807,7 @@ class GpuHealthWatchdog:
     def __init__(
         self, *, job_id: str,
         interval_s: float = GPU_HEALTH_INTERVAL_S,
+        load_grace_s: float = GPU_HEALTH_LOAD_GRACE_S,
         idle_pct: int = GPU_IDLE_PCT,
         ram_delta_mb: int = GPU_HEALTH_RAM_DELTA_MB,
         poll_s: float = STALL_POLL_S,
@@ -464,11 +816,13 @@ class GpuHealthWatchdog:
         on_exit: Callable[[int], None] | None = None,
         exit_code: int = 78,
         table: str = "workflow_node_jobs",
+        host_label: str | None = None, queue: str | None = None,
     ) -> None:
         if table not in _LEASE_TABLES:
             raise ValueError(f"gpu-health table must be in {sorted(_LEASE_TABLES)}, got {table!r}")
         self._job_id = job_id
         self._interval_s = float(interval_s)
+        self._load_grace_s = float(load_grace_s)
         self._idle_pct = int(idle_pct)
         self._ram_delta_mb = int(ram_delta_mb)
         self._poll_s = float(poll_s)
@@ -481,13 +835,17 @@ class GpuHealthWatchdog:
         self._on_exit = on_exit or os._exit
         self._exit_code = int(exit_code)
         self._table = table
+        self._host_label = host_label
+        self._queue = queue
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
-        # Window state. ``_armed`` stays False until the first beat (post-load),
-        # so the cold-load phase is never policed. ``_max_util`` accumulates the
-        # peak GPU util seen this window; ``_ram_anchor`` is the RAM at the
-        # window's start that the |Δ| is measured against.
+        # Window state. ``_armed`` is set True in ``start()`` with a generous
+        # ``load_grace_s`` first checkpoint (NOT inert-until-beat) so a load-phase
+        # hang and a never-beating node are both bounded; the first beat collapses
+        # the window to ``interval_s``. ``_max_util`` accumulates the peak GPU util
+        # seen this window; ``_ram_anchor`` is the RAM at the window's start that
+        # the |Δ| is measured against.
         self._armed = False
         self._max_util = 0
         self._ram_anchor: int | None = None
@@ -495,18 +853,24 @@ class GpuHealthWatchdog:
 
     # ── window management ────────────────────────────────────────────────
 
-    def _reset_window(self) -> None:
+    def _reset_window(self, window_s: float | None = None) -> None:
         """Open a fresh window: clear the peak-util accumulator, re-anchor RAM,
-        and push the next checkpoint out by one interval. Caller holds the lock."""
+        and push the next checkpoint out by ``window_s`` (default: the normal
+        ``interval_s`` cadence; ``start()`` passes the generous ``load_grace_s``
+        for the first window). Caller holds the lock."""
         self._max_util = 0
         self._ram_anchor = self._sample_ram()
-        self._next_checkpoint = time.monotonic() + self._interval_s
+        self._next_checkpoint = time.monotonic() + (
+            self._interval_s if window_s is None else window_s
+        )
 
     def beat(self, *args: Any, **kwargs: Any) -> None:
-        """Record progress: arm (on the first call) + reset the window. Wired in
-        as the node ``status_callback`` (extra liveness) and pulsed once by the
-        executor right after the model load (the arming beat). Thread-safe;
-        ignores any args so it doubles as a ``status_callback``."""
+        """Record progress: arm (idempotent — already armed at start) + reset the
+        window to the NORMAL ``interval_s`` cadence. Wired in as the node
+        ``status_callback`` (extra liveness) and pulsed once by the executor right
+        after the model load — that post-load beat collapses the generous
+        load-grace first window opened by ``start()`` down to ``interval_s``.
+        Thread-safe; ignores any args so it doubles as a ``status_callback``."""
         with self._lock:
             self._armed = True
             self._reset_window()
@@ -527,8 +891,16 @@ class GpuHealthWatchdog:
             return None
 
     def start(self) -> None:
-        # No initial beat — the watchdog arms on the first beat (post-load), not
-        # at start, so the model-load phase is never policed here.
+        # Arm AT start with a generous load-grace first window (NOT inert-until-
+        # beat). Safe because the trip rule is "GPU idle AND RAM static": a
+        # healthy model load moves RAM and a healthy render keeps the GPU busy, so
+        # neither trips even while armed during load — only a genuinely hung load
+        # (idle GPU AND static RAM past load_grace_s) does. This bounds both a
+        # load-phase hang and a GPU node that never beats. The first beat (post-
+        # load) collapses the window to the normal interval_s cadence.
+        with self._lock:
+            self._armed = True
+            self._reset_window(window_s=self._load_grace_s)
         self._thread = threading.Thread(
             target=self._loop, daemon=True,
             name=f"gpu-health-{self._job_id[:8]}",
@@ -579,10 +951,13 @@ class GpuHealthWatchdog:
             f"RAM (anchor={ram_anchor}MB now={ram_now}MB, |Δ| <= {self._ram_delta_mb}MB) "
             f"for {int(self._interval_s)}s — health watchdog hard-stopped a wedged worker"
         )
-        log.error("[gpu-health] %s %s", self._job_id, err)
-        _fail_job_and_exit(
+        # Transient-wedge detector (a wedged GPU render): re-queue + retry on a
+        # fresh worker under the cap, then fail.
+        _watchdog_trip(
             job_id=self._job_id, table=self._table, error=err,
+            label="gpu-health",
             on_exit=self._on_exit, exit_code=self._exit_code,
+            host_label=self._host_label, queue=self._queue,
         )
 
     def stop(self) -> None:
@@ -903,6 +1278,7 @@ class ClaimWorker:
         # never be killed for running too long, so GPU gets NO fixed cap here.
         watchdog: Watchdog | None = None if is_gpu else Watchdog(
             job_id=job_id, budget_s=budget_for(job),
+            host_label=self.host, queue=self.queue,
         )
         # Abandon-watcher: hard-exit if this job is re-queued / reassigned out
         # from under us (restart-resume, lease reclaim) so it's never double-run.
@@ -912,32 +1288,39 @@ class ClaimWorker:
             watchdog.start()
         status_watcher.start()
 
-        # GPU guards. Both arm on the executor's post-load beat (threaded as the
-        # node ``status_callback``) so a multi-minute cold model load is never
-        # policed. A node's per-step beats then keep both windows open.
+        # GPU guards.
         #
         #  * GpuHealthWatchdog — the universal GPU guard (video + non-video),
-        #    replacing the removed wall-clock cap. Kills only a wedged worker
-        #    (no GPU work AND static RAM over a 5-min window); a busy GPU or a
+        #    replacing the removed wall-clock cap. Arms AT job start with a
+        #    generous load-grace first window (so a load-phase hang AND a GPU node
+        #    that never beats — no required_model / no status_callback, e.g.
+        #    sv_detect, scene_build — are both bounded), then the post-load /
+        #    per-step beats collapse it to the 5-min cadence. Kills only a wedged
+        #    worker (no GPU work AND static RAM over the window); a busy GPU or a
         #    > 5 GB RAM move keeps it alive forever. Video is the whole point —
         #    a hung wan/ltx render now gets caught on health instead of camping
         #    a (formerly 1800 s) budget that punished healthy long renders.
-        #  * StallWatchdog — kept for NON-VIDEO GPU as defense in depth: its
-        #    tight 120 s no-progress window catches a fast 0%-GPU hang minutes
-        #    before the health watchdog's first 300 s checkpoint. EXCLUDED for
-        #    video: a video backend steps slowly (minutes/beat) so 120 s would
-        #    false-trip a healthy render — the health watchdog is its only guard.
+        #  * StallWatchdog — kept for NON-VIDEO GPU as defense in depth: it stays
+        #    inert until the first (post-load) beat so a multi-minute cold load is
+        #    never policed, then its tight 120 s no-progress window catches a fast
+        #    0%-GPU hang minutes before the health watchdog's first checkpoint.
+        #    EXCLUDED for video: a video backend steps slowly (minutes/beat) so
+        #    120 s would false-trip a healthy render — health is its only guard.
         is_video = (job.get("required_model") or "") in get_config().video_model_ids
         reports_progress = is_gpu and self._node_reports_progress(job["node_module"])
         stall: StallWatchdog | None = None
         gpu_health: GpuHealthWatchdog | None = None
         beats: list[Callable[..., None]] = []
         if is_gpu:
-            gpu_health = GpuHealthWatchdog(job_id=job_id)
+            gpu_health = GpuHealthWatchdog(
+                job_id=job_id, host_label=self.host, queue=self.queue,
+            )
             gpu_health.start()
             beats.append(gpu_health.beat)
         if reports_progress and not is_video:
-            stall = StallWatchdog(job_id=job_id)
+            stall = StallWatchdog(
+                job_id=job_id, host_label=self.host, queue=self.queue,
+            )
             stall.start()
             beats.append(stall.beat)
 
@@ -996,6 +1379,7 @@ class ClaimWorker:
         )
         watchdog = Watchdog(
             job_id=job_id, budget_s=budget_for(job), table="ingest_jobs",
+            host_label=self.host, queue=self.queue,
         )
         renewer.start()
         watchdog.start()

@@ -86,6 +86,45 @@ def test_parse_pmon_header_only_returns_none():
     assert gpu_health._parse_pmon_sm_pct(_PMON_HEADER_ONLY) is None
 
 
+# A captured multi-process sample exercising EVERY sm% shape the GB10 emits in
+# one block: a busy render PID (sm=95), a real PID whose sm% is the literal
+# N/A token "-" (the common idle/hang shape → 0, NOT a fallback), and the two
+# header comment rows (the "# gpu …" + "# Idx …" lines, skipped). MAX across
+# the real PID rows is 95; the "-" row contributes 0, not None, because a real
+# PID is present so we never fall back to the box probe.
+_PMON_CAPTURED_MIXED = """\
+# gpu        pid  type    sm   mem   enc   dec   command
+# Idx          #   C/G     %     %     %     %    name
+    0       2470     G      -     -     -     -    Xorg
+    0       3762     C     95     0     -     -    python
+    0       4011     C      -     0     -     -    python
+"""
+
+# A captured sample whose ONLY real PID reports sm% = "-" (N/A). All real-PID
+# rows are idle ⇒ MAX over them is 0 (a measurable "no GPU work"), NOT None —
+# the watchdog acts on it instead of falling back to box level.
+_PMON_CAPTURED_ALL_NA = """\
+# gpu        pid  type    sm   mem   enc   dec   command
+# Idx          #   C/G     %     %     %     %    name
+    0       3762     C      -     0     -     -    python
+    0       4011     C      -     0     -     -    python
+"""
+
+
+def test_parse_pmon_captured_mixed_na_and_busy_takes_max_ignoring_dashes():
+    """Captured sample with header rows + a busy PID (95) + a real PID at '-'
+    (N/A): the '-' parses to 0 and the MAX over the real rows is 95 — the
+    header comment lines are skipped, the N/A row never poisons the max."""
+    assert gpu_health._parse_pmon_sm_pct(_PMON_CAPTURED_MIXED) == 95
+
+
+def test_parse_pmon_captured_all_na_real_pids_is_zero_not_none():
+    """Captured sample whose every real PID reports sm% '-' (N/A): '-' → 0, and
+    because real PIDs ARE present the result is a measurable 0 (NOT None ⇒ no
+    box-level fallback)."""
+    assert gpu_health._parse_pmon_sm_pct(_PMON_CAPTURED_ALL_NA) == 0
+
+
 # ── gpu_util_pct dispatch (pmon preferred, box fallback) ─────────────────────
 
 

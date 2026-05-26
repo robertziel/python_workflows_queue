@@ -240,6 +240,171 @@ def test_reclaim_ignores_running_rows_without_a_lease():
     assert row(job_id)["status"] == "running"
 
 
+# ── requeue_job_for_retry (watchdog re-queue mechanic) ───────────────────────
+# The watchdog-trip path re-queues a SINGLE running node-job for a retry on a
+# fresh worker — same "running→queued + clear lease + bump priority to front"
+# mechanic as reclaim_expired_leases, scoped by id, plus a watchdog_retries++
+# counter (migration 0010). CAS-guarded + idempotent like the mark_* ops; writes
+# NO dispatch event (the run stays running, only the node re-runs).
+
+
+def _claimed_running_job(queue="cpu", priority=100):
+    run_id = make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue=queue, priority=priority,
+        required_model=("qwen_edit" if queue == "gpu" else None),
+    )
+    if queue == "gpu":
+        node_queue.claim_next_gpu_job(0, host="host-x")
+    else:
+        node_queue.claim_next_cpu_job(0, host="host-x")
+    return run_id, job_id
+
+
+def test_requeue_for_retry_flips_running_to_queued_and_clears_lease():
+    run_id, job_id = _claimed_running_job()
+    before = row(job_id)
+    assert before["status"] == "running"
+    assert before["claimed_by"] == "host-x"
+    assert before["lease_expires_at"] is not None
+
+    out = node_queue.requeue_job_for_retry(job_id)
+    assert out is not None and out["id"] == job_id
+    r = row(job_id)
+    assert r["status"] == "queued"
+    assert r["claimed_by"] is None
+    assert r["lease_expires_at"] is None
+    assert r["started_at"] is None
+
+
+def test_requeue_for_retry_bumps_priority_to_front():
+    # Matches reclaim_expired_leases' LEAST(priority, 10): a back-of-queue job
+    # (priority 100) jumps to <= 10 so the retry runs promptly.
+    run_id, job_id = _claimed_running_job(priority=100)
+    node_queue.requeue_job_for_retry(job_id)
+    assert row(job_id)["priority"] <= 10
+
+
+def test_requeue_for_retry_does_not_lower_an_already_high_priority():
+    # LEAST(priority, 10) never RAISES the number (lowers urgency): a job already
+    # at priority 3 stays 3, not bumped up to 10.
+    run_id, job_id = _claimed_running_job(priority=3)
+    node_queue.requeue_job_for_retry(job_id)
+    assert row(job_id)["priority"] == 3
+
+
+def test_requeue_for_retry_increments_watchdog_retries():
+    run_id, job_id = _claimed_running_job()
+    assert row(job_id)["watchdog_retries"] == 0
+    node_queue.requeue_job_for_retry(job_id)
+    assert row(job_id)["watchdog_retries"] == 1
+    # A second cycle (re-claim then re-queue) increments again.
+    node_queue.claim_next_cpu_job(0, host="host-x")
+    node_queue.requeue_job_for_retry(job_id)
+    assert row(job_id)["watchdog_retries"] == 2
+
+
+def test_requeue_for_retry_returns_none_when_not_running():
+    # CAS guard: only a running row is re-queued. A queued row (never claimed) is
+    # left untouched and returns None — idempotent like the mark_* transitions.
+    run_id = make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="cpu",
+    )
+    assert node_queue.requeue_job_for_retry(job_id) is None
+    r = row(job_id)
+    assert r["status"] == "queued"
+    assert r["watchdog_retries"] == 0  # not incremented on no-match
+
+
+def test_requeue_for_retry_idempotent_on_terminal_row():
+    run_id, job_id = _claimed_running_job()
+    with connection() as c, c.cursor() as cur:
+        node_queue.mark_completed_in_txn(cur, job_id, context_delta={}, seconds=1.0)
+    # Already completed → no-op, returns None, counter untouched.
+    assert node_queue.requeue_job_for_retry(job_id) is None
+    r = row(job_id)
+    assert r["status"] == "completed"
+    assert r["watchdog_retries"] == 0
+
+
+def test_requeue_for_retry_writes_no_dispatch_event():
+    # The run must stay running — only the node re-runs — so NO failed event.
+    run_id, job_id = _claimed_running_job()
+    node_queue.requeue_job_for_retry(job_id)
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM workflow_dispatch_events WHERE run_id=%s",
+            (run_id,),
+        )
+        assert cur.fetchone()["n"] == 0
+
+
+def test_requeue_for_retry_fires_node_job_ready_notify():
+    # The running→queued flip fires the migration-0006 NOTIFY (carrying the
+    # queue) so an idle worker re-claims it at once — same as reclaim.
+    run_id, job_id = _claimed_running_job(queue="cpu")
+    payloads = _listen_and_capture(lambda: node_queue.requeue_job_for_retry(job_id))
+    assert "cpu" in payloads
+
+
+# ── clear_worker_current_model (Part C — drop the busy ghost on hard-exit) ────
+# A watchdog trip hard-exits via os._exit, skipping the worker's finally — so its
+# worker_heartbeats row keeps advertising current_model. This helper nulls that
+# busy signal + ages last_seen out of the 30 s gauge window so the dead worker
+# stops inflating the "N/M GPU busy" gauge. Scoped by (host_label, queue) PK,
+# idempotent, returns None on no-match.
+
+
+def _heartbeat(host, queue, model):
+    node_queue.upsert_worker_heartbeat(
+        host_label=host, queue=queue, concurrency=1, current_model=model,
+    )
+
+
+def test_clear_current_model_nulls_the_busy_signal_and_ages_last_seen():
+    _heartbeat("spark", "gpu", "qwen_edit")
+    out = node_queue.clear_worker_current_model("spark", "gpu")
+    assert out is not None and out["current_model"] is None
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT current_model, last_seen < now() - interval '30 seconds' AS stale "
+            "FROM worker_heartbeats WHERE host_label='spark' AND queue='gpu'"
+        )
+        r = cur.fetchone()
+    assert r["current_model"] is None
+    assert r["stale"] is True, "last_seen aged past the gauge window"
+
+
+def test_clear_current_model_keeps_last_seen_when_mark_stale_false():
+    _heartbeat("spark", "gpu", "qwen_edit")
+    node_queue.clear_worker_current_model("spark", "gpu", mark_stale=False)
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT current_model, last_seen > now() - interval '30 seconds' AS fresh "
+            "FROM worker_heartbeats WHERE host_label='spark' AND queue='gpu'"
+        )
+        r = cur.fetchone()
+    assert r["current_model"] is None
+    assert r["fresh"] is True, "mark_stale=False leaves last_seen fresh"
+
+
+def test_clear_current_model_noop_returns_none_when_row_absent():
+    assert node_queue.clear_worker_current_model("ghost", "gpu") is None
+
+
+def test_clear_current_model_only_touches_the_named_worker():
+    _heartbeat("spark", "gpu", "qwen_edit")
+    _heartbeat("spark2", "gpu", "wan_i2v")
+    node_queue.clear_worker_current_model("spark", "gpu")
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT current_model FROM worker_heartbeats "
+            "WHERE host_label='spark2' AND queue='gpu'"
+        )
+        assert cur.fetchone()["current_model"] == "wan_i2v"
+
+
 # ── NOTIFY trigger ───────────────────────────────────────────────────────────
 
 

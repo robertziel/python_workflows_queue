@@ -1,0 +1,33 @@
+-- queue_workflows 0010 — workflow_node_jobs.watchdog_retries (per-job watchdog
+-- re-queue counter).
+--
+-- WHY. A watchdog trip (StallWatchdog no-progress, GpuHealthWatchdog GPU-idle +
+-- static-RAM, or the wall-clock Watchdog) used to mark the node-job ``failed``
+-- and write a ``failed`` dispatch event — which the orchestrator turns into a
+-- RUN-level failure (cancel siblings + flip the run to ``failed``). A single
+-- transient wedge (e.g. the Blackwell qwen inference stall, where the worker
+-- recovers fine on a fresh process) therefore killed the WHOLE workflow.
+--
+-- The new policy RE-QUEUES the node instead: the watchdog flips the row
+-- ``running`` → ``queued`` (clearing the lease, bumping priority to the front
+-- via ``LEAST(priority, 10)``, exactly like ``reclaim_expired_leases``), writes
+-- NO dispatch event (the run stays ``running``), and hard-exits the worker so a
+-- fresh worker re-claims and retries the node. To stop a node that wedges EVERY
+-- time from looping forever, each re-queue increments THIS counter; once it
+-- reaches ``AI_LEADS_WATCHDOG_MAX_RETRIES`` (default 3) the watchdog falls back
+-- to the old mark-failed path so the run finally fails.
+--
+-- WHY A DEDICATED COLUMN (not ``attempts``). ``workflow_dispatch_events`` already
+-- has an ``attempts`` column, but that counts DISPATCH-EVENT outbox-drain
+-- retries (orchestrator-side callback failures), a different concern on a
+-- different table. This counter lives on the node-job row, is owned by the
+-- claim-worker watchdog trip path, and must not be conflated with the outbox
+-- retry budget — hence its own column.
+--
+-- Additive + idempotent (``ADD COLUMN IF NOT EXISTS`` with a NOT NULL DEFAULT 0,
+-- which Postgres backfills existing rows to 0 without a table rewrite) so
+-- re-running on the live ai_leads DB is a safe no-op. No index: the column is
+-- only ever read/written by id (the claim worker's own row), never scanned.
+
+ALTER TABLE workflow_node_jobs
+    ADD COLUMN IF NOT EXISTS watchdog_retries INTEGER NOT NULL DEFAULT 0;

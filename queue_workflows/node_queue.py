@@ -24,6 +24,7 @@ generic.
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -169,6 +170,24 @@ def list_jobs_for_run(run_id: str) -> list[dict[str, Any]]:
 # keeps its lease via renewal; only a dead/wedged worker lets it
 # lapse, at which point ``reclaim_expired_leases`` re-queues the row.
 DEFAULT_LEASE_S = 600
+
+# Staleness threshold for the orchestrator-side dead-worker detector
+# (:func:`flag_stale_workers_holding_running_jobs`). A live claim worker
+# refreshes its ``worker_heartbeats`` row every ``HEARTBEAT_INTERVAL_S`` (10 s);
+# 3× that (30 s) is the same window Rails' queue gauge uses to call a row stale,
+# so a heartbeat older than this is a worker that stopped beating — wedged or
+# dead. Env-overridable for ops tuning.
+STALE_WORKER_AFTER_S = 30
+
+
+def _stale_worker_after_s() -> int:
+    raw = (os.environ.get("AI_LEADS_STALE_WORKER_AFTER_S", "") or "").strip()
+    if not raw:
+        return STALE_WORKER_AFTER_S
+    try:
+        return max(1, int(float(raw)))
+    except (TypeError, ValueError):
+        return STALE_WORKER_AFTER_S
 
 
 def _host_dir(host_priority: int) -> int:
@@ -533,6 +552,144 @@ def reclaim_expired_leases() -> list[dict[str, Any]]:
         return list(cur.fetchall())
 
 
+def requeue_job_for_retry_in_txn(cur, job_id: str) -> dict[str, Any] | None:
+    """Re-queue ONE ``running`` node-job for a watchdog retry — same-cursor
+    variant of :func:`requeue_job_for_retry`.
+
+    The watchdog-trip twin of the lease-reclaim mechanic, scoped to a single
+    row by id. In one statement it:
+
+      * flips ``running`` → ``queued`` (which fires the migration-0006
+        ``node_job_ready`` NOTIFY so an idle worker re-claims it at once);
+      * clears the lease bookkeeping (``started_at``/``claimed_by``/
+        ``lease_expires_at`` → NULL) so a fresh worker can stamp its own;
+      * bumps ``priority`` to the FRONT with ``LEAST(priority, 10)`` — the EXACT
+        mechanic :func:`reclaim_expired_leases` uses — so the retry runs
+        promptly ahead of newer work;
+      * increments ``watchdog_retries`` (migration 0010), the per-job re-queue
+        counter the trip site reads to enforce the retry cap.
+
+    CAS-guarded + idempotent like the other transitions: the WHERE narrows to
+    ``status = 'running'``, so a row that's already terminal (completed / failed
+    / cancelled / skipped) or already ``queued``/``awaiting_input`` is left
+    untouched and the function returns ``None``. Writes NO dispatch event — the
+    run stays ``running``; only the node re-runs.
+
+    Returns the updated row (with the incremented ``watchdog_retries``), or
+    ``None`` on no-match."""
+    cur.execute(
+        """
+        UPDATE workflow_node_jobs
+        SET status = 'queued',
+            started_at = NULL,
+            claimed_by = NULL,
+            lease_expires_at = NULL,
+            priority = LEAST(priority, 10),
+            watchdog_retries = watchdog_retries + 1
+        WHERE id = %s
+          AND status = 'running'
+        RETURNING *
+        """,
+        (job_id,),
+    )
+    return cur.fetchone()
+
+
+def requeue_job_for_retry(job_id: str) -> dict[str, Any] | None:
+    """Re-queue a watchdog-tripped node-job so a fresh worker retries it,
+    instead of failing the whole run.
+
+    Opens its own connection and delegates to
+    :func:`requeue_job_for_retry_in_txn` (one ``UPDATE … RETURNING`` ⇒ one
+    transaction). See that function for the full re-queue mechanic + CAS /
+    idempotency contract. Returns the updated row, or ``None`` when the row was
+    not ``running`` (already terminal / already re-queued)."""
+    with connection() as conn, conn.cursor() as cur:
+        return requeue_job_for_retry_in_txn(cur, job_id)
+
+
+def flag_stale_workers_holding_running_jobs(
+    *, stale_after_s: int | None = None,
+) -> list[dict[str, Any]]:
+    """Detect + flag workers that have gone SILENT while still owning a
+    ``running`` job — the GPU-hardware-hang recovery the lease-reclaim alone
+    can't reach.
+
+    THE GAP. A GPU hardware-hang (e.g. a ROCr "GPU Hang" HW exception on a
+    wan_i2v render) can leave the claim-worker PROCESS wedged: a torch/HIP call
+    blocked in the dead GPU context, with the worker's in-process
+    :class:`~queue_workflows.claim_worker.GpuHealthWatchdog` unable to make its
+    trip — either because the trip signal is unobservable from inside (on a ROCm
+    box the box-level GPU probe can read non-idle even while THIS render is
+    wedged, while the hung render holds its weights resident so RAM is static, so
+    "GPU idle AND RAM static" is never both-true) or, on a GIL-holding hang,
+    because the daemon thread can't run at all. Either way the worker stops
+    refreshing its ``worker_heartbeats`` row — it silently quits claiming
+    overflow work. The lease-reclaim re-queues the JOB onto a healthy host
+    (good), but nothing flags the dead PROCESS so it can be bounced.
+
+    THE DETECTOR. The orchestrator (:class:`~queue_workflows.node_pool.NodePool`)
+    runs in a SEPARATE process, GIL-independent of any wedged worker, so it CAN
+    observe the frozen heartbeat. This finds every ``worker_heartbeats`` row
+    whose ``last_seen`` is older than ``stale_after_s`` (default 30 s = 3× the
+    10 s heartbeat cadence) THAT still owns ≥ 1 ``running``
+    ``workflow_node_jobs`` row. The job→worker join is BOTH
+    ``j.claimed_by = wh.host_label`` AND ``j.queue = wh.queue``: the claim stamps
+    ``claimed_by`` with the worker's host label (the value ``worker_heartbeats``
+    is keyed on), and the queue match attributes the job to the right worker
+    PROCESS on a host that runs several (e.g. beelink runs a cpu AND a gpu worker
+    under one ``host_label`` — a wedged gpu worker must not flag the healthy cpu
+    worker's row, and vice-versa). It stamps ``last_flagged_dead_at = now()`` on
+    the matching rows and RETURNS them so the caller logs a clear, actionable
+    line for an operator / host-supervisor to bounce the container.
+
+    IDEMPOTENT. Only rows whose ``last_flagged_dead_at`` is NULL or itself older
+    than ``stale_after_s`` are (re)flagged, so the 0.5 s orchestrator tick
+    doesn't relog every pass — it flags once, then stays quiet until the worker
+    recovers (a fresh heartbeat clears the flag via
+    :func:`upsert_worker_heartbeat`) and goes stale again.
+
+    SAFE / NON-DESTRUCTIVE. This does NOT touch the job rows (the lease-reclaim
+    owns re-queuing) and does NOT kill anything — a cross-host container kill
+    isn't feasible from the orchestrator (no docker socket, different host). It
+    surfaces a durable, queryable signal; the host-supervisor hook acts on it.
+
+    Returns the flagged rows' ``host_label`` / ``queue`` / ``last_seen`` /
+    ``running_jobs`` (the count of running jobs that worker still owns)."""
+    threshold = (
+        _stale_worker_after_s() if stale_after_s is None else max(1, int(stale_after_s))
+    )
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH stale AS (
+                SELECT wh.host_label, wh.queue, wh.last_seen,
+                       COUNT(j.id) AS running_jobs
+                  FROM worker_heartbeats wh
+                  JOIN workflow_node_jobs j
+                    ON j.claimed_by = wh.host_label
+                   AND j.queue = wh.queue
+                   AND j.status = 'running'
+                 WHERE wh.last_seen < now() - make_interval(secs => %(thr)s)
+                   AND (
+                        wh.last_flagged_dead_at IS NULL
+                     OR wh.last_flagged_dead_at < now() - make_interval(secs => %(thr)s)
+                   )
+                 GROUP BY wh.host_label, wh.queue, wh.last_seen
+            )
+            UPDATE worker_heartbeats wh
+               SET last_flagged_dead_at = now()
+              FROM stale
+             WHERE wh.host_label = stale.host_label
+               AND wh.queue = stale.queue
+            RETURNING wh.host_label, wh.queue, stale.last_seen,
+                      stale.running_jobs
+            """,
+            {"thr": threshold},
+        )
+        return list(cur.fetchall())
+
+
 def reclaim_all_running_for_resume() -> list[dict[str, Any]]:
     """Re-queue EVERY ``running`` node job back to ``queued`` — the restart
     hook, not the lease-expiry path (:func:`reclaim_expired_leases`).
@@ -596,6 +753,12 @@ def upsert_worker_heartbeat(
 
     ``update_current_model`` controls whether the ON CONFLICT path
     overwrites ``current_model``.
+
+    A live refresh ALSO clears ``last_flagged_dead_at`` (migration 0009): if the
+    orchestrator's stale-worker detector had flagged this worker as wedged, a
+    fresh heartbeat means it (or its replacement after a bounce) is alive again,
+    so the dead-flag is reset — a future hang then re-flags cleanly instead of
+    staying latched from the previous incident.
     """
     known = list(known_models) if known_models is not None else []
     model_set = (
@@ -612,10 +775,52 @@ def upsert_worker_heartbeat(
                 SET concurrency   = EXCLUDED.concurrency,
                     {model_set}
                     known_models  = EXCLUDED.known_models,
-                    last_seen     = EXCLUDED.last_seen
+                    last_seen     = EXCLUDED.last_seen,
+                    last_flagged_dead_at = NULL
             """,
             (host_label, queue, int(concurrency), current_model, known),
         )
+
+
+def clear_worker_current_model(
+    host_label: str, queue: str, *, mark_stale: bool = True,
+) -> dict[str, Any] | None:
+    """Clear a worker's ``current_model`` (its GPU busy signal) and, by default,
+    age its ``last_seen`` out of the live window — the "don't leave a busy ghost"
+    fix for a HARD-exiting worker.
+
+    A watchdog trip exits via ``os._exit``, which SKIPS the ``_run_node``
+    ``finally`` (so ``ModelCache.mark_idle`` and the heartbeat refresh never run).
+    The worker's last-written ``worker_heartbeats`` row therefore keeps advertising
+    a ``current_model`` even though the process is gone — inflating Rails' "N/M GPU
+    busy" gauge (the user's observed "3/2 GPU busy" after a kill). Before
+    hard-exiting, the trip path calls this to null out ``current_model`` and, when
+    ``mark_stale`` is set, push ``last_seen`` ~10× the heartbeat cadence into the
+    past so the gauge — which counts only rows fresh within 30 s — drops the dead
+    worker immediately rather than waiting up to 30 s for the heartbeat to age out.
+    (A replacement worker's fresh heartbeat re-establishes the row normally.)
+
+    Best-effort + idempotent: scoped by the ``(host_label, queue)`` primary key,
+    a no-op (returns ``None``) when the row is absent. The caller swallows any
+    error — the hard-exit must happen regardless. Returns the updated row, or
+    ``None`` on no-match."""
+    # 100 s ≈ 10× the 10 s heartbeat cadence, comfortably past the 30 s gauge
+    # window so the dead worker drops out at once.
+    stale_secs = 100 if mark_stale else 0
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE worker_heartbeats
+            SET current_model = NULL,
+                last_seen = CASE WHEN %s > 0
+                                 THEN now() - make_interval(secs => %s)
+                                 ELSE last_seen END
+            WHERE host_label = %s AND queue = %s
+            RETURNING *
+            """,
+            (stale_secs, stale_secs, host_label, queue),
+        )
+        return cur.fetchone()
 
 
 def mark_completed_in_txn(
