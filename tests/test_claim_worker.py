@@ -55,21 +55,6 @@ def _lease_expiry(job_id: str):
 # ── budget table ───────────────────────────────────────────────────────────
 
 
-def test_budget_for_video_model_is_1800s():
-    job = {"queue": "gpu", "required_model": "wan_i2v"}
-    assert claim_worker.budget_for(job) == 1800
-
-
-def test_budget_for_generic_gpu_is_8100s():
-    job = {"queue": "gpu", "required_model": "qwen_edit"}
-    assert claim_worker.budget_for(job) == 8100
-
-
-def test_budget_for_gpu_without_model_is_8100s():
-    job = {"queue": "gpu", "required_model": None}
-    assert claim_worker.budget_for(job) == 8100
-
-
 def test_budget_for_cpu_is_2100s():
     job = {"queue": "cpu", "node_module": "geocode"}
     assert claim_worker.budget_for(job) == 2100
@@ -490,15 +475,34 @@ def test_run_node_threads_a_callable_status_callback_to_gpu_node():
     assert node_queue.get_node_job(job_id)["status"] == "completed"
 
 
-def test_stall_watchdog_not_armed_for_video_models():
-    """A video-model gpu job is NOT stall-policed: video backends step slowly
-    and report progress only per beat-segment (minutes apart), which would
-    false-trip the 120 s window. Their backstop is the 1800 s wall-clock budget.
-    So a progress-reporting node on a video model receives status_callback=None
-    (watchdog not armed). Regression guard: a live fence_render_narrative video
-    render was hard-stopped at 120 s by an over-eager arm."""
+def test_stall_watchdog_not_armed_for_video_models(monkeypatch):
+    """A video-model gpu job is NOT stall-policed (the tight 120 s StallWatchdog
+    would false-trip a slow video backend), but it IS guarded by the
+    HEALTH-driven GpuHealthWatchdog (video is the whole point of the health
+    guard). So a video render gets a CALLABLE status_callback that fans out to
+    the health watchdog ONLY — no StallWatchdog is constructed. Regression
+    guard: a live fence_render_narrative video render was hard-stopped at 120 s
+    by an over-eager StallWatchdog arm."""
     run_id = _make_run()
     seen: dict = {}
+
+    constructed: list[str] = []
+    real_stall = claim_worker.StallWatchdog
+    real_health = claim_worker.GpuHealthWatchdog
+
+    def stall_spy(**kw):
+        constructed.append("stall")
+        return real_stall(**kw)
+
+    def health_spy(**kw):
+        constructed.append("health")
+        # inert sampler so the watchdog never trips during the test
+        kw.setdefault("gpu_sampler", lambda: 100)
+        kw.setdefault("ram_sampler", lambda: 0)
+        return real_health(**kw)
+
+    monkeypatch.setattr(claim_worker, "StallWatchdog", stall_spy)
+    monkeypatch.setattr(claim_worker, "GpuHealthWatchdog", health_spy)
 
     def run(*, out=None, model_handle=None, status_callback=None, cancel_event=None):
         seen["status_callback"] = status_callback
@@ -521,8 +525,67 @@ def test_stall_watchdog_not_armed_for_video_models():
 
     worker = claim_worker.ClaimWorker(queue="gpu", host="box-a", model_cache=_Cache())
     assert worker.run_once() is True
-    assert seen.get("status_callback") is None, "video model must NOT arm the stall watchdog"
+    # Health watchdog armed (video is the point); StallWatchdog NOT constructed.
+    assert "health" in constructed, "video model must get the GpuHealthWatchdog"
+    assert "stall" not in constructed, "video model must NOT get the tight StallWatchdog"
+    # The node still receives a CALLABLE callback (the health watchdog's beat
+    # fan-out), not None — so its per-step beats reset the health window.
+    assert callable(seen.get("status_callback")), "video render gets the health-beat callback"
     assert node_queue.get_node_job(job_id)["status"] == "completed"
+
+
+def test_gpu_job_gets_health_watchdog_and_no_wallclock_watchdog(monkeypatch):
+    """Wiring: a GPU job is policed by the HEALTH-driven GpuHealthWatchdog and
+    gets NO wall-clock Watchdog (no fixed time cap — the user's spec). A CPU job
+    is the inverse: a wall-clock Watchdog, no health watchdog."""
+    constructed: list[str] = []
+    real_wd = claim_worker.Watchdog
+    real_health = claim_worker.GpuHealthWatchdog
+
+    def wd_spy(**kw):
+        constructed.append("wallclock")
+        return real_wd(**kw)
+
+    def health_spy(**kw):
+        constructed.append("health")
+        kw.setdefault("gpu_sampler", lambda: 100)  # busy ⇒ never trips
+        kw.setdefault("ram_sampler", lambda: 0)
+        return real_health(**kw)
+
+    monkeypatch.setattr(claim_worker, "Watchdog", wd_spy)
+    monkeypatch.setattr(claim_worker, "GpuHealthWatchdog", health_spy)
+
+    def run(*, out=None, model_handle=None, status_callback=None, cancel_event=None):
+        return {"context_delta": {"ok": True}}
+
+    _install_fake_node("_cw_gpu_guard", run)
+
+    class _Cache:
+        current_model = None
+        def require_model(self, model_id): return object()
+        def mark_busy(self): ...
+        def mark_idle(self): ...
+
+    # GPU job → health watchdog, no wall-clock watchdog.
+    run_id = _make_run()
+    node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="_cw_gpu_guard", queue="gpu",
+    )
+    assert claim_worker.ClaimWorker(
+        queue="gpu", host="box-a", model_cache=_Cache(),
+    ).run_once() is True
+    assert "health" in constructed
+    assert "wallclock" not in constructed, "GPU job must NOT get a fixed wall-clock cap"
+
+    # CPU job → wall-clock watchdog, no health watchdog.
+    constructed.clear()
+    run_id = _make_run()
+    node_queue.enqueue_node_job(
+        run_id=run_id, node_id="c", node_module="_cw_gpu_guard", queue="cpu",
+    )
+    assert claim_worker.ClaimWorker(queue="cpu", host="box-b").run_once() is True
+    assert "wallclock" in constructed
+    assert "health" not in constructed, "CPU job must NOT get a health watchdog"
 
 
 def test_run_once_skips_job_under_cancelled_run():
@@ -533,6 +596,187 @@ def test_run_once_skips_job_under_cancelled_run():
     worker = claim_worker.ClaimWorker(queue="cpu", host="test-host")
     assert worker.run_once() is False
     assert node_queue.get_node_job(job_id)["status"] == "queued"
+
+
+# ── GPU health watchdog (HEALTH-driven, replaces the wall-clock cap) ─────────
+# The GpuHealthWatchdog never kills a GPU job for elapsed time. Every window it
+# checks two per-container signals and TRIPS only when the worker is truly
+# wedged: GPU util stayed idle (<= idle_pct) AND container RAM was static
+# (|Δ| <= ram_delta_mb) across the whole window. A busy GPU OR a > ram_delta RAM
+# move ⇒ healthy ⇒ window resets, job runs on. Like the StallWatchdog it's inert
+# until the first beat (the executor's post-load beat); a node progress beat also
+# resets the window. Samplers are injected so tests never shell out to nvidia-smi.
+
+
+def _gpu_health_job():
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="x", queue="gpu",
+        required_model="qwen_edit",
+    )
+    node_queue.claim_next_gpu_job(0, host="h")
+    return job_id
+
+
+def _drain(exits, timeout_s=3.0):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline and not exits:
+        time.sleep(0.01)
+
+
+def test_gpu_health_does_not_trip_while_gpu_busy():
+    """(a) GPU busy (util well over idle_pct) ⇒ never trips, even with static
+    RAM and many checkpoints elapsed."""
+    job_id = _gpu_health_job()
+    exits: list[int] = []
+    wd = claim_worker.GpuHealthWatchdog(
+        job_id=job_id, interval_s=0.05, idle_pct=5, ram_delta_mb=5120,
+        poll_s=0.01,
+        gpu_sampler=lambda: 90,          # busy
+        ram_sampler=lambda: 1000,        # static
+        on_exit=lambda c: exits.append(c),
+    )
+    wd.start()
+    wd.beat()  # arm (post-load)
+    time.sleep(0.4)  # many interval_s windows
+    wd.stop()
+    assert exits == [], "a busy GPU must never be killed"
+    assert node_queue.get_node_job(job_id)["status"] == "running"
+
+
+def test_gpu_health_does_not_trip_while_ram_moves_even_if_gpu_idle():
+    """(b) GPU idle but RAM climbs > ram_delta_mb each window ⇒ healthy work
+    (staging / decode) ⇒ never trips."""
+    job_id = _gpu_health_job()
+    exits: list[int] = []
+    # RAM grows by 6 GB every read — well over the 5 GB delta.
+    ram_seq = iter(range(0, 1_000_000, 6144))
+    wd = claim_worker.GpuHealthWatchdog(
+        job_id=job_id, interval_s=0.05, idle_pct=5, ram_delta_mb=5120,
+        poll_s=0.01,
+        gpu_sampler=lambda: 0,           # idle
+        ram_sampler=lambda: next(ram_seq),
+        on_exit=lambda c: exits.append(c),
+    )
+    wd.start()
+    wd.beat()  # arm
+    time.sleep(0.4)
+    wd.stop()
+    assert exits == [], "RAM moving > delta must keep the job alive even at 0% GPU"
+    assert node_queue.get_node_job(job_id)["status"] == "running"
+
+
+def test_gpu_health_trips_when_gpu_idle_and_ram_static():
+    """(c) GPU idle AND RAM static across a window ⇒ wedged ⇒ marks failed +
+    hard-exits with the health exit code."""
+    job_id = _gpu_health_job()
+    exits: list[int] = []
+    wd = claim_worker.GpuHealthWatchdog(
+        job_id=job_id, interval_s=0.05, idle_pct=5, ram_delta_mb=5120,
+        poll_s=0.01,
+        gpu_sampler=lambda: 0,           # idle
+        ram_sampler=lambda: 2048,        # static
+        on_exit=lambda c: exits.append(c),
+    )
+    wd.start()
+    wd.beat()  # arm; window opens, then no movement ⇒ trip at the checkpoint
+    _drain(exits)
+    wd.stop()
+    assert exits and exits[0] == 78, "wedged worker must hard-exit (code 78)"
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "failed"
+    assert "no gpu activity" in (row["error"] or "").lower()
+    assert "static" in (row["error"] or "").lower()
+
+
+def test_gpu_health_inert_before_first_beat():
+    """(d) Before the arming beat the watchdog never trips — so a multi-minute
+    cold model load (GPU idle, RAM still settling) is never policed."""
+    job_id = _gpu_health_job()
+    exits: list[int] = []
+    wd = claim_worker.GpuHealthWatchdog(
+        job_id=job_id, interval_s=0.02, idle_pct=5, ram_delta_mb=5120,
+        poll_s=0.01,
+        gpu_sampler=lambda: 0,           # idle — would trip if armed
+        ram_sampler=lambda: 2048,        # static
+        on_exit=lambda c: exits.append(c),
+    )
+    wd.start()
+    time.sleep(0.3)  # well past several interval_s, but never beat ⇒ never armed
+    assert exits == [], "must stay inert until the first (post-load) beat"
+    assert node_queue.get_node_job(job_id)["status"] == "running"
+    wd.stop()
+
+
+def test_gpu_health_beat_resets_window():
+    """(e) A progress beat re-anchors the window: an idle-GPU + static-RAM job
+    that keeps beating faster than interval_s never trips (the beat is the extra
+    liveness signal threaded as the node status_callback)."""
+    job_id = _gpu_health_job()
+    exits: list[int] = []
+    wd = claim_worker.GpuHealthWatchdog(
+        job_id=job_id, interval_s=0.1, idle_pct=5, ram_delta_mb=5120,
+        poll_s=0.01,
+        gpu_sampler=lambda: 0,           # idle
+        ram_sampler=lambda: 2048,        # static
+        on_exit=lambda c: exits.append(c),
+    )
+    wd.start()
+    wd.beat()  # arm
+    # Beat faster than interval_s for well over one window total — each beat
+    # resets the checkpoint so the trip condition is never reached.
+    for _ in range(10):
+        time.sleep(0.03)
+        wd.beat()
+    assert exits == [], "beats faster than interval_s must hold the window open"
+    assert node_queue.get_node_job(job_id)["status"] == "running"
+    wd.stop()
+
+
+def test_gpu_health_does_not_trip_when_stopped_before_checkpoint():
+    job_id = _gpu_health_job()
+    exits: list[int] = []
+    wd = claim_worker.GpuHealthWatchdog(
+        job_id=job_id, interval_s=5.0, idle_pct=5, ram_delta_mb=5120,
+        poll_s=0.01,
+        gpu_sampler=lambda: 0, ram_sampler=lambda: 2048,
+        on_exit=lambda c: exits.append(c),
+    )
+    wd.start()
+    wd.beat()
+    time.sleep(0.1)
+    wd.stop()
+    time.sleep(0.05)
+    assert exits == []
+    assert node_queue.get_node_job(job_id)["status"] == "running"
+
+
+def test_gpu_health_threshold_defaults_are_documented():
+    """The module-level health thresholds carry the documented defaults
+    (300 s / 5 % / 5120 MB = 5 GiB)."""
+    assert claim_worker.GPU_HEALTH_INTERVAL_S == 300.0
+    assert claim_worker.GPU_IDLE_PCT == 5
+    assert claim_worker.GPU_HEALTH_RAM_DELTA_MB == 5120
+
+
+def test_gpu_health_env_parsers_override_and_fall_back(monkeypatch):
+    """The env-parsing helpers read the override when set + valid, fall back to
+    the default when unset or junk — so every threshold is env-overridable."""
+    # unset → default
+    monkeypatch.delenv("AI_LEADS_GPU_IDLE_PCT", raising=False)
+    assert claim_worker._env_int("AI_LEADS_GPU_IDLE_PCT", 5) == 5
+    monkeypatch.delenv("AI_LEADS_GPU_HEALTH_INTERVAL_S", raising=False)
+    assert claim_worker._env_float("AI_LEADS_GPU_HEALTH_INTERVAL_S", 300.0) == 300.0
+    # set + valid → override
+    monkeypatch.setenv("AI_LEADS_GPU_IDLE_PCT", "9")
+    assert claim_worker._env_int("AI_LEADS_GPU_IDLE_PCT", 5) == 9
+    monkeypatch.setenv("AI_LEADS_GPU_HEALTH_INTERVAL_S", "42.5")
+    assert claim_worker._env_float("AI_LEADS_GPU_HEALTH_INTERVAL_S", 300.0) == 42.5
+    monkeypatch.setenv("AI_LEADS_GPU_HEALTH_RAM_DELTA_MB", "1024")
+    assert claim_worker._env_int("AI_LEADS_GPU_HEALTH_RAM_DELTA_MB", 5120) == 1024
+    # set + junk → default (never crash a worker on a bad env)
+    monkeypatch.setenv("AI_LEADS_GPU_IDLE_PCT", "not-a-number")
+    assert claim_worker._env_int("AI_LEADS_GPU_IDLE_PCT", 5) == 5
 
 
 # ── ingest (fetch/load) claim + execute ──────────────────────────────────────
