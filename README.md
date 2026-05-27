@@ -19,6 +19,55 @@ Postgres is the only hard dependency. The engine provides:
   free RAM/VRAM) or parks a worker on command (`worker_control`; see
   `docs/worker_control.md`).
 
+## Architecture
+
+Three independent processes run against **one Postgres** — the database *is* the
+message bus. `INSERT`ing a row is enqueuing the work; a trigger fires
+`pg_notify` inside the writer's transaction, so there is no "queued but no wake"
+window. A live worker renews its lease while a job runs; a dead/wedged worker's
+lease lapses and the orchestrator re-queues the row.
+
+```mermaid
+flowchart LR
+    subgraph PROC["Three processes (separate OS processes, GIL-independent)"]
+        direction TB
+        O["<b>Orchestrator</b><br/>• bootstraps migrations<br/>• dispatch loop — DAG fan-out<br/>• drains dispatch outbox<br/>• lease-reclaim + dead-worker sweep<br/>• InputListener (resume parked nodes)"]
+        S["<b>Scheduler</b><br/>PG-native ticker<br/>enqueues ingest_jobs<br/>at scheduled minutes"]
+        W["<b>Claim worker(s)</b><br/>1 process == 1 worker<br/>LISTEN + FOR UPDATE SKIP LOCKED<br/>LeaseRenewer + Watchdogs<br/>GPU worker owns warm ModelCache"]
+    end
+
+    subgraph PG["Postgres — the message bus (one database)"]
+        direction TB
+        T1["workflow_runs"]
+        T2["workflow_node_jobs<br/>(cpu / gpu — DAG)"]
+        T3["ingest_jobs<br/>(host-defined queues)"]
+        T4["workflow_dispatch_events<br/>(durable outbox)"]
+        T5["worker_heartbeats<br/>worker_controls"]
+    end
+
+    S  -- "INSERT + pg_notify(ingest_job_ready)" --> T3
+    O  -- "INSERT + pg_notify(node_job_ready)"   --> T2
+    T2 -. "NOTIFY wakes" .-> W
+    T3 -. "NOTIFY wakes" .-> W
+    W  -- "claim → run → write (terminal status + dispatch_event) in ONE txn" --> T4
+    T4 -- "drain → fan out next ready nodes" --> O
+    O  -- "reclaim lapsed leases → re-queue" --> T2
+    W  -- "renew lease · emit heartbeat · obey ON/OFF" --> T5
+```
+
+**Two job families** share the engine: DAG **node-jobs** (`workflow_node_jobs`,
+queues `cpu`/`gpu`, fanned out by the dispatcher) and standalone **ingest jobs**
+(`ingest_jobs`, host-defined queues, no DAG). See `CLAUDE.md` for the full design
+rationale.
+
+## Docs
+
+- [`docs/watchdogs.md`](docs/watchdogs.md) — the liveness model: lease renewal,
+  the wall-clock + no-progress watchdogs, and the orchestrator-side dead-worker
+  detector (last-resort recovery from a GPU hardware hang).
+- [`docs/worker_control.md`](docs/worker_control.md) — the operator ON/OFF
+  control plane (hard-stop vs park a `(host, queue)` worker).
+
 ## Quick start
 
 ```python
