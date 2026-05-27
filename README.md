@@ -147,6 +147,43 @@ A registered callable may be `fn(reason)` (args ignored, back-compat) or
 `ingest_snapshot()[...]["workers"]` reflects live workers per queue. `cpu`/`gpu`
 stay reserved for the DAG node path; ingest queues require migration version 8.
 
+## Turning workers on/off
+
+Each machine runs one worker **per queue** under a `host_label` (e.g. a box may
+run both a `cpu` and a `gpu` worker). An operator can turn any one of them ON or
+OFF independently — turning OFF is a **hard stop**: it requeues the in-flight
+job (resume-style, redistributed to a healthy peer), frees RAM/VRAM, and the
+worker comes back **parked** (idle, not claiming) until turned back ON. State is
+just a row in `worker_controls`; a trigger wakes the worker immediately, so any
+process sharing the DB can flip it.
+
+```bash
+# CLI (console script) — defaults host to the local hostname:
+queue-worker-control --queue gpu --off            # hard-stop this box's gpu worker
+queue-worker-control --queue gpu --on  --host spark   # turn it back on
+```
+
+```python
+from queue_workflows import worker_control
+
+worker_control.disable_worker("spark", "gpu")     # hard stop + stay off
+worker_control.enable_worker("spark", "gpu")      # resume in place (no restart)
+worker_control.desired_state_for("spark", "gpu")  # 'on' | 'off'  (absent ⇒ 'on')
+```
+
+```sql
+-- or a plain SQL write from any consumer sharing the DB (the trigger wakes the worker):
+INSERT INTO worker_controls (host_label, queue, desired_state, stop_policy, requested_by)
+VALUES ('spark', 'gpu', 'off', 'hard', 'ops')
+ON CONFLICT (host_label, queue) DO UPDATE
+  SET desired_state = EXCLUDED.desired_state, updated_at = now();
+```
+
+Turning a worker off **redistributes** its work rather than failing it, and a
+worker absent from `worker_controls` is treated as ON. See
+[`docs/worker_control.md`](docs/worker_control.md) for the full design (the
+`os._exit(79)` hard-stop contract and the extensible stop-policy seam).
+
 ## Tests
 
 ```
