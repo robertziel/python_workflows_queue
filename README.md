@@ -19,6 +19,23 @@ Postgres is the only hard dependency. The engine provides:
   free RAM/VRAM) or parks a worker on command (`worker_control`; see
   `docs/worker_control.md`).
 
+## Example dashboard
+
+<p align="center">
+  <img src="https://robertz.co/images/queue-workflows-dashboard.png" alt="Example operator dashboard built on the engine's telemetry" width="340">
+</p>
+
+> **The UI is not part of this package — we ship only the core engine.** The
+> screenshot above is an *example* operator dashboard built on top of what the
+> engine already emits: per-host CPU/GPU/RAM via `pg_notify('hw_metrics', …)`,
+> live capacity from `worker_heartbeats`, queue depth from `node_queue.*_snapshot()`,
+> and the per-`(host, queue)` ON/OFF toggles backed by `worker_controls`.
+>
+> Building the front-end is left to you — and it's a great task to hand to your
+> coding agent: point it at the `hw_metrics` notifications, the snapshot helpers,
+> and the `worker_control` API, and ask it to wire up a dashboard in your stack
+> of choice.
+
 ## Architecture
 
 Three independent processes run against **one Postgres** — the database *is* the
