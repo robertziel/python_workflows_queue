@@ -26,7 +26,9 @@ dependencies = [
 
 [project.optional-dependencies]
 metrics = ["psutil"]               # hw_metrics CPU/RAM probe (GPU probe shells out, no dep)
-test = ["pytest", "pytest-cov"]
+redis = ["redis>=5"]               # the 'redis' StorageBackend (queue_workflows.backends.redis)
+mongodb = ["pymongo>=4.4"]         # the 'mongodb' StorageBackend (needs a replica set)
+test = ["pytest", "pytest-cov", "redis>=5", "pymongo>=4.4"]
 
 [project.scripts]
 queue-claim-worker   = "queue_workflows.claim_worker:main"   # generic CLIs (used standalone / other projects)

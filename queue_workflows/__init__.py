@@ -67,6 +67,8 @@ def configure(
     container_prefix: str | None = None,
     ingest_queues: frozenset[str] | None = None,
     ingest_default_budget_s: int | None = None,
+    db_backend: str | None = None,
+    db_namespace: str | None = None,
 ) -> EngineConfig:
     """Set engine configuration values. Only the passed keyword args are
     mutated; the rest keep their (ai_leads-byte-compatible) defaults. Returns
@@ -101,6 +103,14 @@ def configure(
             cfg.ingest_queues = iq
         if ingest_default_budget_s is not None:
             cfg.ingest_default_budget_s = int(ingest_default_budget_s)
+        if db_backend is not None:
+            # Validate against the backend registry (source of truth), imported
+            # lazily so the package root stays import-light and config a leaf.
+            from queue_workflows.backends import canonical_backend_name
+
+            cfg.db_backend = canonical_backend_name(db_backend)
+        if db_namespace is not None:
+            cfg.db_namespace = str(db_namespace)
     return cfg
 
 

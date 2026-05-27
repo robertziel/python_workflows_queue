@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.3.0] — 2026-05-27
 
 ### Added
+- **Pluggable storage backends** — a `StorageBackend` SPI
+  (`queue_workflows.backends`) makes the durable-queue store selectable via
+  `configure(db_backend="pg"|"redis"|"mongodb")`, one provider per file. `pg`
+  (default) is byte-compatible and unchanged; `redis` (atomic claim/terminal via
+  Lua + pub/sub wake) and `mongodb` (`find_one_and_update` + multi-doc-txn outbox
+  + change-stream wake, replica set) reproduce the same contract — claim
+  exactly-once, lease/reclaim, idempotent terminals, the atomic outbox, and
+  per-namespace tenant isolation — pinned by a parametrized contract suite run
+  against all three live servers. Optional drivers: `queue_workflows[redis]` /
+  `[mongodb]`. See `docs/storage_backends.md`.
 - Operator worker ON/OFF control plane: a `worker_controls` table + a
   per-`(host, queue)` `WorkerControlWatcher` that hard-stops (kill in-flight +
   free RAM/VRAM) or parks a worker on command (migration 0012). See

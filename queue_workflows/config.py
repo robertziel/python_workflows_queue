@@ -60,6 +60,10 @@ class EngineConfig:
     db_url_env: str = "AI_LEADS_DB_URL"
     host_label_env: str = "AI_LEADS_HOST_LABEL"
     host_priority_env: str = "AI_LEADS_GPU_CONSUMER_PRIORITY"
+    #: env vars holding the redis / mongodb DSN for those backends (read only when
+    #: ``db_backend`` selects them). New names (no ai_leads equivalent).
+    redis_url_env: str = "QUEUE_WORKFLOWS_REDIS_URL"
+    mongo_url_env: str = "QUEUE_WORKFLOWS_MONGO_URL"
 
     # ── value config ──────────────────────────────────────────────────────────
     #: GPU model ids on the tight per-job video render budget (claim_worker).
@@ -70,6 +74,20 @@ class EngineConfig:
     node_module_package: str = ""
     #: cgroup-attribution container-name prefix (hw_metrics per-container slice).
     container_prefix: str = "ai_leads-"
+
+    # ── storage backend selection (pluggable DB type) ──────────────────────────
+    #: Which provider the StorageBackend SPI (``queue_workflows.backends``)
+    #: resolves to: ``"pg"`` (default — Postgres, byte-compat), ``"redis"``, or
+    #: ``"mongodb"``. The legacy engine modules always use Postgres directly; this
+    #: only selects the backend the generic durable-queue SPI hands out. Validated
+    #: against the backend registry by ``configure()``.
+    db_backend: str = "pg"
+    #: Logical namespace isolating THIS tenant's jobs on a SHARED redis/mongodb
+    #: server — every key/collection is scoped by it, so two apps pointed at one
+    #: server can't claim or read each other's jobs (the multi-tenant data-leakage
+    #: guard). ``""`` ⇒ the literal namespace ``"default"``. For pg it scopes the
+    #: SPI rows via a ``namespace`` column.
+    db_namespace: str = ""
 
     # ── node-module resolver (overrides node_module_package when set) ──────────
     #: ``Callable[[str], module]`` — resolve a stored ``node_module`` string to

@@ -91,6 +91,9 @@ rationale.
   detector (last-resort recovery from a GPU hardware hang).
 - [`docs/worker_control.md`](docs/worker_control.md) — the operator ON/OFF
   control plane (hard-stop vs park a `(host, queue)` worker).
+- [`docs/storage_backends.md`](docs/storage_backends.md) — the pluggable
+  `StorageBackend` SPI (`pg` / `redis` / `mongodb`): the contract, the
+  capability matrix, and the integration boundary.
 
 ## Quick start
 
@@ -208,6 +211,29 @@ worker absent from `worker_controls` is treated as ON. See
 [`docs/worker_control.md`](docs/worker_control.md) for the full design (the
 `os._exit(79)` hard-stop contract and the extensible stop-policy seam).
 
+## Pluggable storage backends (`pg` · `redis` · `mongodb`)
+
+The queue store is selectable (since v0.3.0). Postgres is the default and the
+reference path; `redis` and `mongodb` are **opt-in** providers that reproduce the
+same durable-queue contract — claim exactly-once, lease/reclaim, idempotent
+terminals, an **atomic outbox**, and per-namespace tenant isolation.
+
+```python
+import queue_workflows
+queue_workflows.configure(db_backend="redis")     # or "mongodb" / "pg" (default)
+from queue_workflows.backends import get_backend
+be = get_backend()
+job_id = be.enqueue("cpu", {"task": "render"})
+job = be.claim("cpu", worker="box-1", lease_s=30)
+be.complete_with_event(job["id"], "completed", result={"ok": True})
+```
+
+`pip install 'queue_workflows[redis]'` / `'[mongodb]'` for the optional drivers
+(mongo needs a replica set). This is **additive** — it does not move the existing
+orchestrator/worker off Postgres. See
+[`docs/storage_backends.md`](docs/storage_backends.md) for the design, the
+capability matrix (and its caveats), and the integration boundary.
+
 ## Tests
 
 ```
@@ -217,4 +243,6 @@ QUEUE_WORKFLOWS_TEST_DB_URL=postgresql://user:pw@host:port/queue_workflows_test 
 ```
 
 The suite forces a `*_test` DB and applies the engine migration chain only. See
-`tests/conftest.py`.
+`tests/conftest.py`. The multi-backend contract suite additionally reads
+`QUEUE_WORKFLOWS_TEST_REDIS_URL` / `QUEUE_WORKFLOWS_TEST_MONGO_URL` (each backend
+skips if its server is unset/unreachable).
