@@ -5,3 +5,35 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+
+# uv lockfile — this is a library; consumers resolve against pyproject.toml.
+# Kept local for dev/CI reproducibility, not tracked in the repo.
+uv.lock
+
+# Python compile artifacts
+*.pyo
+*.pyd
+.eggs/
+
+# Test & coverage (pytest-cov)
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+
+# Type / lint caches
+.mypy_cache/
+.ruff_cache/
+
+# Local env / secrets — the DB DSN lives in env vars; never commit a real one
+.env
+.env.*
+!.env.example
+
+# Editor / OS cruft
+.idea/
+.vscode/
+.DS_Store
+*.swp
