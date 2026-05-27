@@ -1577,6 +1577,15 @@ class ClaimWorker:
         # Gate on schema readiness FIRST so the loop never polls a table the
         # orchestrator's bootstrap hasn't created yet.
         self.await_schema()
+        # Host hw-metrics sampler: start it BEFORE the park gate so a PARKED gpu
+        # worker KEEPS streaming this box's telemetry (CPU/GPU/RAM). Otherwise
+        # turning the gpu worker OFF also kills the host's telemetry and the queue
+        # gauge FREEZES at its last (busy) sample — it looks "still GPU busy" even
+        # though the GPU just went idle. The sampler is host-level, independent of
+        # whether this worker is claiming; one per host (flock).
+        if self.queue == "gpu":
+            from queue_workflows import hw_metrics
+            self._hw_sampler = hw_metrics.start_hw_metrics_sampler_flocked()
         # Boot-gate: if an operator has this worker turned OFF, PARK (no claim, no
         # heartbeat) until it's turned back ON. A fresh process holds no model so
         # RAM is already free; parking keeps us idle + out of the capacity gauge.
@@ -1590,13 +1599,8 @@ class ClaimWorker:
         )
         # Advertise capacity (no-op for fetch/load) + keep last_seen fresh.
         self.heartbeat.start()
-        # Bring up this HOST's hw-metrics sampler — but ONLY from the gpu
-        # worker. There is exactly one gpu-worker container per host, so gating
-        # the sampler start to the gpu queue yields exactly one sampler per box.
-        # The flock inside the starter is a cheap secondary guard.
-        if self.queue == "gpu":
-            from queue_workflows import hw_metrics
-            self._hw_sampler = hw_metrics.start_hw_metrics_sampler_flocked()
+        # (hw-metrics sampler already started above, before the park gate, so it
+        # survives an OFF→park cycle.)
         # Operator control watcher: HARD-stop this worker the instant it's turned
         # OFF (re-queue in-flight + os._exit to free RAM; the supervisor restart
         # re-enters the park gate above). Honours AI_LEADS_DISABLE_WORKER_CONTROL.
