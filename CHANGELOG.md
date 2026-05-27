@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-27
+
 ### Added
 - Operator worker ON/OFF control plane: a `worker_controls` table + a
   per-`(host, queue)` `WorkerControlWatcher` that hard-stops (kill in-flight +
@@ -24,8 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `finalize(context_delta)` is applied only on success.
 - MIT `LICENSE` and PEP 639 license metadata, keywords, and trove classifiers
   in `pyproject.toml`.
-- `README.md`: Architecture diagram (Mermaid), an "Example dashboard" section,
-  a "Turning workers on/off" section, and a Docs index.
+- `README.md`: a "local-cluster swift management" purpose note, an Architecture
+  diagram (Mermaid), an "Example dashboard" section, a "Turning workers on/off"
+  section, and a Docs index.
+- `AGENTS.md` as a byte-identical mirror of `CLAUDE.md`, and a documented
+  changelog convention.
 - This `CHANGELOG.md`.
 
 ### Changed
@@ -58,6 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatch-event outbox, a GPU warm-model cache, periodic ingest work + a
   PG-native scheduler, and per-host hw-metrics telemetry. Migrations 0001–0007.
 
-[Unreleased]: https://github.com/robertziel/python_workflows_queue/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/robertziel/python_workflows_queue/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/robertziel/python_workflows_queue/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/robertziel/python_workflows_queue/releases/tag/v0.2.0
 [0.1.0]: https://github.com/robertziel/python_workflows_queue/commit/9ddaf4ae80d906e9d286403bab015e56ba9899ed
