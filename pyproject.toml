@@ -8,6 +8,18 @@ version = "0.2.0"
 description = "Postgres-as-queue workflow engine (SKIP LOCKED claim, lease reclaim, DAG dispatch, GPU warm-model cache)."
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Robert Zieliński", email = "hello@robertz.co" }]
+keywords = ["postgres", "queue", "workflow", "dag", "skip-locked", "task-queue"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+    "Topic :: System :: Distributed Computing",
+]
 dependencies = [
     "psycopg[binary,pool]>=3.1",   # the only hard runtime dep (pool + connection + LISTEN/NOTIFY)
 ]
