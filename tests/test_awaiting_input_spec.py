@@ -453,3 +453,91 @@ def test_assign_walls_input_spec_enumerates_five_lanes_dynamically(tmp_path):
     assert len(set(gids)) == len(gids)
     assert any(g.startswith("parse_clusters:") for g in gids)
     assert any(g.startswith("parse_captions:") for g in gids)
+
+
+def test_paint_mask_source_wraps_scalar_abs_path_from_upstream_pick(tmp_path, provider):
+    """Regression pin for the "ChooseOne pick is ignored by the next
+    paint_mask step" bug.
+
+    Workflow shape:
+      pick_clean (choose_one, target=clean_plate_path)
+        ↓
+      pick_install_area (paint_mask, source={"$from": "pick_clean.clean_plate_path"})
+
+    After pick_clean completes with a scalar string in its
+    ``context_delta`` (the abs_path the operator picked), the
+    dispatcher's paint_mask block must expose that exact path as the
+    spec's ``source_abs_path`` — wrapping the scalar into a
+    single-element file-info list so the widget renders THAT image,
+    not "whichever lane happened to come back first from the
+    remove_fence.files scan."
+
+    Without the wrap the previous behaviour fell through into the
+    ``elif not isinstance(options, list): options = []`` branch — the
+    widget then had ``source_options=[]`` and (via PaintMask's
+    ``sourceRelPath ?? null``) rendered nothing or the lane-0 fallback.
+    """
+    from queue_workflows import dispatcher, node_queue
+
+    name = "_pick_then_paint"
+    provider.workflows[name] = {
+        "name": name, "mode": "node",
+        "steps": [
+            {"id": "pick_clean", "kind": "input", "widget": "choose_one",
+             "prompt": "pick", "target": "clean_plate_path",
+             "depends_on": []},
+            {"id": "pick_install_area", "kind": "input", "widget": "paint_mask",
+             "prompt": "paint", "target": "install_area_path",
+             "source": {"$from": "pick_clean.clean_plate_path"},
+             "depends_on": ["pick_clean"]},
+        ],
+    }
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    # Simulate the lane outputs the operator just picked from.
+    lane_dir = out_dir / "remove_fence" / "lane_sd15_inpaint"
+    lane_dir.mkdir(parents=True)
+    picked = lane_dir / "no_fence.jpg"
+    picked.write_bytes(b"\xff\xd8\xff fake")
+
+    run_id = _insert_run(name, out_dir)
+
+    # Complete pick_clean with the operator's scalar pick — exactly
+    # what ``resume_after_input`` writes for a single-select ChooseOne.
+    pick_job = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="pick_clean",
+        node_module="__input__choose_one", queue="cpu",
+        inputs={"widget": "choose_one", "target": "clean_plate_path"},
+        priority=50,
+    )
+    # Drive the lifecycle directly via SQL — no claim_worker is running.
+    # The dispatcher's context-builder only cares about status='completed'
+    # + context_delta, so we set just those.
+    import json
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_node_jobs SET status='completed', "
+            "context_delta=%s::jsonb, finished_at=now() WHERE id=%s",
+            (json.dumps({"clean_plate_path": str(picked)}), pick_job),
+        )
+        conn.commit()
+
+    _insert_awaiting_job(run_id, "pick_install_area", target="install_area_path")
+    dispatcher.on_node_awaiting_input(run_id, "pick_install_area")
+
+    spec = _job_spec(run_id, "pick_install_area")
+    assert spec is not None, "paint_mask spec should be persisted"
+    options = spec.get("source_options") or []
+    assert len(options) == 1, (
+        f"source_options must wrap the scalar pick into ONE option, "
+        f"got {options!r}"
+    )
+    assert options[0]["abs_path"] == str(picked), (
+        f"source_abs_path must equal the picked lane file; "
+        f"got {options[0].get('abs_path')!r}"
+    )
+    assert spec.get("source_abs_path") == str(picked)
+    # rel_path is the path relative to ``out_dir`` — the same convention
+    # the file-endpoint uses when streaming the artefact.
+    assert spec.get("source_rel_path") == "remove_fence/lane_sd15_inpaint/no_fence.jpg"
