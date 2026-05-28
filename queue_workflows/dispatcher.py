@@ -573,6 +573,16 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
             options = []
         if isinstance(options, dict):
             options = [options]
+        elif isinstance(options, str):
+            # Scalar abs_path (e.g. ``$from: pick_clean.clean_plate_path``,
+            # which an upstream ChooseOne wrote into ``context_delta`` as a
+            # single string). Wrap into a single-element file-info list so
+            # the widget renders that exact image — without this branch the
+            # code fell into the ``else: []`` arm below, the widget showed
+            # ``source_options=[]``, and the operator saw a blank canvas
+            # (or the lane-0 fallback). Regression test:
+            # ``test_paint_mask_source_wraps_scalar_abs_path_from_upstream_pick``.
+            options = [_file_info_for_abs_path(options, run.get("out_dir"))]
         elif not isinstance(options, list):
             options = []
         spec["source_options"] = options
@@ -736,16 +746,90 @@ def _resolve_pano_meta(
     return out
 
 
+_EXT_KIND = {
+    ".png": "image", ".jpg": "image", ".jpeg": "image",
+    ".webp": "image", ".gif": "image",
+    ".json": "json", ".geojson": "json",
+    ".csv": "csv", ".txt": "text", ".md": "text",
+    ".ply": "pointcloud", ".obj": "mesh", ".glb": "mesh",
+}
+
+
+def _file_info_for_abs_path(
+    abs_path: str, out_dir: str | None,
+) -> dict[str, Any]:
+    """Build a file-info dict (``rel_path`` + ``abs_path`` + ``kind`` +
+    ``size_bytes``) for a scalar abs_path string — same shape the
+    on-disk scanner in :func:`_run_context_for_refs` produces.
+
+    Used by widget builders (paint_mask, choose_one — anywhere a
+    ``$from`` ref might resolve to a single string rather than a list
+    of pre-shaped files). When the path lies INSIDE ``out_dir``, we
+    compute ``rel_path`` relative to it so the frontend's
+    ``/api/workflow/:id/file?path=<rel_path>`` endpoint can stream
+    the artefact. When it lies outside, we fall back to the absolute
+    path as the "rel_path" — defensive; the file-serving endpoint
+    will refuse paths outside the run's allowlisted roots anyway.
+    """
+    from pathlib import Path
+    p = Path(abs_path)
+    if out_dir:
+        try:
+            rel = p.relative_to(out_dir).as_posix()
+        except ValueError:
+            rel = abs_path
+    else:
+        rel = abs_path
+    info: dict[str, Any] = {
+        "abs_path": abs_path,
+        "rel_path": rel,
+        "kind": _EXT_KIND.get(p.suffix.lower(), "file"),
+    }
+    try:
+        info["size_bytes"] = p.stat().st_size
+    except OSError:
+        info["size_bytes"] = 0
+    return info
+
+
 def _run_context_for_refs(run: dict[str, Any]) -> dict[str, Any]:
     """Build the context dict ``$from`` refs resolve against when paused at an
     input step.
 
-    Starts with ``run.context`` and augments it with a ``<step_id>: {"files":
-    [...]}`` entry for each pipeline step whose output directory exists on disk.
-    Each file record has ``rel_path`` + ``kind`` so ``$filter`` clauses work.
+    Starts with ``run.context`` and augments it with:
+
+      * ``<step_id>: {"files": [...]}`` for each pipeline step whose output
+        directory exists on disk (each file has ``rel_path`` + ``kind`` so
+        ``$filter`` clauses work).
+      * Every completed sibling job's ``context_delta`` merged under its
+        ``node_id`` — so an input step downstream of another input step (e.g.
+        ``pick_install_area`` referencing ``$from: pick_clean.clean_plate_path``)
+        sees the operator's prior pick. Without this, the context-builder only
+        saw on-disk artefacts; user picks that aren't physical files were
+        invisible and the downstream resolver raised "missing segment".
     """
     from pathlib import Path
     ctx: dict[str, Any] = dict(run.get("context") or {})
+    # Merge completed sibling jobs' context_delta. Mirror ``_enqueue``'s
+    # merge so the context shape is identical whether the resolver runs
+    # at enqueue-time (for pipeline nodes) or input-spec-build-time (for
+    # input nodes). The dispatcher mutates ``ctx`` LATER from the
+    # on-disk scan, but ``files`` only — non-files keys (operator picks,
+    # scalar paths) survive untouched.
+    run_id = run.get("id") or run.get("run_id")
+    if run_id:
+        try:
+            for sib in node_queue.list_jobs_for_run(run_id):
+                if sib.get("status") == "completed" and sib.get("context_delta"):
+                    nid = sib.get("node_id")
+                    if not nid:
+                        continue
+                    ctx[nid] = {**(ctx.get(nid) or {}), **sib["context_delta"]}
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "[dispatcher] couldn't merge sibling context_delta for %s",
+                run_id,
+            )
     out_dir = run.get("out_dir")
     if not out_dir:
         return ctx
