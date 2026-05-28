@@ -513,6 +513,28 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
             spec["fisheye_rel_path"] = options[0].get("rel_path")
             spec["fisheye_abs_path"] = options[0].get("abs_path")
         spec["pano_meta"] = _resolve_pano_meta(run, options)
+    elif widget == "paint_mask":
+        # Resolves the source image the user will paint a mask on. The widget
+        # uploads a binary mask PNG back through the standard multipart pipe;
+        # the spec just needs to tell it which image to display.
+        context = _run_context_for_refs(run)
+        source = step.get("source")
+        try:
+            options = _resolve_ref(source, context) if source else []
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "[dispatcher] failed to resolve paint_mask source for "
+                "%s: %s", step["id"], exc,
+            )
+            options = []
+        if isinstance(options, dict):
+            options = [options]
+        elif not isinstance(options, list):
+            options = []
+        spec["source_options"] = options
+        if options:
+            spec["source_rel_path"] = options[0].get("rel_path")
+            spec["source_abs_path"] = options[0].get("abs_path")
     elif widget == "assign_walls":
         # Operator-facing wall-assignment widget for the facade-merge workflow.
         import json
