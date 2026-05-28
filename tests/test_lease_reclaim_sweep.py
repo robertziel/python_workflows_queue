@@ -291,3 +291,73 @@ def test_reclaim_all_requeues_running_regardless_of_lease():
 
 def test_reclaim_all_noop_when_nothing_running():
     assert node_queue.reclaim_all_running_for_resume() == []
+
+
+# ── cancel-aware reclaim ────────────────────────────────────────────────────
+
+
+def _cancel_run(run_id: str) -> None:
+    """Flip ``workflow_runs.status`` to ``cancelled`` — same effect as
+    the Rails ``WorkflowsController#cancel`` endpoint, just the
+    state-transition step (the cascade is what we're testing isn't
+    needed for the lease-reclaim path)."""
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_runs SET status='cancelled', finished_at=now() "
+            "WHERE id::text=%s",
+            (run_id,),
+        )
+
+
+def test_lease_reclaim_cancels_running_row_on_cancelled_parent():
+    """Regression: when a worker dies mid-job on a CANCELLED run, the
+    lease expires, the sweep re-queues the row, the parent run is
+    cancelled so no worker will EVER claim it (the claim SQL filters
+    cancelled parents) — and the row sits in ``queued`` as a ghost
+    forever. The fix: when the parent run is in a terminal state, the
+    sweep marks the row ``cancelled`` instead of re-queueing.
+
+    Reproduction: run ``41570ecd-566e-4281-8b12-4e925fceebd1`` —
+    ``reconstruct/render_hunyuan_i2v`` sat ``queued`` for 20+ minutes
+    after the run was cancelled. The orphan was discovered by the
+    operator in the queue popover and reported as
+    "I cancelled this run but it's still in the GPU queue."
+    """
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="ghost", node_module="x", queue="gpu",
+        priority=100,
+    )
+    force_lease(job_id, expires_in_s=-30)
+    _cancel_run(run_id)
+
+    pool = _reclaim_pool()
+    pool._sweep_expired_leases()
+
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "cancelled", (
+        f"row whose parent run is cancelled must NOT be re-queued; "
+        f"got status={row['status']!r}. This is the ghost-job bug."
+    )
+    # Bookkeeping should still be cleared so a future debugger can tell
+    # this was a reclaim-into-cancel, not a stale ``running`` row.
+    assert row["claimed_by"] is None
+    assert row["lease_expires_at"] is None
+
+
+def test_lease_reclaim_still_requeues_when_parent_is_running():
+    """The cancel-aware branch must NOT regress the normal case. An
+    expired lease on a row whose parent is still ``running`` must
+    re-queue, exactly as before."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="alive", node_module="x", queue="cpu",
+        priority=100,
+    )
+    force_lease(job_id, expires_in_s=-30)
+
+    pool = _reclaim_pool()
+    pool._sweep_expired_leases()
+
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "queued"

@@ -524,32 +524,64 @@ def reclaim_expired_ingest_leases() -> list[dict[str, Any]]:
 
 
 def reclaim_expired_leases() -> list[dict[str, Any]]:
-    """Re-queue ``running`` rows whose lease has lapsed.
+    """Re-queue ``running`` rows whose lease has lapsed — UNLESS the
+    parent run is no longer active.
 
-    A live worker renews its lease while running, so a lapsed lease means
-    the owner died or wedged. Flip such rows back to ``queued``, clear
-    the lease bookkeeping, and bump priority to the front
-    (``LEAST(priority, 10)``) so the recovered work jumps the queue. The
-    status flip fires the ``node_job_ready`` NOTIFY (migration 0006) so an
-    idle worker picks it straight back up.
+    A live worker renews its lease while running, so a lapsed lease
+    means the owner died or wedged. Two outcomes depending on the
+    parent run's status:
+
+      * ``running`` parent — flip the row to ``queued``, clear the
+        lease bookkeeping, bump priority to the front
+        (``LEAST(priority, 10)``) so the recovered work jumps the
+        queue. The status flip fires the ``node_job_ready`` NOTIFY
+        (migration 0006) so an idle worker picks it straight back up.
+      * ``cancelled`` / ``failed`` / ``completed`` parent — flip the
+        row to ``cancelled`` instead. The claim SQL filters out jobs
+        whose parent is non-running, so re-queuing here would create
+        a ghost: the row sits in ``queued`` forever (no worker will
+        ever claim it) while the queue popover keeps reporting "+1
+        queued." Regression: cancelled run
+        ``41570ecd-566e-4281-8b12-4e925fceebd1`` left
+        ``reconstruct/render_hunyuan_i2v`` orphaned for 20+ minutes
+        after a worker restart killed the in-flight render. Pinned
+        by ``test_lease_reclaim_cancels_running_row_on_cancelled_parent``.
 
     Only touches rows that carry a lease (``lease_expires_at IS NOT NULL``).
 
     Returns the reclaimed rows' ``id`` / ``run_id`` / ``node_id`` so the
     caller can re-dispatch or log them."""
     with connection() as conn, conn.cursor() as cur:
+        # Single UPDATE branches on the parent run's status. The
+        # CASE-on-target keeps this atomic — no race window between an
+        # is-parent-active check and the lease flip.
         cur.execute(
             """
-            UPDATE workflow_node_jobs
-            SET status = 'queued',
-                started_at = NULL,
+            UPDATE workflow_node_jobs j
+            SET status = CASE WHEN r.status = 'running'
+                              THEN 'queued'
+                              ELSE 'cancelled'
+                         END,
+                started_at = CASE WHEN r.status = 'running'
+                                  THEN NULL
+                                  ELSE j.started_at
+                             END,
                 claimed_by = NULL,
                 lease_expires_at = NULL,
-                priority = LEAST(priority, 10)
-            WHERE status = 'running'
-              AND lease_expires_at IS NOT NULL
-              AND lease_expires_at < now()
-            RETURNING id, run_id, node_id
+                priority = CASE WHEN r.status = 'running'
+                                THEN LEAST(j.priority, 10)
+                                ELSE j.priority
+                           END,
+                finished_at = CASE WHEN r.status = 'running'
+                                   THEN j.finished_at
+                                   ELSE now()
+                              END
+            FROM workflow_runs r
+            WHERE r.id::text = j.run_id
+              AND j.status = 'running'
+              AND j.lease_expires_at IS NOT NULL
+              AND j.lease_expires_at < now()
+            RETURNING j.id, j.run_id, j.node_id
             """,
         )
         return list(cur.fetchall())
