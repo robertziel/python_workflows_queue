@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `node_queue.delete_non_terminal_jobs_for_run(run_id) -> list[node_id]` —
+  restart primitive that deletes every job whose status is NOT
+  `completed` / `skipped`, returning the deleted `node_id`s so the host can
+  cascade cleanup into its own artefacts (on-disk dirs, input submissions).
+  Paired with the engine's existing `_find_ready_nodes` (which treats
+  surviving `completed` / `skipped` rows as cursors), a follow-up
+  `dispatcher.start_run` resumes a failed run from exactly the failed
+  branch instead of re-doing the completed prefix. Caller-policy
+  in-flight guard is documented in the docstring.
 - `paint_mask` input widget — the dispatcher's `_build_input_spec` resolves
   the step's `source` ref into `source_options` / `source_rel_path` /
   `source_abs_path` so a host-side canvas widget can display the upstream

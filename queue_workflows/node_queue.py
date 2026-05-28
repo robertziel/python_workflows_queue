@@ -1208,6 +1208,41 @@ def cancel_siblings_after_failure(run_id: str) -> int:
     return cancel_queued_jobs_for_run(run_id)
 
 
+def delete_non_terminal_jobs_for_run(run_id: str) -> list[str]:
+    """Restart primitive: delete every job for ``run_id`` whose status is NOT
+    ``completed`` / ``skipped``. Returns the list of deleted ``node_id``s so
+    the host can cascade into its own artefacts (on-disk node dirs, input
+    submissions). Idempotent — a second call returns ``[]``.
+
+    The engine's ``dispatcher._find_ready_nodes`` treats surviving
+    ``completed`` / ``skipped`` rows as cursors when re-expanding the DAG: only
+    nodes WITHOUT a row whose deps are completed/skipped get enqueued. So a
+    follow-up ``dispatcher.start_run`` after this call resumes the run from
+    exactly the deleted set (plus any downstream that never got enqueued
+    because of the original failure) — the host's "retry whole run" button no
+    longer re-does the completed prefix.
+
+    CALLER POLICY: this primitive INCLUDES ``running`` rows in the deletion
+    set. If the caller's retry contract needs to refuse while a worker is
+    mid-flight (the typical case — the cancel-watcher polls at 5 s, so a
+    just-terminated run can briefly still have ``running`` children winding
+    down), it must check ``WHERE status='running'`` itself BEFORE calling this.
+    The engine's lease-reclaim sweep eventually re-queues a stranded
+    ``running`` row, so the worst case here is a single straggler producing
+    output to a path the caller then `rm -rf`'s — recoverable, but worth a
+    409 from the caller.
+    """
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM workflow_node_jobs "
+            "WHERE run_id = %s "
+            "  AND status NOT IN ('completed', 'skipped') "
+            "RETURNING node_id",
+            (run_id,),
+        )
+        return [r["node_id"] for r in cur.fetchall()]
+
+
 def cancel_orphaned_queued_jobs() -> int:
     """Flip every ``queued`` job whose parent run is already terminal
     (``cancelled`` / ``failed``) to ``cancelled``. Returns the number of rows
