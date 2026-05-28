@@ -513,6 +513,50 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
             spec["fisheye_rel_path"] = options[0].get("rel_path")
             spec["fisheye_abs_path"] = options[0].get("abs_path")
         spec["pano_meta"] = _resolve_pano_meta(run, options)
+    elif widget == "pick_fence":
+        # Per-detection fence picker — operator clicks individual detections
+        # (their own fence, ignore neighbour's) before the paint refinement
+        # step. Spec carries (a) the source image to display as background and
+        # (b) the detections.json index the host widget fetches to render each
+        # detection as a colored overlay. Same $from/$filter resolution shape
+        # as paint_mask + choose_one — no new mini-language.
+        context = _run_context_for_refs(run)
+        source = step.get("source")
+        try:
+            src_options = _resolve_ref(source, context) if source else []
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "[dispatcher] failed to resolve pick_fence source for "
+                "%s: %s", step["id"], exc,
+            )
+            src_options = []
+        if isinstance(src_options, dict):
+            src_options = [src_options]
+        elif not isinstance(src_options, list):
+            src_options = []
+        spec["source_options"] = src_options
+        if src_options:
+            spec["source_rel_path"] = src_options[0].get("rel_path")
+            spec["source_abs_path"] = src_options[0].get("abs_path")
+        # Detections JSON — same ref shape; the widget fetches the file via
+        # /workflow/:id/file?path=... and parses the list of detection entries.
+        detections = step.get("detections")
+        try:
+            det_options = _resolve_ref(detections, context) if detections else []
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "[dispatcher] failed to resolve pick_fence detections for "
+                "%s: %s", step["id"], exc,
+            )
+            det_options = []
+        if isinstance(det_options, dict):
+            det_options = [det_options]
+        elif not isinstance(det_options, list):
+            det_options = []
+        spec["detections_options"] = det_options
+        if det_options:
+            spec["detections_rel_path"] = det_options[0].get("rel_path")
+            spec["detections_abs_path"] = det_options[0].get("abs_path")
     elif widget == "paint_mask":
         # Resolves the source image the user will paint a mask on. The widget
         # uploads a binary mask PNG back through the standard multipart pipe;

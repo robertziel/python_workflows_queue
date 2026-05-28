@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- New `pick_fence` input widget — `_build_input_spec` resolves both `source`
+  (the image to display as background) and `detections` (a `detections.json`
+  index of per-detection masks) into `source_options` / `source_rel_path` /
+  `source_abs_path` plus `detections_options` / `detections_rel_path` /
+  `detections_abs_path`. Lets a host-side widget render each detection as a
+  colored overlay the operator clicks to toggle in/out. Same `$from`/`$filter`
+  resolution shape as `paint_mask` + `choose_one` — no new mini-language.
 - `node_queue.delete_non_terminal_jobs_for_run(run_id) -> list[node_id]` —
   restart primitive that deletes every job whose status is NOT
   `completed` / `skipped`, returning the deleted `node_id`s so the host can
