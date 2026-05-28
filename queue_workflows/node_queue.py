@@ -1208,6 +1208,34 @@ def cancel_siblings_after_failure(run_id: str) -> int:
     return cancel_queued_jobs_for_run(run_id)
 
 
+def cancel_orphaned_queued_jobs() -> int:
+    """Flip every ``queued`` job whose parent run is already terminal
+    (``cancelled`` / ``failed``) to ``cancelled``. Returns the number of rows
+    touched.
+
+    The host's cancel handler typically only updates ``workflow_runs.status``;
+    it does NOT cascade into ``workflow_node_jobs``. The claim SQL's run-cancel
+    guard prevents such jobs from ever running, but they linger in ``queued``
+    forever — operator-facing queue gauges then misleadingly suggest a worker
+    stall. This sweep is the cleanup. Only ``status='queued'`` rows are touched
+    so we don't race the cancel-watcher's cooperative ``running`` cancel.
+
+    Idempotent: a second call after the first returns 0.
+    """
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE workflow_node_jobs j
+               SET status = 'cancelled', finished_at = now()
+              FROM workflow_runs r
+             WHERE j.run_id = r.id
+               AND j.status = 'queued'
+               AND r.status IN ('cancelled', 'failed')
+            """
+        )
+        return cur.rowcount or 0
+
+
 def set_resolved_inputs(job_id: str, resolved_inputs: dict[str, Any]) -> None:
     """Write the execution-time snapshot of resolved inputs into the
     ``resolved_inputs`` column. Called by the worker just before

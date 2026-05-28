@@ -69,6 +69,7 @@ def configure(
     ingest_default_budget_s: int | None = None,
     db_backend: str | None = None,
     db_namespace: str | None = None,
+    cancel_orphan_queued_jobs: bool | None = None,
 ) -> EngineConfig:
     """Set engine configuration values. Only the passed keyword args are
     mutated; the rest keep their (ai_leads-byte-compatible) defaults. Returns
@@ -111,6 +112,8 @@ def configure(
             cfg.db_backend = canonical_backend_name(db_backend)
         if db_namespace is not None:
             cfg.db_namespace = str(db_namespace)
+        if cancel_orphan_queued_jobs is not None:
+            cfg.cancel_orphan_queued_jobs = bool(cancel_orphan_queued_jobs)
     return cfg
 
 
