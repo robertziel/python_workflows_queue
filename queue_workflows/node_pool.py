@@ -125,6 +125,16 @@ class NodePool:
         )
         self._node_event_prune_last_run: float = 0.0
 
+        # Orphan-cancel sweep — opt-in (``configure(cancel_orphan_queued_jobs=
+        # True)``). Flips ``queued`` jobs whose parent run is already terminal
+        # (``cancelled`` / ``failed``) to ``cancelled``. The claim SQL already
+        # refuses them, but the rows linger and pollute queue gauges. Disabled
+        # by default to preserve pre-0.4 behaviour byte-for-byte.
+        self._orphan_cancel_interval_s: float = float(
+            os.environ.get("AI_LEADS_ORPHAN_CANCEL_SWEEP_INTERVAL_S", "30")
+        )
+        self._orphan_cancel_last_run: float = 0.0
+
     def start(self) -> None:
         if self._register_builtins is not None:
             try:
@@ -401,6 +411,16 @@ class NodePool:
         except Exception:
             log.exception("[node-pool] node-event retention sweep failed")
 
+        # 7) Orphan-cancel sweep — opt-in. Flip ``queued`` jobs of cancelled /
+        # failed runs to ``cancelled`` so the queue gauges don't read
+        # misleadingly. Default-off so the engine's behaviour pre-0.4 is
+        # unchanged; hosts that want the cleanup ship
+        # ``configure(cancel_orphan_queued_jobs=True)``.
+        try:
+            self._sweep_orphan_queued_jobs()
+        except Exception:
+            log.exception("[node-pool] orphan-cancel sweep failed")
+
     def _sweep_expired_leases(self) -> None:
         """Re-queue ``running`` rows whose PG lease has lapsed.
 
@@ -483,6 +503,36 @@ class NodePool:
                 "must be bounced (host-supervisor should restart it)",
                 row.get("host_label"), row.get("queue"),
                 row.get("last_seen"), row.get("running_jobs"),
+            )
+
+    def _sweep_orphan_queued_jobs(self) -> None:
+        """Flip ``queued`` jobs of already-terminal runs to ``cancelled``.
+
+        Opt-in via :attr:`EngineConfig.cancel_orphan_queued_jobs` — default
+        ``False`` so the engine's pre-0.4 behaviour is preserved byte-for-byte.
+        When enabled, runs interval-gated (``_orphan_cancel_interval_s``,
+        default 30 s) so the 0.5 s dispatch loop doesn't run the join UPDATE
+        every tick. The underlying SQL is idempotent (no-op if there are no
+        orphans), so the gate is purely a load optimisation.
+        """
+        from queue_workflows.config import get_config
+
+        if not get_config().cancel_orphan_queued_jobs:
+            return
+
+        import time as _time
+
+        now = _time.time()
+        if now - self._orphan_cancel_last_run < self._orphan_cancel_interval_s:
+            return
+        self._orphan_cancel_last_run = now
+
+        flipped = node_queue.cancel_orphaned_queued_jobs()
+        if flipped:
+            log.info(
+                "[node-pool] cancelled %d orphaned queued job(s) of "
+                "terminal runs",
+                flipped,
             )
 
     def _sweep_node_event_retention(self) -> None:

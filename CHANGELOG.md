@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `paint_mask` input widget — the dispatcher's `_build_input_spec` resolves
+  the step's `source` ref into `source_options` / `source_rel_path` /
+  `source_abs_path` so a host-side canvas widget can display the upstream
+  image and upload a binary mask PNG back through the standard multipart
+  pipe.
+- Opt-in orphan-cancel sweep: with
+  `configure(cancel_orphan_queued_jobs=True)` the `NodePool` periodically
+  flips `queued` `workflow_node_jobs` whose parent run is already
+  `cancelled` / `failed` to `cancelled`. The claim SQL's run-cancel guard
+  already refuses such jobs, but they linger in `queued` and pollute the
+  operator-facing queue gauges; this is the cleanup. Default `False`
+  preserves pre-0.4 behaviour byte-for-byte. New
+  `node_queue.cancel_orphaned_queued_jobs()` exposes the underlying join
+  UPDATE for direct use. Interval-gated by
+  `AI_LEADS_ORPHAN_CANCEL_SWEEP_INTERVAL_S` (default 30 s).
+
 ## [0.3.0] — 2026-05-27
 
 ### Added

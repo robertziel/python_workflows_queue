@@ -124,6 +124,17 @@ class EngineConfig:
     #: without forking ``execute_node``.
     invoke_context: Callable[[dict, dict], Any] | None = None
 
+    # ── orphan-cancel sweep (opt-in) ──────────────────────────────────────────
+    #: When True, the :class:`NodePool` periodically flips ``queued`` jobs whose
+    #: parent run is already ``cancelled`` / ``failed`` to ``cancelled``. The
+    #: host's cancel handler is usually a single ``UPDATE workflow_runs SET
+    #: status='cancelled'`` and does not cascade into ``workflow_node_jobs``; the
+    #: claim SQL refuses such jobs (run-cancel guard), but they linger in
+    #: ``queued`` and pollute queue gauges. Default ``False`` preserves the
+    #: engine's pre-0.4 behaviour byte-for-byte; hosts that want the cleanup
+    #: opt in via ``configure(cancel_orphan_queued_jobs=True)``.
+    cancel_orphan_queued_jobs: bool = False
+
     # ── ingest queue names + budget (host-configurable; G1) ────────────────────
     #: Ingest-family queue names. Migration 0008 dropped the fetch/load DB CHECK;
     #: the host validates ``queue`` against THIS set before enqueue (mirroring the
