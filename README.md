@@ -45,16 +45,9 @@ Orchestrate model jobs across the machines you already own — keep each model w
 
 The pitch in one line: **your Postgres is already the most durable thing you run — so let it _be_ the queue.** No second broker to babysit, no scheduler cluster to operate. You `INSERT` a row inside your own transaction and the work is enqueued; a dead worker's lease lapses and the row is re‑queued. Purpose‑built for a **small, self‑hosted, heterogeneous CPU/GPU fleet you already own** — not a 1,000‑node cloud.
 
-| | **queue_workflows** | Celery + RabbitMQ | Temporal / Airflow |
-|---|---|---|---|
-| 🧩 **Infra to run** | Just Postgres (one hard dep: `psycopg`) | App **+ a broker** (RabbitMQ/Redis) to operate & monitor | A **server/scheduler cluster** (+ its own DB) to stand up |
-| ✍️ **Enqueue** | `INSERT` **in your own txn** — atomic with your domain write; a trigger `NOTIFY`s in‑transaction (no "queued but no wake" gap) | `apply_async` — a **separate** broker publish, not in your DB txn (dual‑write to reconcile) | Client call to the external server |
-| 💀 **Worker dies mid‑job** | **Lease lapses → row auto‑requeued** to a healthy peer; resume‑style, no lost work | `acks_late` redelivery — but a restart can resurrect ghost tasks you must guard against | Server reschedules (it owns durable state) |
-| 🎛️ **Operator ON/OFF a box** | Built‑in: one `worker_controls` row hard‑stops & **redistributes** the in‑flight job, worker comes back **parked** | Roll your own (revoke + process mgmt) | Worker pools / pause, via the control plane |
-| 🖥️ **GPU‑aware** | First‑class: warm‑model cache, per‑host capability, two‑lane diffusion+VLM concurrency, hardware telemetry | Not a concept — you build it | Not a concept — you build it |
-| 🪶 **Footprint / ops** | One library, one DB, three small processes | Heavier moving parts to keep alive | Heaviest — a platform in its own right |
+**Reach for it when** you have a handful of self-hosted CPU/GPU boxes you already own, want GPU-aware scheduling (warm models, per-box ON/OFF) and crash-safe recovery, and would rather not stand up a broker or a workflow platform just to move jobs between machines.
 
-**Honest scope:** this is intentionally *not* Temporal. There is no hosted UI, no multi‑region story, no versioned‑workflow replay engine. It's a lean, durable, GPU‑aware queue for a handful of machines on your own LAN — extracted from a larger self‑hosted stack and hardened there, then generalized so any consumer can reuse it.
+**Look elsewhere when** you need a hosted UI, multi-region durability, or versioned-workflow replay at large scale — that's a different class of tool.
 
 > ⭐ **Give me a star if you find it useful :)** — it genuinely helps other small‑fleet operators find the project.
 
