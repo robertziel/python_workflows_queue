@@ -1126,15 +1126,13 @@ class HeartbeatEmitter:
 
     Claim-worker shape:
 
-      * ``concurrency`` is **1** for every queue — a claim worker is one
-        poll-claim loop with a single structural in-flight slot, which for GPU
-        is the warm-model diffusion job. The GPU also runs a PAR-sized no-model
-        VLM pool beside that slot, but the pool's capacity is a per-machine
-        VLM-request-batching property surfaced to the queue UI via
-        ``worker_controls.llm_parallelism`` (the "PAR" field) — deliberately NOT
-        folded into this heartbeat, so the GPU pill counts the heavy warm-model
-        slot (1/box), not the lightweight VLM pool. (A ``concurrency_fn`` seam
-        remains for a future caller wanting a live per-tick value; unused today.)
+      * ``concurrency`` is **1** for cpu/ingest — a claim worker is one
+        poll-claim loop. For **GPU** it is ``max(1, PAR)``: the machine's GPU job
+        concurrency, i.e. its VLM pool size (``worker_controls.llm_parallelism``),
+        read live each tick via the ``concurrency_fn`` seam so a UI PAR change is
+        reflected without a restart. So a PAR-4 vLLM machine reads GPU x/4 in the
+        consumer pill; an ollama machine (PAR 1) reads x/1. (NOT 1+PAR — the
+        inline diffusion job occupies one of those PAR slots, not an extra one.)
       * the **GPU** heartbeat reports ``current_model`` read from the worker's
         :class:`ModelCache` on every tick — the gauge's busy signal. The
         **CPU** heartbeat reports ``current_model=None``.
@@ -1155,9 +1153,9 @@ class HeartbeatEmitter:
         self._host_label = host_label
         self._model_cache = model_cache
         self._interval_s = float(interval_s)
-        # Optional live concurrency provider (reserved seam, unused today — the
-        # GPU VLM pool's PAR is surfaced via worker_controls, not this gauge).
-        # None ⇒ the historical constant 1 for every queue.
+        # Live concurrency provider, read each tick. GPU supplies one returning
+        # max(1, PAR) (its VLM pool size = the machine's GPU job concurrency);
+        # cpu/ingest pass None ⇒ the historical constant 1.
         self._concurrency_fn = concurrency_fn
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1179,10 +1177,9 @@ class HeartbeatEmitter:
 
     def _concurrency(self) -> int:
         """The advertised capacity for this tick — the historical constant 1
-        (one structural in-flight slot) unless a caller supplies a
-        ``concurrency_fn`` (reserved seam, unused today). A read failure falls
-        back to 1 so a transient DB blip never zeroes the gauge nor crashes the
-        heartbeat."""
+        unless a caller supplies a ``concurrency_fn`` (GPU does: ``max(1, PAR)``).
+        A read failure falls back to 1 so a transient DB blip never zeroes the
+        gauge nor crashes the heartbeat."""
         if self._concurrency_fn is None:
             return 1
         try:
@@ -1195,10 +1192,10 @@ class HeartbeatEmitter:
             return 1
 
     def emit_once(self) -> None:
-        """Upsert this worker's row once (concurrency = 1 — one structural
-        in-flight slot per queue; GPU also carries its live ``current_model``,
-        the diffusion busy signal). Failures are swallowed + logged — a
-        transient DB blip must never crash a worker mid-job."""
+        """Upsert this worker's row once (concurrency = 1 for cpu/ingest, or
+        ``max(1, PAR)`` for GPU via ``concurrency_fn``; GPU also carries its live
+        ``current_model``, the diffusion busy signal). Failures are swallowed +
+        logged — a transient DB blip must never crash a worker mid-job."""
         try:
             from queue_workflows import model_registry
             node_queue.upsert_worker_heartbeat(
@@ -1284,18 +1281,17 @@ class ClaimWorker:
         self._pool_feeder: threading.Thread | None = None
         self._pool_inflight = 0
         self._pool_lock = threading.Lock()
-        # Worker capacity heartbeat — a no-op for fetch/load. EVERY queue
-        # advertises 1: the structural one-job-inline slot, which for GPU is the
-        # single warm-model diffusion job. The GPU VLM pool's PAR capacity is a
-        # per-machine VLM-request-batching property surfaced to the queue UI via
-        # worker_controls.llm_parallelism (the "PAR" field) — deliberately NOT
-        # folded into this gauge, so the GPU pill counts the heavy warm-model
-        # slot (1/box), not the lightweight no-model VLM pool that rides beside
-        # it. (The VLM pool's live occupancy is shown per-machine in the RUNNING
-        # list instead.)
+        # Worker capacity heartbeat — a no-op for fetch/load. cpu/ingest advertise
+        # 1 (one poll-claim loop). GPU advertises max(1, PAR): the machine's GPU
+        # job concurrency = its VLM pool size (worker_controls.llm_parallelism),
+        # read live each tick so a UI PAR change is reflected without a restart.
+        # A PAR-4 vLLM machine therefore reads GPU x/4 in the consumer pill; an
+        # ollama machine (PAR 1) reads x/1. (NOT 1+PAR — the inline diffusion job
+        # occupies one of those PAR slots, it is not an extra one.)
         self.heartbeat = HeartbeatEmitter(
             queue=self.queue, host_label=self.host,
             model_cache=self.model_cache,
+            concurrency_fn=(self._pool_parallelism if self.queue == "gpu" else None),
         )
         # This host's hw-metrics sampler — started in ``run_forever`` ONLY when
         # ``queue == 'gpu'`` (one gpu container per host ⇒ one sampler per host).

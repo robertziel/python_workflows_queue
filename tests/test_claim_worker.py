@@ -2120,27 +2120,26 @@ def test_pool_feeder_does_not_claim_model_backed_jobs(monkeypatch):
         w._stop_pool_lane()
 
 
-# ── heartbeat advertises 1 (the diffusion slot) for GPU ─────────────────────
+# ── heartbeat advertises max(1, PAR) for GPU (= the machine's GPU concurrency) ─
 
 
-def test_gpu_heartbeat_concurrency_is_one(_heartbeat_enabled, monkeypatch):
-    """The GPU heartbeat advertises ``concurrency = 1`` — the single structural
-    warm-model diffusion slot. The PAR-sized VLM pool's capacity is a
-    per-machine property surfaced to the UI via worker_controls.llm_parallelism
-    (the "PAR" field), deliberately NOT folded into this gauge — so the GPU pill
-    counts the heavy warm-model slot (1/box), not the lightweight VLM pool. A
-    large configured PAR must NOT inflate the heartbeat."""
+def test_gpu_heartbeat_concurrency_is_parallelism(_heartbeat_enabled, monkeypatch):
+    """The GPU heartbeat advertises ``concurrency = max(1, PAR)`` — the machine's
+    GPU job concurrency, i.e. its VLM pool size (worker_controls.llm_parallelism).
+    So a PAR-4 vLLM machine shows GPU x/4 in the consumer pill; an ollama machine
+    (PAR 1) shows x/1. NOT 1+PAR — the inline diffusion job is one of those slots,
+    not an extra one."""
     from queue_workflows import worker_control
     monkeypatch.setattr(
         worker_control, "llm_config_for",
-        lambda h, q: worker_control.LLMConfig(parallelism=16),
+        lambda h, q: worker_control.LLMConfig(parallelism=4),
     )
 
     w = claim_worker.ClaimWorker(queue="gpu", host="host-hb", model_cache=_PoolCache())
     w.heartbeat.emit_once()
     row = _heartbeat_row("host-hb", "gpu")
     assert row is not None
-    assert row["concurrency"] == 1
+    assert row["concurrency"] == 4
 
 
 def test_cpu_heartbeat_concurrency_stays_one(_heartbeat_enabled):
