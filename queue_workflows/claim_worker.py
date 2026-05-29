@@ -1281,6 +1281,12 @@ class ClaimWorker:
         self._pool_feeder: threading.Thread | None = None
         self._pool_inflight = 0
         self._pool_lock = threading.Lock()
+        # True while the INLINE lane is executing a (model-backed diffusion) job.
+        # The gpu VLM-pool feeder subtracts this from PAR so a machine's TOTAL
+        # concurrent node-jobs (1 inline diffusion + pool VLM) never exceeds PAR —
+        # the diffusion occupies one of the PAR slots. Plain bool: written by the
+        # inline loop, read by the feeder thread (GIL-atomic; best-effort cap).
+        self._inline_running = False
         # Worker capacity heartbeat — a no-op for fetch/load. cpu/ingest advertise
         # 1 (one poll-claim loop). GPU advertises max(1, PAR): the machine's GPU
         # job concurrency = its VLM pool size (worker_controls.llm_parallelism),
@@ -1368,6 +1374,15 @@ class ClaimWorker:
             return 1
         return max(1, int(par or 1))
 
+    def _pool_budget(self, par: int) -> int:
+        """The VLM pool's in-flight ceiling THIS cycle: ``PAR`` minus the inline
+        diffusion slot when it's busy. A GPU machine's capacity is PAR TOTAL
+        node-jobs; the concurrency-1 inline diffusion lane (when running) takes
+        one of those slots, so the pool may keep at most ``PAR - 1`` VLM node-jobs
+        in flight alongside it — keeping the machine's total ≤ PAR. Idle inline ⇒
+        the full PAR. Clamped ≥ 0 (PAR=1 + a diffusion ⇒ 0 VLM slots)."""
+        return max(0, par - (1 if self._inline_running else 0))
+
     # ── execute one ───────────────────────────────────────────────────────
 
     def run_once(self) -> bool:
@@ -1379,7 +1394,15 @@ class ClaimWorker:
             return False
         if self._is_ingest:
             return self._run_ingest(job)
-        return self._run_node(job)
+        # The inline lane holds the warm-model (diffusion) slot for this job's
+        # duration. Flag it so the gpu VLM-pool feeder budgets PAR - 1 while the
+        # diffusion runs — capping the machine's TOTAL node-jobs at PAR (the
+        # diffusion takes one of the PAR slots). Harmless for cpu (no feeder).
+        self._inline_running = True
+        try:
+            return self._run_node(job)
+        finally:
+            self._inline_running = False
 
     @staticmethod
     def _node_reports_progress(module_name: str) -> bool:
@@ -1704,10 +1727,13 @@ class ClaimWorker:
                         if defer:
                             break
                         with self._pool_lock:
-                            if self._pool_inflight >= par:
+                            # Budget = PAR minus the inline diffusion slot when
+                            # busy, so the machine's TOTAL node-jobs (inline + pool)
+                            # stays ≤ PAR (the diffusion takes one of the PAR slots).
+                            if self._pool_inflight >= self._pool_budget(par):
                                 break
                             # Reserve the slot BEFORE the claim/submit so a
-                            # concurrent decrement can't let us exceed PAR.
+                            # concurrent decrement can't let us exceed the budget.
                             self._pool_inflight += 1
                         try:
                             job = self._claim_pool()

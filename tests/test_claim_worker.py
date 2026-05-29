@@ -1874,6 +1874,23 @@ def test_pool_parallelism_reads_llm_config_and_clamps(monkeypatch):
     assert w._pool_parallelism() == 1
 
 
+def test_pool_budget_reserves_one_slot_for_inline_diffusion():
+    """A GPU machine's capacity is PAR TOTAL node-jobs. The VLM pool's per-cycle
+    budget is the full PAR while the inline diffusion lane is idle, and PAR - 1
+    while a diffusion runs inline — so total (1 inline diffusion + pool VLM) never
+    exceeds PAR. PAR=1 + a diffusion ⇒ 0 VLM slots (the one slot IS the diffusion).
+    Clamped ≥ 0."""
+    w = claim_worker.ClaimWorker(queue="gpu", host="host-budget", model_cache=_PoolCache())
+
+    w._inline_running = False
+    assert w._pool_budget(4) == 4
+    assert w._pool_budget(1) == 1
+
+    w._inline_running = True
+    assert w._pool_budget(4) == 3   # diffusion takes one of the 4 → 1 + 3 = 4 total
+    assert w._pool_budget(1) == 0   # the single slot IS the diffusion → 0 VLM
+
+
 def test_run_pool_node_executes_no_model_job_and_does_not_touch_cache():
     """``_run_pool_node`` runs a no-model GPU job to completion WITHOUT touching
     the model cache (no mark_busy/idle, no require_model) — a VLM job loads no

@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **GPU node-job capacity capped at PAR total (was 1+PAR)** — a GPU machine runs
+  1 inline diffusion (concurrency-1) + a PAR-sized VLM pool; the pool feeder now
+  budgets `PAR - 1` while the inline diffusion runs (`_pool_budget` +
+  an `_inline_running` flag set around the inline `run_once`), so the diffusion
+  occupies one of the PAR slots and the machine's TOTAL concurrent node-jobs
+  never exceeds PAR. Idle inline ⇒ the full PAR pool. Best-effort (a transient
+  race may briefly allow 1+PAR until a pool job drains). Consumer-safe: a worker
+  with no inline diffusion keeps the full PAR (flag stays False) — byte-identical
+  to before. Makes a consumer's `used/PAR node-jobs` gauge honest (used ≤ PAR).
 - **FILL-BEFORE-SPILL packing for the no-model GPU (VLM) pool lane** — VLM jobs now
   bin-pack onto the highest-ranked vLLM machine before spilling, instead of every
   vLLM box claiming independently (which SPREAD VLM work across the fleet). New
