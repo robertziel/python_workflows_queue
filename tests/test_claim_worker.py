@@ -18,6 +18,7 @@ Pins the pieces directly, without a live LISTEN loop:
 from __future__ import annotations
 
 import sys
+import threading
 import time
 import types
 
@@ -864,7 +865,11 @@ def test_run_node_threads_a_callable_status_callback_to_gpu_node():
     """End-to-end wiring: a gpu node that declares ``status_callback`` receives
     a CALLABLE (the StallWatchdog beat), not ``None`` — so each reported step
     pushes the no-progress deadline out. (Pre-fix the executor hard-wired
-    ``status_callback=None``, so no node could ever beat.)"""
+    ``status_callback=None``, so no node could ever beat.)
+
+    Uses a MODEL-BACKED job: the inline lane (``run_once`` → ``_claim`` with
+    ``require_model=True``) is the warm-model diffusion lane; no-model GPU jobs
+    now go to the pool lane instead."""
     run_id = _make_run()
     seen: dict = {}
 
@@ -877,10 +882,11 @@ def test_run_node_threads_a_callable_status_callback_to_gpu_node():
     _install_fake_node("_cw_gpu_progress", run)
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="g", node_module="_cw_gpu_progress", queue="gpu",
+        required_model="sdxl",
     )
 
     class _Cache:
-        current_model = None
+        current_model = "sdxl"
 
         def require_model(self, model_id):
             return object()
@@ -980,15 +986,17 @@ def test_gpu_job_gets_health_watchdog_and_no_wallclock_watchdog(monkeypatch):
     _install_fake_node("_cw_gpu_guard", run)
 
     class _Cache:
-        current_model = None
+        current_model = "sdxl"
         def require_model(self, model_id): return object()
         def mark_busy(self): ...
         def mark_idle(self): ...
 
-    # GPU job → health watchdog, no wall-clock watchdog.
+    # Model-backed GPU job → health watchdog, no wall-clock watchdog. (The
+    # inline lane is the warm-model diffusion lane — require_model=True.)
     run_id = _make_run()
     node_queue.enqueue_node_job(
         run_id=run_id, node_id="g", node_module="_cw_gpu_guard", queue="gpu",
+        required_model="sdxl",
     )
     assert claim_worker.ClaimWorker(
         queue="gpu", host="host-a", model_cache=_Cache(),
@@ -1007,14 +1015,19 @@ def test_gpu_job_gets_health_watchdog_and_no_wallclock_watchdog(monkeypatch):
     assert "health" not in constructed, "CPU job must NOT get a health watchdog"
 
 
-def test_gpu_node_with_no_model_and_no_progress_still_gets_started_health_watchdog(monkeypatch):
-    """GAP #2 regression: a GPU node with NEITHER ``required_model`` NOR a
-    ``status_callback`` param (e.g. sv_detect / scene_build) never beats — so
-    under the old inert-until-beat arming the health watchdog was never armed
-    and the node had NO time bound at all (the wall-clock cap was removed). The
-    fix arms the watchdog AT start, so it must still be CONSTRUCTED and STARTED
-    for such a node — that's what makes it bounded. No StallWatchdog (the node
-    doesn't report progress), no wall-clock Watchdog (GPU)."""
+def test_gpu_model_backed_no_progress_node_still_gets_started_health_watchdog(monkeypatch):
+    """GAP #2 regression (diffusion lane): a MODEL-BACKED GPU node with no
+    ``status_callback`` param never beats — under the old inert-until-beat arming
+    the health watchdog was never armed and the node had NO time bound (the
+    wall-clock cap was removed). The fix arms it AT start, so it must still be
+    CONSTRUCTED and STARTED. No StallWatchdog (the node doesn't report progress),
+    no wall-clock Watchdog (GPU).
+
+    Now scoped to the INLINE (warm-model diffusion) lane — that's the lane the
+    GpuHealthWatchdog guards. (A NO-model GPU node is handled by the pool lane,
+    which deliberately does NOT arm the health watchdog — see the pool-lane
+    tests; its bound is the lease + JobStatusWatcher + reclaim, not GPU health,
+    because a VLM job is HTTP-bound.)"""
     started: list[str] = []
     real_health = claim_worker.GpuHealthWatchdog
 
@@ -1035,7 +1048,44 @@ def test_gpu_node_with_no_model_and_no_progress_still_gets_started_health_watchd
     def run(*, out=None, model_handle=None, cancel_event=None):
         return {"context_delta": {"ok": True}}
 
-    _install_fake_node("_cw_no_model_no_progress", run)
+    _install_fake_node("_cw_model_no_progress", run)
+
+    class _Cache:
+        current_model = "sdxl"
+        def require_model(self, model_id): return object()
+        def mark_busy(self): ...
+        def mark_idle(self): ...
+
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="_cw_model_no_progress",
+        queue="gpu", required_model="sdxl",
+    )
+    assert claim_worker.ClaimWorker(
+        queue="gpu", host="host-a", model_cache=_Cache(),
+    ).run_once() is True
+    assert started == ["health"], (
+        "a model-backed/no-progress GPU node must still get a STARTED health "
+        "watchdog (armed at start) so it is bounded"
+    )
+    assert node_queue.get_node_job(job_id)["status"] == "completed"
+
+
+def test_inline_lane_does_not_claim_no_model_gpu_job():
+    """The two-lane split: the inline lane (``run_once`` → ``_claim`` with
+    ``require_model=True``) does NOT claim a no-model GPU job — that row belongs
+    to the pool lane. ``run_once`` returns False (nothing claimable by this lane)
+    and the row stays ``queued`` for the pool feeder to take."""
+    run_id = _make_run()
+
+    def run(*, out=None, cancel_event=None):
+        return {"context_delta": {"ok": True}}
+
+    _install_fake_node("_cw_inline_skip_nomodel", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="g", node_module="_cw_inline_skip_nomodel",
+        queue="gpu",  # no required_model ⇒ pool lane's, not inline's
+    )
 
     class _Cache:
         current_model = None
@@ -1043,19 +1093,9 @@ def test_gpu_node_with_no_model_and_no_progress_still_gets_started_health_watchd
         def mark_busy(self): ...
         def mark_idle(self): ...
 
-    run_id = _make_run()
-    job_id = node_queue.enqueue_node_job(
-        run_id=run_id, node_id="g", node_module="_cw_no_model_no_progress",
-        queue="gpu",  # NOTE: no required_model
-    )
-    assert claim_worker.ClaimWorker(
-        queue="gpu", host="host-a", model_cache=_Cache(),
-    ).run_once() is True
-    assert started == ["health"], (
-        "a no-model/no-progress GPU node must still get a STARTED health watchdog "
-        "(armed at start) so it is bounded"
-    )
-    assert node_queue.get_node_job(job_id)["status"] == "completed"
+    worker = claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=_Cache())
+    assert worker.run_once() is False, "inline lane must not claim a no-model GPU job"
+    assert node_queue.get_node_job(job_id)["status"] == "queued"
 
 
 def test_run_once_skips_job_under_cancelled_run():
@@ -1739,3 +1779,372 @@ def test_claim_worker_wires_heartbeat_emitter():
 
     cpu = claim_worker.ClaimWorker(queue="cpu", host="host-c")
     assert cpu.heartbeat._current_model() is None
+
+
+# ── GPU VLM pool lane (PAR-sized no-model concurrency) ──────────────────────
+#
+# The GPU claim worker runs TWO lanes: the existing concurrency-1 INLINE lane
+# (warm-model diffusion, require_model=True) and a NEW PAR-sized POOL lane for
+# no-model VLM jobs (require_model=False — HTTP to a per-host vLLM server that
+# batches PAR requests on the GPU). These tests pin the pool lane + the
+# disjoint-claim contract WITHOUT spinning the live run_forever LISTEN loop.
+
+
+class _PoolCache:
+    """A GPU model cache spy: records every mark_busy/mark_idle/require_model so a
+    test can assert the POOL lane never touches it (a VLM job loads no warm
+    model)."""
+
+    def __init__(self, current_model=None):
+        self.current_model = current_model
+        self.busy_calls = 0
+        self.idle_calls = 0
+        self.require_calls: list[str] = []
+
+    def require_model(self, model_id):
+        self.require_calls.append(model_id)
+        return object()
+
+    def mark_busy(self):
+        self.busy_calls += 1
+
+    def mark_idle(self):
+        self.idle_calls += 1
+
+
+def test_inline_claim_passes_require_model_true(monkeypatch):
+    """The inline lane's ``_claim`` (gpu) narrows to model-backed jobs
+    (require_model=True) so it never grabs a no-model VLM row — the disjoint-lane
+    contract. (CPU still claims via claim_next_cpu_job; ingest via ingest.)"""
+    seen = {}
+
+    def spy(worker_lane, current_model=None, **kw):
+        seen.update(kw)
+        seen["current_model"] = current_model
+        return None
+
+    monkeypatch.setattr(node_queue, "claim_next_gpu_job", spy)
+    w = claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=_PoolCache())
+    assert w._claim() is None
+    assert seen["require_model"] is True
+
+
+def test_pool_claim_passes_require_model_false(monkeypatch):
+    """The pool lane's ``_claim_pool`` narrows to no-model jobs
+    (require_model=False, current_model=None) — the VLM lane."""
+    seen = {}
+
+    def spy(worker_lane, current_model=None, **kw):
+        seen.update(kw)
+        seen["current_model"] = current_model
+        return None
+
+    monkeypatch.setattr(node_queue, "claim_next_gpu_job", spy)
+    w = claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=_PoolCache())
+    assert w._claim_pool() is None
+    assert seen["require_model"] is False
+    assert seen["current_model"] is None
+
+
+def test_pool_parallelism_reads_llm_config_and_clamps(monkeypatch):
+    """PAR for the pool = llm_config_for(host, 'gpu').parallelism, clamped >= 1.
+    Read live so a UI change takes effect without a restart."""
+    from queue_workflows import worker_control
+
+    w = claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=_PoolCache())
+
+    monkeypatch.setattr(
+        worker_control, "llm_config_for",
+        lambda h, q: worker_control.LLMConfig(parallelism=8),
+    )
+    assert w._pool_parallelism() == 8
+
+    # Clamp: a bogus sub-1 value floors at 1 (never a zero-width pool).
+    monkeypatch.setattr(
+        worker_control, "llm_config_for",
+        lambda h, q: worker_control.LLMConfig(parallelism=0),
+    )
+    assert w._pool_parallelism() == 1
+
+    # A read failure also floors at 1 (never crash the feeder / heartbeat).
+    def boom(h, q):
+        raise RuntimeError("db blip")
+
+    monkeypatch.setattr(worker_control, "llm_config_for", boom)
+    assert w._pool_parallelism() == 1
+
+
+def test_run_pool_node_executes_no_model_job_and_does_not_touch_cache():
+    """``_run_pool_node`` runs a no-model GPU job to completion WITHOUT touching
+    the model cache (no mark_busy/idle, no require_model) — a VLM job loads no
+    warm model in-worker."""
+    run_id = _make_run()
+    ran = {}
+
+    def run(*, out=None, inputs=None, cancel_event=None):
+        ran["did"] = True
+        return {"context_delta": {"ok": True}}
+
+    _install_fake_node("_cw_pool_vlm", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="v", node_module="_cw_pool_vlm", queue="gpu",
+    )
+    job = node_queue.claim_next_gpu_job(0, None, host="host-a", require_model=False)
+    assert job is not None and job["id"] == job_id
+
+    cache = _PoolCache()
+    w = claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=cache)
+    assert w._run_pool_node(job) is True
+    assert ran.get("did") is True
+    assert node_queue.get_node_job(job_id)["status"] == "completed"
+    # The pool lane NEVER touches the warm-model cache.
+    assert cache.busy_calls == 0
+    assert cache.idle_calls == 0
+    assert cache.require_calls == []
+
+
+def test_run_pool_node_does_not_arm_gpu_or_stall_watchdogs(monkeypatch):
+    """``_run_pool_node`` must NOT construct a GpuHealthWatchdog or StallWatchdog
+    (those police an in-worker diffusion hang; a VLM job's GPU work is in the
+    server, HTTP-bound here). It DOES renew the lease (LeaseRenewer constructed)."""
+    constructed: list[str] = []
+    for cls in ("GpuHealthWatchdog", "StallWatchdog", "Watchdog", "LeaseRenewer"):
+        real = getattr(claim_worker, cls)
+
+        def make_spy(name, real_cls):
+            def spy(**kw):
+                constructed.append(name)
+                return real_cls(**kw)
+            return spy
+
+        monkeypatch.setattr(claim_worker, cls, make_spy(cls, real))
+
+    run_id = _make_run()
+
+    def run(*, out=None, inputs=None, cancel_event=None):
+        return {"context_delta": {"ok": True}}
+
+    _install_fake_node("_cw_pool_noguard", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="v", node_module="_cw_pool_noguard", queue="gpu",
+    )
+    job = node_queue.claim_next_gpu_job(0, None, host="host-a", require_model=False)
+
+    w = claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=_PoolCache())
+    assert w._run_pool_node(job) is True
+    assert "GpuHealthWatchdog" not in constructed, "pool lane must NOT arm the GPU health watchdog"
+    assert "StallWatchdog" not in constructed, "pool lane must NOT arm the stall watchdog"
+    assert "Watchdog" not in constructed, "pool lane must NOT arm a wall-clock watchdog"
+    assert "LeaseRenewer" in constructed, "pool lane MUST renew the lease"
+    assert node_queue.get_node_job(job_id)["status"] == "completed"
+
+
+def test_run_pool_node_renews_lease_while_running():
+    """The pool lane keeps its lease fresh: a long-running no-model job has its
+    ``lease_expires_at`` pushed out by the per-job LeaseRenewer (a fast-interval
+    renewer so the test doesn't wait the production 10s)."""
+    run_id = _make_run()
+    started = threading.Event()
+    release = threading.Event()
+
+    def run(*, out=None, inputs=None, cancel_event=None):
+        started.set()
+        release.wait(timeout=5.0)
+        return {"context_delta": {}}
+
+    _install_fake_node("_cw_pool_lease", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="v", node_module="_cw_pool_lease", queue="gpu",
+    )
+    job = node_queue.claim_next_gpu_job(0, None, host="host-a", require_model=False)
+    before = _lease_expiry(job_id)
+
+    w = claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=_PoolCache())
+    real_renewer = claim_worker.LeaseRenewer
+
+    def fast_renewer(**kw):
+        kw["interval_s"] = 0.05
+        return real_renewer(**kw)
+
+    claim_worker.LeaseRenewer = fast_renewer
+    try:
+        t = threading.Thread(target=lambda: w._run_pool_node(job), daemon=True)
+        t.start()
+        assert started.wait(timeout=5.0)
+        deadline = time.time() + 3.0
+        after = before
+        while time.time() < deadline:
+            time.sleep(0.05)
+            after = _lease_expiry(job_id)
+            if after > before:
+                break
+        release.set()
+        t.join(timeout=5.0)
+    finally:
+        claim_worker.LeaseRenewer = real_renewer
+        release.set()
+    assert after > before, "pool lane must renew the lease while the job runs"
+    assert node_queue.get_node_job(job_id)["status"] == "completed"
+
+
+def test_run_pool_node_parks_input_node_via_outbox():
+    """An ``__input__`` sentinel in the pool lane parks via the durable outbox
+    (mark awaiting_input + dispatch event), exactly like the inline lane — never
+    handed to execute_node (which would ModuleNotFoundError)."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="i", node_module="__input__choose_one", queue="gpu",
+    )
+    job = node_queue.claim_next_gpu_job(0, None, host="host-a", require_model=False)
+    assert job is not None
+
+    w = claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=_PoolCache())
+    assert w._run_pool_node(job) is True
+    assert node_queue.get_node_job(job_id)["status"] == "awaiting_input"
+
+
+def test_pool_feeder_runs_up_to_par_concurrently_never_over(monkeypatch):
+    """The feeder keeps up to PAR no-model jobs IN FLIGHT at once — and NEVER
+    more than PAR submitted. A fake node blocks on an event; we assert exactly
+    PAR are running concurrently while (PAR + extra) jobs are queued, then
+    release them and confirm all complete."""
+    from queue_workflows import worker_control
+
+    PAR = 3
+    EXTRA = 2
+    monkeypatch.setattr(
+        worker_control, "llm_config_for",
+        lambda h, q: worker_control.LLMConfig(parallelism=PAR),
+    )
+
+    inflight = {"n": 0, "max": 0}
+    inflight_lock = threading.Lock()
+    release = threading.Event()
+
+    def run(*, out=None, inputs=None, cancel_event=None):
+        with inflight_lock:
+            inflight["n"] += 1
+            inflight["max"] = max(inflight["max"], inflight["n"])
+        release.wait(timeout=10.0)
+        with inflight_lock:
+            inflight["n"] -= 1
+        return {"context_delta": {}}
+
+    _install_fake_node("_cw_pool_block", run)
+    run_id = _make_run()
+    ids = [
+        node_queue.enqueue_node_job(
+            run_id=run_id, node_id=f"v{i}", node_module="_cw_pool_block",
+            queue="gpu",
+        )
+        for i in range(PAR + EXTRA)
+    ]
+
+    w = claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=_PoolCache())
+    w._start_pool_lane()
+    try:
+        # Wait until PAR jobs are concurrently in flight.
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            with inflight_lock:
+                if inflight["n"] >= PAR:
+                    break
+            time.sleep(0.02)
+        with inflight_lock:
+            assert inflight["n"] == PAR, f"expected {PAR} concurrent, saw {inflight['n']}"
+        # The worker's accounting must never exceed PAR submitted.
+        assert w._pool_inflight <= PAR
+        # The EXTRA jobs are still queued (not over-claimed).
+        queued = [i for i in ids if node_queue.get_node_job(i)["status"] == "queued"]
+        assert len(queued) == EXTRA, "feeder over-claimed past PAR"
+        release.set()
+        # All jobs eventually complete as slots free up.
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            done = [i for i in ids if node_queue.get_node_job(i)["status"] == "completed"]
+            if len(done) == len(ids):
+                break
+            time.sleep(0.05)
+    finally:
+        release.set()
+        w.stop()
+        w._stop_pool_lane()
+    assert inflight["max"] == PAR, f"max concurrency was {inflight['max']}, expected {PAR}"
+    done = [i for i in ids if node_queue.get_node_job(i)["status"] == "completed"]
+    assert len(done) == len(ids)
+
+
+def test_pool_feeder_does_not_claim_model_backed_jobs(monkeypatch):
+    """Lane isolation: the pool feeder claims ONLY no-model jobs. A model-backed
+    (diffusion) job queued alongside is left untouched for the inline lane."""
+    from queue_workflows import worker_control
+    monkeypatch.setattr(
+        worker_control, "llm_config_for",
+        lambda h, q: worker_control.LLMConfig(parallelism=2),
+    )
+
+    run_id = _make_run()
+    release = threading.Event()
+
+    def run(*, out=None, inputs=None, cancel_event=None):
+        release.wait(timeout=5.0)
+        return {"context_delta": {}}
+
+    _install_fake_node("_cw_pool_only", run)
+    vlm_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="vlm", node_module="_cw_pool_only", queue="gpu",
+    )
+    diffusion_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="diff", node_module="_cw_pool_only", queue="gpu",
+        required_model="sdxl",
+    )
+
+    w = claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=_PoolCache())
+    w._start_pool_lane()
+    try:
+        deadline = time.time() + 6.0
+        while time.time() < deadline:
+            if node_queue.get_node_job(vlm_id)["status"] in ("running", "completed"):
+                break
+            time.sleep(0.02)
+        # VLM job claimed by the pool; the diffusion job is NOT (stays queued —
+        # only the inline lane, which we did not start, would take it).
+        assert node_queue.get_node_job(vlm_id)["status"] in ("running", "completed")
+        assert node_queue.get_node_job(diffusion_id)["status"] == "queued", (
+            "pool feeder must NOT claim a model-backed diffusion job"
+        )
+        release.set()
+    finally:
+        release.set()
+        w.stop()
+        w._stop_pool_lane()
+
+
+# ── heartbeat advertises 1 + PAR for GPU ────────────────────────────────────
+
+
+def test_gpu_heartbeat_concurrency_is_one_plus_par(_heartbeat_enabled, monkeypatch):
+    """The GPU heartbeat advertises ``concurrency = 1 + PAR`` (inline diffusion
+    slot + the VLM pool) so Rails' used/total gauge reflects real capacity.
+    Read live from llm_config_for."""
+    from queue_workflows import worker_control
+    monkeypatch.setattr(
+        worker_control, "llm_config_for",
+        lambda h, q: worker_control.LLMConfig(parallelism=16),
+    )
+
+    w = claim_worker.ClaimWorker(queue="gpu", host="host-hb", model_cache=_PoolCache())
+    w.heartbeat.emit_once()
+    row = _heartbeat_row("host-hb", "gpu")
+    assert row is not None
+    assert row["concurrency"] == 1 + 16
+
+
+def test_cpu_heartbeat_concurrency_stays_one(_heartbeat_enabled):
+    """CPU (and ingest) heartbeats keep the historical constant concurrency=1 —
+    the 1 + PAR capacity is GPU-only."""
+    w = claim_worker.ClaimWorker(queue="cpu", host="host-hb2")
+    w.heartbeat.emit_once()
+    row = _heartbeat_row("host-hb2", "cpu")
+    assert row is not None
+    assert row["concurrency"] == 1

@@ -58,6 +58,7 @@ import os
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 from queue_workflows import node_executor, node_queue, worker_control
@@ -1125,7 +1126,13 @@ class HeartbeatEmitter:
 
     Claim-worker shape:
 
-      * ``concurrency`` is **1** — a claim worker is one poll-claim loop.
+      * ``concurrency`` is **1** for cpu/ingest — a claim worker is one
+        poll-claim loop. For **GPU** it is ``1 + PAR``: the single inline
+        warm-model diffusion slot PLUS the PAR-sized no-model VLM pool lane, so
+        Rails' used/total gauge reflects the worker's real concurrent capacity
+        (one diffusion job + up to PAR concurrent VLM requests). A ``concurrency_fn``
+        seam supplies this live value (read each tick) so a UI parallelism change
+        is reflected without a restart; ``None`` keeps the historical constant 1.
       * the **GPU** heartbeat reports ``current_model`` read from the worker's
         :class:`ModelCache` on every tick — the gauge's busy signal. The
         **CPU** heartbeat reports ``current_model=None``.
@@ -1140,11 +1147,15 @@ class HeartbeatEmitter:
     def __init__(
         self, *, queue: str, host_label: str, model_cache: Any = None,
         interval_s: float = HEARTBEAT_INTERVAL_S,
+        concurrency_fn: Callable[[], int] | None = None,
     ) -> None:
         self._queue = queue
         self._host_label = host_label
         self._model_cache = model_cache
         self._interval_s = float(interval_s)
+        # Live concurrency provider (GPU: 1 + PAR). None ⇒ the historical
+        # constant 1 (cpu/ingest, and any caller that doesn't supply one).
+        self._concurrency_fn = concurrency_fn
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -1163,8 +1174,25 @@ class HeartbeatEmitter:
             return None
         return getattr(self._model_cache, "current_model", None)
 
+    def _concurrency(self) -> int:
+        """The advertised capacity for this tick. ``concurrency_fn`` (GPU:
+        ``1 + PAR``) when supplied, else the historical constant 1. A read
+        failure falls back to 1 so a transient DB blip never zeroes the gauge
+        nor crashes the heartbeat."""
+        if self._concurrency_fn is None:
+            return 1
+        try:
+            return max(1, int(self._concurrency_fn()))
+        except Exception:
+            log.exception(
+                "[claim-worker:%s] concurrency_fn read failed; advertising 1",
+                self._queue,
+            )
+            return 1
+
     def emit_once(self) -> None:
-        """Upsert this worker's row once (concurrency=1; GPU carries its live
+        """Upsert this worker's row once (concurrency = 1 for cpu/ingest, or
+        ``1 + PAR`` for GPU via ``concurrency_fn``; GPU carries its live
         ``current_model``). Failures are swallowed + logged — a transient DB
         blip must never crash a worker mid-job."""
         try:
@@ -1172,7 +1200,7 @@ class HeartbeatEmitter:
             node_queue.upsert_worker_heartbeat(
                 host_label=self._host_label,
                 queue=self._queue,
-                concurrency=1,
+                concurrency=self._concurrency(),
                 current_model=self._current_model(),
                 known_models=model_registry.known_ids(),
                 llm_servers_available=get_config().llm_servers_available,
@@ -1244,10 +1272,24 @@ class ClaimWorker:
             model_cache = gpu_model_cache()
         self.model_cache = model_cache
         self._stop = threading.Event()
-        # Worker capacity heartbeat — a no-op for fetch/load.
+        # GPU two-lane pool (NEW, additive): a PAR-sized ThreadPoolExecutor +
+        # feeder thread for no-model VLM jobs, started in run_forever (gpu only).
+        # None for cpu/ingest and until run_forever arms it.
+        self._pool: ThreadPoolExecutor | None = None
+        self._pool_max = 0
+        self._pool_feeder: threading.Thread | None = None
+        self._pool_inflight = 0
+        self._pool_lock = threading.Lock()
+        # Worker capacity heartbeat — a no-op for fetch/load. GPU advertises
+        # 1 (inline diffusion slot) + PAR (the VLM pool) so the used/total gauge
+        # reflects real capacity; cpu/ingest keep the constant 1.
         self.heartbeat = HeartbeatEmitter(
             queue=self.queue, host_label=self.host,
             model_cache=self.model_cache,
+            concurrency_fn=(
+                (lambda: 1 + self._pool_parallelism())
+                if self.queue == "gpu" else None
+            ),
         )
         # This host's hw-metrics sampler — started in ``run_forever`` ONLY when
         # ``queue == 'gpu'`` (one gpu container per host ⇒ one sampler per host).
@@ -1265,6 +1307,14 @@ class ClaimWorker:
     # ── claim ────────────────────────────────────────────────────────────
 
     def _claim(self) -> dict | None:
+        """Claim the next job for the INLINE lane.
+
+        GPU: the inline lane runs warm-model diffusion ONLY — it claims with
+        ``require_model=True`` so it never grabs a no-model VLM job (those are
+        the pool lane's, claimed via :meth:`_claim_pool`). This keeps the two
+        lanes' claim sets disjoint (no stealing, no over-claim). On a host with
+        the VLM pool disabled (PAR clamps to >= 1, but no no-model jobs exist)
+        this is a pure narrowing — diffusion behaviour is byte-identical."""
         if self._is_ingest:
             return node_queue.claim_next_ingest_job(
                 self.queue, host=self.host, lease_s=self.lease_s,
@@ -1277,11 +1327,44 @@ class ClaimWorker:
                 host=self.host, lease_s=self.lease_s,
                 host_priority=self.host_priority,
                 known_models=model_registry.known_ids(),
+                require_model=True,
             )
         return node_queue.claim_next_cpu_job(
             0, host=self.host, lease_s=self.lease_s,
             host_priority=self.host_priority,
         )
+
+    def _claim_pool(self) -> dict | None:
+        """Claim the next job for the POOL lane (gpu only): no-model GPU jobs
+        (``require_model=False``) — VLM facade work that POSTs to a per-host
+        vLLM server which batches up to PAR requests on the GPU. These load NO
+        warm model in-worker, so they run in a PAR-sized concurrent pool instead
+        of the concurrency-1 inline lane. Disjoint from :meth:`_claim`'s
+        ``require_model=True`` set so the lanes never steal each other's rows."""
+        from queue_workflows import model_registry
+        return node_queue.claim_next_gpu_job(
+            0, None,
+            host=self.host, lease_s=self.lease_s,
+            host_priority=self.host_priority,
+            known_models=model_registry.known_ids(),
+            require_model=False,
+        )
+
+    def _pool_parallelism(self) -> int:
+        """PAR for the VLM pool lane: the per-``(host, gpu)`` LLM ``parallelism``
+        (vLLM ``--max-num-seqs`` / ollama ``OLLAMA_NUM_PARALLEL``), clamped to
+        ``>= 1``. Read live (cheap DB read, default-safe on a pre-0013 schema)
+        so an operator's UI change to parallelism takes effect without a
+        restart — the feeder re-reads it each cycle to gate submissions."""
+        try:
+            par = worker_control.llm_config_for(self.host, "gpu").parallelism
+        except Exception:
+            log.exception(
+                "[claim-worker:gpu] llm_config_for parallelism read failed; "
+                "defaulting pool PAR to 1",
+            )
+            return 1
+        return max(1, int(par or 1))
 
     # ── execute one ───────────────────────────────────────────────────────
 
@@ -1450,6 +1533,225 @@ class ClaimWorker:
             cancel_event.set()
             cancel_thread.join(timeout=2.0)
         return True
+
+    def _run_pool_node(self, job: dict) -> bool:
+        """Execute a no-model GPU job (VLM — HTTP to a per-host vLLM server) in
+        the PAR-sized pool lane. A DELIBERATELY lighter sibling of
+        :meth:`_run_node` — it reuses the same helpers but OMITS the in-worker
+        diffusion guards, because a VLM job loads no warm model and does its GPU
+        work inside the vLLM server (HTTP-bound here):
+
+          * NO ``model_cache.mark_busy/idle`` — there is no warm-model slot to
+            protect from the idle reaper; these jobs carry ``required_model=None``.
+          * NO :class:`GpuHealthWatchdog` / :class:`StallWatchdog` — those police
+            an in-worker diffusion hang (idle GPU + static RAM) and a 0%-GPU
+            denoise stall; neither maps to an HTTP-bound VLM request, and the
+            pool runs PAR jobs at once so a shared single-job GPU-health verdict
+            would be meaningless. The lease + abandon-watcher already bound a
+            wedged request via reclaim.
+
+        KEPT (the per-job correctness machinery, identical to the inline lane):
+        the ``__input__`` park-and-return outbox early-return, the run-cancel
+        watcher, a per-job :class:`LeaseRenewer`, and a :class:`JobStatusWatcher`
+        so a reclaimed/reassigned row hard-exits instead of double-running. Runs
+        the node through the SAME ``node_executor.execute_node`` path (no
+        model_cache → the executor invokes the node directly). Returns ``True``
+        once the row reached a terminal state.
+
+        Runs on a pool worker thread; never touches the inline lane's
+        ``self.model_cache``. ``os._exit`` from the JobStatusWatcher still kills
+        the whole process (the safe abandon path) — acceptable: the inline
+        diffusion job, if any, is re-queued by lease reclaim exactly as a
+        watchdog hard-exit would do."""
+        job_id = job["id"]
+        log.info(
+            "[claim-worker:gpu:pool] claimed %s (node=%s model=%s)",
+            job_id, job.get("node_id"), job.get("required_model"),
+        )
+        _emit_node_event(
+            job_id, "claimed", host_label=self.host, queue=self.queue, row=job,
+        )
+
+        # Input/await nodes: mark awaiting_input + enqueue the dispatch event in
+        # one txn (the durable outbox), exactly as the inline lane — never hand a
+        # ``__input__`` sentinel to execute_node. (A VLM lane shouldn't normally
+        # see one, but the guard keeps the two lanes' contract identical.)
+        if (job.get("node_module") or "").startswith("__input__"):
+            with connection() as conn, conn.cursor() as cur:
+                node_queue.mark_awaiting_input_in_txn(cur, job_id)
+                node_queue.enqueue_dispatch_event_in_txn(
+                    cur, job["run_id"], job["node_id"], "awaiting_input",
+                )
+            return True
+
+        from queue_workflows.cancel_watcher import _start_run_cancel_watcher
+        cancel_event = threading.Event()
+        cancel_thread = _start_run_cancel_watcher(
+            job["run_id"], cancel_event, interval_s=5.0,
+        )
+        renewer = LeaseRenewer(
+            job_id=job_id, claimed_by=self.host, lease_s=self.lease_s,
+        )
+        status_watcher = JobStatusWatcher(job_id=job_id, claimed_by=self.host)
+        renewer.start()
+        status_watcher.start()
+        try:
+            # No model_cache (no warm model) and no status_callback (no GPU
+            # watchdog to beat) — the executor invokes the node directly.
+            node_executor.execute_node(
+                job, model_cache=None, cancel_event=cancel_event,
+                status_callback=None,
+            )
+        finally:
+            status_watcher.stop()
+            renewer.stop()
+            cancel_event.set()
+            cancel_thread.join(timeout=2.0)
+        return True
+
+    # ── GPU VLM pool lane (feeder + executor pool) ──────────────────────────
+
+    def _pool_run_and_release(self, job: dict) -> None:
+        """Pool-worker entry: run one no-model GPU job then release its in-flight
+        slot. Always decrements the in-flight counter (even on a node exception
+        — :meth:`_run_pool_node` already finalises the row through the executor's
+        outbox; a stray error here must NOT leak a permanent slot or the feeder
+        would stop claiming)."""
+        try:
+            self._run_pool_node(job)
+        except Exception:
+            log.exception(
+                "[claim-worker:gpu:pool] %s raised in pool execution",
+                job.get("id"),
+            )
+        finally:
+            with self._pool_lock:
+                self._pool_inflight -= 1
+
+    def _ensure_pool(self, par: int) -> ThreadPoolExecutor:
+        """Return the pool executor sized for ``par``, recreating it if PAR grew
+        since last cycle (an operator raised ``--max-num-seqs`` in the UI). A
+        shrink keeps the larger pool but the feeder GATES submissions on the
+        current PAR, so excess threads simply sit idle — cheaper than tearing a
+        live pool down mid-flight. Caller is the single feeder thread, so no lock
+        is needed around the executor handle itself."""
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(
+                max_workers=par, thread_name_prefix="gpu-vlm-pool",
+            )
+            self._pool_max = par
+        elif par > self._pool_max:
+            # Grow: drain-free swap — the old pool's in-flight jobs keep running
+            # on their threads; new submissions go to the larger pool.
+            old = self._pool
+            self._pool = ThreadPoolExecutor(
+                max_workers=par, thread_name_prefix="gpu-vlm-pool",
+            )
+            self._pool_max = par
+            old.shutdown(wait=False)
+        return self._pool
+
+    def _pool_feeder_loop(self) -> None:
+        """The NEW pool lane's feeder (gpu only): keep up to PAR no-model VLM
+        jobs in flight, claiming them via :meth:`_claim_pool` and running each on
+        the :class:`ThreadPoolExecutor`. Mirrors the inline loop's
+        LISTEN(``node_job_ready``)+safety-poll shape on its OWN autocommit
+        connection (never shares the inline loop's), so the two lanes wake
+        independently.
+
+        Per cycle:
+
+          1. re-read PAR live (cheap, default-safe) so a UI change takes effect;
+          2. while in-flight < PAR, claim a no-model job and ``submit`` it
+             (in-flight bumped BEFORE submit so a fast-returning claim can't race
+             past PAR — the hard no-over-claim guarantee);
+          3. when the queue is drained (claim returns None) or PAR is full,
+             block on the wake NOTIFY with the safety-poll timeout, then re-loop.
+
+        Stops cleanly when ``self._stop`` is set (the run_forever finally also
+        shuts the pool down)."""
+        import psycopg
+
+        try:
+            with psycopg.connect(db_url(), autocommit=True) as listen_conn:
+                listen_conn.execute(f"LISTEN {self._wake_channel}")
+                while not self._stop.is_set():
+                    par = self._pool_parallelism()
+                    pool = self._ensure_pool(par)
+                    claimed_any = False
+                    while not self._stop.is_set():
+                        with self._pool_lock:
+                            if self._pool_inflight >= par:
+                                break
+                            # Reserve the slot BEFORE the claim/submit so a
+                            # concurrent decrement can't let us exceed PAR.
+                            self._pool_inflight += 1
+                        try:
+                            job = self._claim_pool()
+                        except Exception:
+                            log.exception(
+                                "[claim-worker:gpu:pool] claim failed"
+                            )
+                            job = None
+                        if job is None:
+                            # Nothing to run — release the reserved slot.
+                            with self._pool_lock:
+                                self._pool_inflight -= 1
+                            break
+                        claimed_any = True
+                        try:
+                            pool.submit(self._pool_run_and_release, job)
+                        except Exception:
+                            # Submit failed (pool shutting down) — release the
+                            # slot and finalise the row's fate to lease reclaim.
+                            log.exception(
+                                "[claim-worker:gpu:pool] submit failed for %s",
+                                job.get("id"),
+                            )
+                            with self._pool_lock:
+                                self._pool_inflight -= 1
+                            break
+                    if self._stop.is_set():
+                        break
+                    # Drained or PAR-full: block on the wake NOTIFY (short
+                    # safety-poll timeout) before the next cycle. A claim this
+                    # cycle ⇒ loop straight back to drain greedily.
+                    if not claimed_any:
+                        for _ in listen_conn.notifies(
+                            timeout=NOTIFY_POLL_TIMEOUT_S, stop_after=1,
+                        ):
+                            break
+        except Exception:
+            log.exception(
+                "[claim-worker:gpu:pool] feeder loop crashed (pool lane down; "
+                "inline diffusion lane unaffected)"
+            )
+
+    def _start_pool_lane(self) -> None:
+        """Arm the GPU VLM pool lane (gpu only): create the PAR-sized executor +
+        start the feeder thread. Idempotent-safe (only called once from
+        run_forever after the park gate)."""
+        if self.queue != "gpu":
+            return
+        self._ensure_pool(self._pool_parallelism())
+        self._pool_feeder = threading.Thread(
+            target=self._pool_feeder_loop, daemon=True,
+            name="gpu-vlm-feeder",
+        )
+        self._pool_feeder.start()
+
+    def _stop_pool_lane(self) -> None:
+        """Tear the GPU VLM pool lane down: join the feeder, shut the executor
+        down (cancel queued, let in-flight drain briefly). Safe to call when the
+        lane was never armed (cpu/ingest, or stopped while parked)."""
+        if self._pool_feeder is not None:
+            self._pool_feeder.join(timeout=2.0)
+            self._pool_feeder = None
+        if self._pool is not None:
+            # cancel_futures drops not-yet-started submissions; in-flight VLM
+            # requests finish on their own threads (they're HTTP-bound + short).
+            self._pool.shutdown(wait=False, cancel_futures=True)
+            self._pool = None
 
     def _run_ingest(self, job: dict) -> bool:
         """Execute a claimed ingest job (fetch/load) under a lease-renewer +
@@ -1621,6 +1923,12 @@ class ClaimWorker:
         # re-enters the park gate above). Honours AI_LEADS_DISABLE_WORKER_CONTROL.
         self._control_watcher = worker_control.WorkerControlWatcher(worker=self)
         self._control_watcher.start()
+        # GPU VLM pool lane (NEW, additive): start the PAR-sized executor + feeder
+        # thread that drains no-model GPU jobs concurrently (HTTP to the per-host
+        # vLLM server, which batches up to PAR on the GPU). No-op for cpu/ingest.
+        # The inline loop below now claims require_model=True (diffusion) only;
+        # the two lanes' claim sets are disjoint so neither steals the other's.
+        self._start_pool_lane()
         try:
             with psycopg.connect(db_url(), autocommit=True) as listen_conn:
                 listen_conn.execute(f"LISTEN {self._wake_channel}")
@@ -1639,6 +1947,9 @@ class ClaimWorker:
                     ):
                         break
         finally:
+            # Stop the GPU VLM pool lane FIRST so the feeder stops claiming new
+            # work before the rest of the teardown (no-op for cpu/ingest).
+            self._stop_pool_lane()
             if self._control_watcher is not None:
                 self._control_watcher.stop()
                 self._control_watcher = None

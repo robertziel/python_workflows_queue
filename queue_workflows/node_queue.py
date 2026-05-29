@@ -290,6 +290,7 @@ def claim_next_gpu_job(
     lease_s: int = DEFAULT_LEASE_S,
     host_priority: int = 0,
     known_models: Iterable[str] | None = None,
+    require_model: bool | None = None,
 ) -> dict[str, Any] | None:
     """Atomically grab the next queued GPU job (the GPU claim worker's
     claim).
@@ -306,18 +307,32 @@ def claim_next_gpu_job(
     * **Warm-model affinity tiebreak** — rows whose ``required_model`` matches
       the worker's ``current_model`` (``IS NOT DISTINCT FROM``) sort first
       within their priority band so consecutive same-model jobs don't reload.
-      ``host_priority`` then breaks the creation-order tie exactly as on CPU."""
+      ``host_priority`` then breaks the creation-order tie exactly as on CPU.
+    * **Model-presence lane filter** (``require_model``) — splits the GPU queue
+      into two disjoint claim sets so a two-lane GPU worker (inline warm-model
+      diffusion lane + a PAR-sized no-model VLM pool lane) never over-claims or
+      steals the other lane's rows. ``None`` (default) keeps the existing
+      claim-any behaviour; ``True`` adds ``AND c.required_model IS NOT NULL``
+      (model-backed diffusion jobs only); ``False`` adds
+      ``AND c.required_model IS NULL`` (no-model GPU jobs — VLM/HTTP — only).
+      Orthogonal to and ANDed with the capability gate above."""
     order = (
         f"{_AFFINITY_TERM}, "
         f"c.priority ASC, "
         f"{_HOST_DIR_TERM}"
     )
     known = [m for m in (known_models or []) if m]
-    capability = (
-        "AND (c.required_model IS NULL "
-        "OR c.required_model = ANY(%(known_models)s::text[]))"
-        if known else ""
-    )
+    capability_terms = []
+    if known:
+        capability_terms.append(
+            "AND (c.required_model IS NULL "
+            "OR c.required_model = ANY(%(known_models)s::text[]))"
+        )
+    if require_model is True:
+        capability_terms.append("AND c.required_model IS NOT NULL")
+    elif require_model is False:
+        capability_terms.append("AND c.required_model IS NULL")
+    capability = " ".join(capability_terms)
     sql = _CLAIM_SQL.format(order=order, capability=capability)
     params = {
         "worker_lane": worker_lane,

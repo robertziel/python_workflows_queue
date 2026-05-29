@@ -129,6 +129,100 @@ def test_warm_affinity_respects_null_required_model_with_null_current():
     assert typed
 
 
+# ── model-presence lane filter (require_model) ──────────────────────────────
+
+
+def _seed_one_typed_one_untyped(run_id: str) -> tuple[str, str]:
+    """Enqueue one model-backed (``required_model='sdxl'``) and one no-model GPU
+    job; return (typed_id, untyped_id)."""
+    typed = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="typed", node_module="x", queue="gpu",
+        required_model="sdxl", priority=100,
+    )
+    untyped = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="untyped", node_module="x", queue="gpu",
+        priority=100,
+    )
+    return typed, untyped
+
+
+def test_require_model_true_claims_only_model_backed_jobs():
+    """``require_model=True`` (the diffusion inline lane) claims ONLY a row whose
+    ``required_model IS NOT NULL`` — never a no-model VLM job."""
+    run_id = make_run()
+    typed, untyped = _seed_one_typed_one_untyped(run_id)
+    claimed = node_queue.claim_next_gpu_job(
+        0, current_model="sdxl", host="host-a", require_model=True,
+    )
+    assert claimed is not None and claimed["id"] == typed
+    # The untyped (no-model) job is left for the pool lane.
+    assert node_queue.get_node_job(untyped)["status"] == "queued"
+
+
+def test_require_model_false_claims_only_no_model_jobs():
+    """``require_model=False`` (the VLM pool lane) claims ONLY a row whose
+    ``required_model IS NULL`` — never a model-backed diffusion job."""
+    run_id = make_run()
+    typed, untyped = _seed_one_typed_one_untyped(run_id)
+    claimed = node_queue.claim_next_gpu_job(
+        0, current_model=None, host="host-a", require_model=False,
+    )
+    assert claimed is not None and claimed["id"] == untyped
+    assert node_queue.get_node_job(typed)["status"] == "queued"
+
+
+def test_require_model_none_claims_any_existing_behaviour():
+    """``require_model=None`` (default) is the existing claim-any behaviour: it
+    grabs either kind. With a NULL current_model the affinity tiebreak puts the
+    no-model row first — but the point is it is NOT filtered out by presence."""
+    run_id = make_run()
+    typed, untyped = _seed_one_typed_one_untyped(run_id)
+    first = node_queue.claim_next_gpu_job(0, current_model=None, host="host-a")
+    second = node_queue.claim_next_gpu_job(0, current_model=None, host="host-a")
+    assert {first["id"], second["id"]} == {typed, untyped}
+
+
+def test_require_model_true_finds_nothing_when_only_no_model_jobs_queued():
+    """The two lanes are disjoint: with ONLY no-model jobs queued, the diffusion
+    lane (``require_model=True``) claims nothing — it can't steal the pool's
+    rows."""
+    run_id = make_run()
+    node_queue.enqueue_node_job(
+        run_id=run_id, node_id="u", node_module="x", queue="gpu",
+    )
+    assert node_queue.claim_next_gpu_job(
+        0, current_model=None, host="host-a", require_model=True,
+    ) is None
+
+
+def test_require_model_false_finds_nothing_when_only_model_jobs_queued():
+    """Mirror: with ONLY model-backed jobs queued, the pool lane
+    (``require_model=False``) claims nothing."""
+    run_id = make_run()
+    node_queue.enqueue_node_job(
+        run_id=run_id, node_id="t", node_module="x", queue="gpu",
+        required_model="sdxl",
+    )
+    assert node_queue.claim_next_gpu_job(
+        0, current_model=None, host="host-a", require_model=False,
+    ) is None
+
+
+def test_require_model_filter_composes_with_capability_gate():
+    """``require_model=True`` ANDs with the capability gate: a model-backed row
+    this worker CAN'T serve (not in known_models) is still skipped, even though
+    it has a required_model."""
+    run_id = make_run()
+    node_queue.enqueue_node_job(
+        run_id=run_id, node_id="t", node_module="x", queue="gpu",
+        required_model="flux",  # NOT in known_models below
+    )
+    assert node_queue.claim_next_gpu_job(
+        0, current_model=None, host="host-a",
+        known_models=["sdxl"], require_model=True,
+    ) is None
+
+
 # ── host_priority tiebreaker ────────────────────────────────────────────────
 
 

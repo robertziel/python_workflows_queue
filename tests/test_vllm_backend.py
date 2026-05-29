@@ -299,6 +299,78 @@ def test_unsupported_sleep_state_reflected_after_attempt():
     assert b.sleep_unsupported is True
 
 
+# ── ensure_ready: served-model mismatch FAILS LOUD (baked --model) ────────────
+
+
+def test_ensure_ready_switch_mismatch_raises_runtimeerror():
+    """The HIGH audit bug. On a model SWITCH the slow path kills + brings the
+    sidecar up — but docker ``restart: unless-stopped`` resurrects it serving its
+    BAKED ``--model`` flag, NOT the requested one. So after the health wait the
+    /v1/models probe names a DIFFERENT served id than we asked for. ensure_ready
+    must FAIL LOUD (RuntimeError) so the consumer soft-degrades instead of POSTing
+    prompts to the wrong model.
+
+    Modelled with an ``ensure_up_fn`` that always brings the server up serving the
+    BAKED id ('A'), regardless of the requested model — exactly the production
+    failure (the entrypoint isn't model-aware yet)."""
+    server = _FakeServer(up=True, served="A")
+    kill_fn, _real_ensure_up, health_fn, served_model_fn = _seams(server)
+
+    def baked_ensure_up(_model_id: str) -> None:
+        # Resurrects on the baked model 'A' no matter what was requested.
+        server.up = True
+        server.served = "A"
+
+    b = VLLMBackend(
+        base_url="http://h:8000", served_model="A", sleep_fn=lambda _s: None,
+        kill_fn=kill_fn, ensure_up_fn=baked_ensure_up,
+        health_fn=health_fn, served_model_fn=served_model_fn,
+    )
+    with pytest.raises(RuntimeError, match=r"came up serving 'A', not 'B'"):
+        b.ensure_ready("B")
+    # The mismatch is observable: state was committed SERVING the OBSERVED model
+    # before the raise (so a later probe/log sees the truth, not a stale belief).
+    assert b._served_model == "A"
+
+
+def test_ensure_ready_cold_start_mismatch_raises_runtimeerror():
+    """Same fail-loud on a COLD start (not just a switch): bring-up serves a baked
+    model that differs from the requested id ⇒ RuntimeError. Covers the cold path
+    through the shared reconcile tail."""
+    server = _FakeServer(up=False, served=None)
+    kill_fn, _real_ensure_up, health_fn, served_model_fn = _seams(server)
+
+    def baked_ensure_up(_model_id: str) -> None:
+        server.up = True
+        server.served = "BAKED"
+
+    b = VLLMBackend(
+        base_url="http://h:8000", sleep_fn=lambda _s: None,
+        kill_fn=kill_fn, ensure_up_fn=baked_ensure_up,
+        health_fn=health_fn, served_model_fn=served_model_fn,
+    )
+    with pytest.raises(RuntimeError, match=r"came up serving 'BAKED', not 'WANT'"):
+        b.ensure_ready("WANT")
+
+
+def test_ensure_ready_cold_start_blank_probe_does_not_raise():
+    """A BLANK /v1/models probe (endpoint empty/early) is NOT a mismatch: the
+    served id optimistically falls back to the requested model, so ensure_ready
+    must still land SERVING that model and NOT raise. Guards against the fail-loud
+    check over-firing on the existing optimistic-fallback path."""
+    server = _FakeServer(up=False, served=None)
+    kill_fn, ensure_up_fn, health_fn, _real_served = _seams(server)
+
+    b = VLLMBackend(
+        base_url="http://h:8000", sleep_fn=lambda _s: None,
+        kill_fn=kill_fn, ensure_up_fn=ensure_up_fn, health_fn=health_fn,
+        served_model_fn=lambda: None,  # blank probe
+    )
+    b.ensure_ready("X")  # must not raise
+    assert b.state == VLLMState.SERVING
+    assert b._served_model == "X"
+
+
 # ── stop_server ──────────────────────────────────────────────────────────────
 
 

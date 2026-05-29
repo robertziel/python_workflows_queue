@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **PAR-driven GPU two-lane concurrency** — the GPU claim worker now runs no-model
+  GPU jobs (VLM facade work: HTTP to a per-host vLLM server that batches up to
+  `--max-num-seqs` = PAR requests on the GPU) in a PAR-sized `ThreadPoolExecutor`
+  pool lane, alongside the UNCHANGED concurrency-1 inline lane for model-backed
+  diffusion jobs. A dedicated feeder thread (gpu only, started in `run_forever`)
+  claims `require_model=False` jobs and submits them to the pool, gating
+  submissions on the live PAR (`worker_control.llm_config_for(host,'gpu').parallelism`,
+  clamped ≥ 1, re-read each cycle so a UI change takes effect without a restart)
+  so it never exceeds PAR in flight. The pool path (`ClaimWorker._run_pool_node`)
+  is a lighter sibling of `_run_node`: it keeps the `__input__` outbox park, the
+  run-cancel watcher, a per-job `LeaseRenewer`, and the `JobStatusWatcher`, but
+  OMITS the warm-model cache busy-bracket and the `GpuHealthWatchdog`/`StallWatchdog`
+  (those police an in-worker diffusion hang; a VLM job's GPU work is in the server,
+  HTTP-bound in the worker). Additive: the inline diffusion path is byte-identical
+  except the new `require_model=True` claim filter. Fixes "the vLLM toggle gives
+  nothing over ollama" — a concurrency-1 worker could only issue one VLM request at
+  a time, so vLLM never batched.
+- `node_queue.claim_next_gpu_job(..., require_model: bool | None = None)` — a
+  model-presence claim filter that splits the GPU queue into two disjoint sets:
+  `None` (default) = existing claim-any; `True` adds `AND c.required_model IS NOT
+  NULL` (diffusion); `False` adds `AND c.required_model IS NULL` (no-model VLM).
+  ANDs with the existing capability gate + keeps the affinity/priority ordering.
+  The two GPU lanes use `True`/`False` so they never over-claim or steal each
+  other's rows.
 - Worker LLM-server capability advertisement (migration 0014): a worker publishes
   `worker_heartbeats.llm_servers_available text[]` (default `{ollama}`) — which
   server types it can actually run — set via `set_llm_servers_available([...])` /
@@ -100,6 +124,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `node_queue.cancel_orphaned_queued_jobs()` exposes the underlying join
   UPDATE for direct use. Interval-gated by
   `AI_LEADS_ORPHAN_CANCEL_SWEEP_INTERVAL_S` (default 30 s).
+
+### Changed
+- The GPU worker's capacity heartbeat now advertises `concurrency = 1 + PAR`
+  (one inline diffusion slot + the PAR-sized VLM pool) instead of the hardcoded
+  `1`, so Rails' used/total queue pill reflects the worker's real concurrent
+  capacity. Read live via a `HeartbeatEmitter(concurrency_fn=...)` seam; CPU and
+  ingest workers keep the constant `1`.
+
+### Fixed
+- `VLLMBackend.ensure_ready` now FAILS LOUD on a served-model mismatch. After the
+  bring-up + health wait it reconciles the `/v1/models` probe against the
+  requested id and raises `RuntimeError` if they differ — because the default
+  bring-up (docker `restart: unless-stopped` + the BAKED `--model` flag) can
+  resurrect the sidecar serving the wrong model on a cross-model switch. Failing
+  loudly lets the consumer soft-degrade (e.g. fall back to ollama) instead of
+  silently POSTing prompts to the wrong model. A blank probe still optimistically
+  trusts the requested id (no false trip on the existing fallback path).
 
 ## [0.3.0] — 2026-05-27
 

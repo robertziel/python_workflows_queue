@@ -277,6 +277,16 @@ class VLLMBackend(LLMBackend):
              once (unless already known unsupported), catch its NotImplementedError
              and set the sticky flag, then the slow path (stop → cold-start the new
              model).
+
+        After the bring-up + health wait, the served id is RECONCILED against the
+        ``/v1/models`` probe and a MISMATCH raises ``RuntimeError`` (FAIL LOUD).
+        The default ``ensure_up_fn`` is a no-op + docker ``restart: unless-stopped``
+        brings the sidecar back up on its BAKED ``--model`` flag, NOT the requested
+        one — so a cross-model switch can come up serving the wrong model. Failing
+        here lets the consumer soft-degrade (e.g. fall back to ollama) instead of
+        silently POSTing prompts to the wrong model. (A blank probe — endpoint
+        empty/early — still optimistically trusts the requested id; only a probe
+        that names a DIFFERENT served id is treated as a mismatch.)
         """
         # Snapshot the decision under the lock; the health poll itself runs without
         # the lock held (we must not sleep holding it).
@@ -318,17 +328,28 @@ class VLLMBackend(LLMBackend):
         # ── lock released — issue the bring-up + poll health without holding it ──
         self._ensure_up_fn(model_id)
         self._await_health(timeout_s=timeout_s)
-        # Reconcile the served id best-effort, then commit SERVING under the lock.
-        observed = None
+        # Reconcile the served id, then commit SERVING under the lock. If the
+        # /v1/models probe named a model, trust it; else (blank/unreachable probe)
+        # optimistically assume the model we just asked to bring up.
+        probed = None
         try:
-            observed = self._served_model_fn()
+            probed = self._served_model_fn()
         except Exception:
-            observed = None
+            probed = None
+        observed = probed or model_id
         with self._lock:
-            # If the /v1/models probe named a model, trust it; else optimistically
-            # assume the model we just asked to bring up.
-            self._served_model = observed or model_id
+            self._served_model = observed
             self._state = VLLMState.SERVING
+        # FAIL LOUD on a cross-model mismatch: the default bring-up (docker
+        # restart:unless-stopped + baked --model) can resurrect the sidecar
+        # serving its baked model, not the one we asked for. Raise so the
+        # consumer soft-degrades instead of POSTing to the wrong model. A blank
+        # probe (observed fell back to model_id) never trips this.
+        if observed != model_id:
+            raise RuntimeError(
+                f"vLLM came up serving {observed!r}, not {model_id!r} "
+                "(baked --model; cross-model switch needs container recreate)"
+            )
 
     def _await_health(self, *, timeout_s: float) -> None:
         """Poll ``health_fn`` every :data:`_HEALTH_POLL_INTERVAL_S` until it returns
