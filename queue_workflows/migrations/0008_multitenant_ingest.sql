@@ -6,7 +6,7 @@
 -- the queue-name allow-list moves from a DB CHECK to host-side validation —
 -- exactly the move migration 0007 already made for task_name (the host
 -- validates against its registered set before enqueue). This lets a non-ingest
--- domain (the second consumer, lm_flood) route its own queues
+-- domain (a second consumer — a non-DAG forecast service) route its own queues
 -- (ingest/hydro/hydraulic/gpu) and carry per-job arguments, without forking the
 -- shared engine.
 --

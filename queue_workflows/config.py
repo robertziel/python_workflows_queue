@@ -171,7 +171,7 @@ class EngineConfig:
     #: Ingest-family queue names. Migration 0008 dropped the fetch/load DB CHECK;
     #: the host validates ``queue`` against THIS set before enqueue (mirroring the
     #: task_name gate). Default {'fetch','load'} keeps ai_leads byte-compat; a
-    #: different project (lm_flood) sets e.g. {'ingest','hydro','hydraulic','gpu'}.
+    #: different project (e.g. a forecast service) sets {'ingest','hydro','hydraulic','gpu'}.
     ingest_queues: frozenset[str] = frozenset({"fetch", "load"})
     #: Wall-clock budget (s) the claim worker applies to ingest queues OTHER than
     #: the built-in fetch/load (``claim_worker.budget_for``). Host-tunable.

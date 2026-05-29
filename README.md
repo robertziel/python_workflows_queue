@@ -134,6 +134,87 @@ queue-scheduler
 queue-orchestrator
 ```
 
+## Deploying with Ansible (example)
+
+A minimal, copy-pasteable shape for a small self-hosted fleet: one claim worker
+per host, with each box's LLM server type (ollama / vLLM) set per-machine. All
+values are placeholders — **keep the real DSN and any secrets in
+`ansible-vault`, never in the inventory**.
+
+```yaml
+# inventory.yml — tag each host with the LLM server types it can actually run
+# (this gates the per-machine toggle; an AMD box can't run the CUDA vLLM image).
+all:
+  children:
+    workers:
+      hosts:
+        gpu-box-1: { worker_queue: gpu, llm_servers: ["ollama", "vllm"] }
+        gpu-box-2: { worker_queue: gpu, llm_servers: ["ollama"] }
+        cpu-box-1: { worker_queue: cpu, llm_servers: [] }
+      vars:
+        queue_db_url: "{{ vault_queue_db_url }}"     # real DSN lives in ansible-vault
+        ollama_url:   "http://127.0.0.1:11434"
+        vllm_url:     "http://127.0.0.1:8000"
+```
+
+```yaml
+# site.yml — install the engine + run one claim worker per host as a service.
+- hosts: workers
+  tasks:
+    - name: Install the engine
+      ansible.builtin.pip: { name: "queue_workflows[metrics]", state: present }
+
+    - name: Render the worker unit
+      ansible.builtin.template:
+        src: queue-worker.service.j2          # ExecStart=queue-claim-worker --queue={{ worker_queue }}
+        dest: "~/.config/systemd/user/queue-worker.service"
+      # Environment= drives the host's configure():
+      #   APP_DB_URL={{ queue_db_url }}   (the env var named by configure(db_url_env=...))
+      #   OLLAMA_URL={{ ollama_url }}  VLLM_URL={{ vllm_url }}
+      #   plus, in the host's startup: set_llm_servers_available({{ llm_servers | to_json }})
+
+    - name: Enable + (re)start the worker
+      ansible.builtin.systemd:
+        name: queue-worker.service
+        scope: user
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+    # Seed the operator-desired LLM server type per (host, queue). The 0013
+    # trigger NOTIFYs worker_llm_config_changed, so the running worker rebuilds
+    # its backend with no restart. (Programmatic equivalent:
+    # worker_control.set_llm_config(host, queue, server_type=..., parallelism=...).)
+    - name: Seed per-machine LLM server type + parallelism (PAR)
+      community.postgresql.postgresql_query:
+        login_db: appdb
+        query: >
+          INSERT INTO worker_controls (host_label, queue, llm_server_type, llm_parallelism)
+          VALUES (%(host)s, %(queue)s, %(server)s, %(par)s)
+          ON CONFLICT (host_label, queue) DO UPDATE
+            SET llm_server_type = EXCLUDED.llm_server_type,
+                llm_parallelism = EXCLUDED.llm_parallelism
+        named_args:
+          host:   "{{ inventory_hostname }}"
+          queue:  "{{ worker_queue }}"
+          server: "{{ 'vllm' if 'vllm' in llm_servers else 'ollama' }}"
+          par: 4
+      when: worker_queue == "gpu"
+
+    # Optional vLLM sidecar, only on hosts that advertise it. The engine STOPS it
+    # when idle (set_vllm_lifecycle), so it needs no docker restart policy.
+    - name: Deploy vLLM sidecar
+      ansible.builtin.template:
+        src: vllm-compose.yml.j2                # image + --model + --max-num-seqs={{ par }}
+        dest: "/opt/queue/vllm-compose.yml"
+      when: "'vllm' in llm_servers"
+```
+
+`llm_parallelism` (PAR) is the **server's** request-batching capacity, *not* the
+claim-worker concurrency (which stays 1) — see
+[`docs/llm_backends.md`](docs/llm_backends.md) for how the two GPU lanes share a
+box and why a diffusion model never goes through ollama/vLLM.
+
 ## Migrations
 
 The engine owns its schema as `queue_workflows/migrations/NNNN_*.sql` (shipped

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -159,7 +160,32 @@ def _down_migration(migrations_dir: Path, version: int) -> Path | None:
     return matches[0]
 
 
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _check_identifier(name: str) -> str:
+    """Guard the one SQL identifier the migration runner interpolates
+    (``version_table``).
+
+    ``version_table`` is an *identifier* (a table name), so it cannot be bound
+    with a ``%s`` placeholder — it has to be interpolated into the statement
+    text. It is a developer-supplied parameter (``bootstrap(version_table=...)``),
+    never end-user input, so this is defence-in-depth rather than a response to
+    an attacker-reachable path: it pins the value to a plain, unqualified
+    Postgres identifier (letters/digits/underscore, not starting with a digit)
+    so a typo or a hostile caller can't smuggle SQL through the table name.
+    Returns the validated name so call sites can interpolate it directly.
+    """
+    if not _IDENT_RE.match(name):
+        raise ValueError(
+            f"invalid version_table identifier {name!r} — must match "
+            r"^[A-Za-z_][A-Za-z0-9_]*$ (a plain unqualified SQL identifier)"
+        )
+    return name
+
+
 def _applied_versions(conn: psycopg.Connection, version_table: str) -> list[int]:
+    _check_identifier(version_table)
     with conn.cursor() as cur:
         cur.execute(f"SELECT version FROM {version_table} ORDER BY version")
         return [r["version"] for r in cur.fetchall()]
@@ -177,6 +203,7 @@ def bootstrap(
     ``queue_schema_version``. A host applies its domain chain by calling this
     a SECOND time with its own dir + ``schema_version``.
     """
+    _check_identifier(version_table)
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -217,6 +244,7 @@ def bootstrap_from_schema(
     import subprocess
     import urllib.parse
 
+    _check_identifier(version_table)
     snap = path or _ENGINE_SCHEMA_SNAPSHOT
     if not snap.exists():
         return 0
@@ -256,6 +284,7 @@ def current_schema_version(*, version_table: str = ENGINE_VERSION_TABLE) -> int:
     table doesn't exist yet (a brand-new DB the orchestrator hasn't
     bootstrapped). Never raises ``UndefinedTable`` — the ``to_regclass``
     guard returns NULL instead, which we map to 0."""
+    _check_identifier(version_table)
     with connection() as conn, conn.cursor() as cur:
         cur.execute("SELECT to_regclass(%s) AS t", (f"public.{version_table}",))
         if cur.fetchone()["t"] is None:
@@ -320,6 +349,7 @@ def downgrade(
     Returns the list of reverted versions (highest-first). Raises
     ``RuntimeError`` when a step has no ``.down.sql`` file.
     """
+    _check_identifier(version_table)
     reverted: list[int] = []
     with connection() as conn:
         with conn.cursor() as cur:

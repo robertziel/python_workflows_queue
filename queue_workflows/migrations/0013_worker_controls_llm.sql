@@ -3,9 +3,9 @@
 -- WHY columns on worker_controls (not a new table). The LLM server a host runs
 -- is DESIRED, operator-set state with the SAME key as the ON/OFF switch —
 -- (host_label, queue) — and is read by the SAME worker that reads desired_state.
--- It belongs next to it, written by the same Rails/operator path. Both consumer
--- projects (lm_flood, lm_content_generator) read worker_controls only through the
--- engine accessors (never SELECT *), so widening the row is safe for them.
+-- It belongs next to it, written by the same Rails/operator path. Other consumer
+-- projects read worker_controls only through the engine accessors (never
+-- SELECT *), so widening the row is safe for them.
 --
 --   * llm_server_type — 'ollama' | 'vllm'. A stable two-value enum ⇒ a DB CHECK.
 --                       DEFAULT 'ollama' so every pre-existing / freshly-written

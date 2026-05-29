@@ -17,8 +17,7 @@
 --     ``{ollama}`` (the universal baseline) or ``{ollama,vllm}`` (an NVIDIA host
 --     with the vllm sidecar rendered). DEFAULT ``{ollama}`` so every existing /
 --     freshly-written row is ollama-only until a worker advertises otherwise —
---     no backfill, and consumers that never set it (lm_flood, lm_content_generator)
---     are unaffected.
+--     no backfill, and other consumers that never set it are unaffected.
 --
 -- IF NOT EXISTS ⇒ idempotent on re-run, like the rest of the chain.
 

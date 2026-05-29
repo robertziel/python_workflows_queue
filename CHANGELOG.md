@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-30
+
 ### Added
+- **Docs: ollama vs vLLM request flow + how a diffusion model shares the GPU** —
+  `docs/llm_backends.md` gains two Mermaid request-flow graphs (ollama's
+  always-up, self-managed daemon vs vLLM's engine-managed, idle-stopping,
+  batching server), a side-by-side comparison table, and a "When a diffusion
+  model runs on the same host" section: the two-lane split (the in-process
+  diffusion inline lane + the PAR-sized VLM pool), the PAR cap, and why a
+  compute-bound diffusion model never goes through ollama/vLLM. The README gains
+  a copy-pasteable **Ansible deployment example** (inventory + playbook) that
+  wires the per-machine ollama/vLLM choice, capability advertisement, and PAR —
+  secrets kept in `ansible-vault`, not the inventory.
 - **GPU node-job capacity capped at PAR total (was 1+PAR)** — a GPU machine runs
   1 inline diffusion (concurrency-1) + a PAR-sized VLM pool; the pool feeder now
   budgets `PAR - 1` while the inline diffusion runs (`_pool_budget` +
@@ -231,8 +243,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Multi-tenant ingest path: host-defined ingest queues and per-job `args`, with
   host-side `task_name`/queue validation (migration 0008). A second consumer
-  (e.g. `lm_flood`) can route its own queue names and carry per-job arguments
-  without forking the schema.
+  (e.g. a non-DAG forecast service) can route its own queue names and carry
+  per-job arguments without forking the schema.
 
 ## [0.1.0] — 2026-05-25
 
@@ -243,7 +255,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatch-event outbox, a GPU warm-model cache, periodic ingest work + a
   PG-native scheduler, and per-host hw-metrics telemetry. Migrations 0001–0007.
 
-[Unreleased]: https://github.com/robertziel/python_workflows_queue/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/robertziel/python_workflows_queue/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/robertziel/python_workflows_queue/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/robertziel/python_workflows_queue/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/robertziel/python_workflows_queue/releases/tag/v0.2.0
 [0.1.0]: https://github.com/robertziel/python_workflows_queue/commit/9ddaf4ae80d906e9d286403bab015e56ba9899ed
