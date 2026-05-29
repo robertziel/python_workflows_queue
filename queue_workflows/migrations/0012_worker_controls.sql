@@ -11,8 +11,8 @@
 --
 -- Keyed ``(host_label, queue)`` — the SAME identity worker_heartbeats and the
 -- claim's ``claimed_by``/``queue`` use. A host runs several workers under one
--- ``host_label`` (box-b runs a cpu AND a gpu worker), so control MUST be
--- per-queue: turning off "box-a gpu" must not touch "box-a cpu".
+-- ``host_label`` (host-c runs a cpu AND a gpu worker), so control MUST be
+-- per-queue: turning off "host-a gpu" must not touch "host-a cpu".
 --
 --   * desired_state — 'on' | 'off'. A stable two-value enum ⇒ a DB CHECK.
 --   * stop_policy   — how to transition on→off. 'hard' (kill in-flight + free

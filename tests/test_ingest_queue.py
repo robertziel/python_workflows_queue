@@ -279,7 +279,7 @@ def test_ingest_snapshot_reports_depth_and_workers():
     node_queue.enqueue_ingest_job(task_name="t", queue="hydraulic")
     node_queue.claim_next_ingest_job("hydraulic", host="h")  # → running
     node_queue.upsert_worker_heartbeat(
-        host_label="box-b", queue="hydro", concurrency=1,
+        host_label="host-c", queue="hydro", concurrency=1,
     )
 
     snap = node_queue.ingest_snapshot()

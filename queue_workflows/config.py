@@ -60,6 +60,14 @@ class EngineConfig:
     db_url_env: str = "AI_LEADS_DB_URL"
     host_label_env: str = "AI_LEADS_HOST_LABEL"
     host_priority_env: str = "AI_LEADS_GPU_CONSUMER_PRIORITY"
+    #: env vars holding the per-machine LLM server ROOT URLs the backend factory
+    #: (``queue_workflows.llm_backends.factory``) reads. The DB (worker_controls,
+    #: migration 0013) owns WHICH server type a machine runs + its tunables; the
+    #: URL is deployment topology (set per host by ansible), so it stays in env.
+    #: Names default to the ai_leads vars for byte-compat; values fall back to the
+    #: localhost defaults below when the env is unset.
+    ollama_url_env: str = "AI_LEADS_OLLAMA_URL"
+    vllm_url_env: str = "AI_LEADS_VLLM_URL"
     #: env vars holding the redis / mongodb DSN for those backends (read only when
     #: ``db_backend`` selects them). New names (no ai_leads equivalent).
     redis_url_env: str = "QUEUE_WORKFLOWS_REDIS_URL"
@@ -74,6 +82,14 @@ class EngineConfig:
     node_module_package: str = ""
     #: cgroup-attribution container-name prefix (hw_metrics per-container slice).
     container_prefix: str = "ai_leads-"
+    #: OBSERVED LLM-server capability this worker advertises in its heartbeat
+    #: (migration 0014) — which server types this HOST can actually run. The host
+    #: sets it once at startup (ai_leads → from the vllm-sidecar-rendered env), and
+    #: the heartbeat emitter publishes it so the queue UI can gate its per-machine
+    #: server-type control (an AMD box that can't run the CUDA vllm sidecar
+    #: advertises just ``["ollama"]`` → the UI disables vllm there). Default
+    #: ``["ollama"]`` (the universal baseline) keeps every other consumer unchanged.
+    llm_servers_available: list[str] = field(default_factory=lambda: ["ollama"])
 
     # ── storage backend selection (pluggable DB type) ──────────────────────────
     #: Which provider the StorageBackend SPI (``queue_workflows.backends``)
@@ -123,6 +139,22 @@ class EngineConfig:
     #: host thread per-node execution state (e.g. a smoke/mock ``_mocked`` stamp)
     #: without forking ``execute_node``.
     invoke_context: Callable[[dict, dict], Any] | None = None
+
+    # ── vllm sidecar lifecycle (host-provided; idle supervisor + model switch) ─
+    #: ``Callable[[], bool]`` — stop the vllm sidecar to free VRAM, returning True
+    #: iff it stopped one. The :class:`~queue_workflows.llm_backends.supervisor.\
+    #: LLMSupervisor` calls this (via the backend's ``stop_server``) on idle.
+    #: ``Callable[[str], None]`` — (re)start the sidecar serving ``model_id``; the
+    #: backend's ``ensure_ready`` calls it on a cold start / respawn. Default
+    #: ``None`` ⇒ the vllm backend's built-in pkill / no-op seams (a same-container
+    #: or unmanaged deployment). A host that runs vllm as a SEPARATE container
+    #: wires these (ai_leads → docker Engine API over the UDS) so the in-worker
+    #: supervisor can stop/start the SIBLING sidecar WITHOUT a docker restart
+    #: policy (which would re-trigger the NFS cold-start boot race). Threaded into
+    #: ``VLLMBackend`` by the backend factory; ``None`` passes through to the
+    #: backend's own default (``kill_fn or _default_kill_fn``).
+    vllm_stop_fn: Callable[[], bool] | None = None
+    vllm_start_fn: Callable[[str], None] | None = None
 
     # ── orphan-cancel sweep (opt-in) ──────────────────────────────────────────
     #: When True, the :class:`NodePool` periodically flips ``queued`` jobs whose

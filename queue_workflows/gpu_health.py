@@ -10,7 +10,7 @@ cgroup tree or the docker socket — see ``docker-compose.yml`` ``workers-gpu``)
 
 Both are deliberately read from the container's own namespaced views so they
 need no extra mounts and — critically — EXCLUDE the ollama VLM sidecar that
-shares the box-c GPU on box-a/box-a2 (the box-level util would false-negative a
+shares the box-c GPU on host-a/host-b (the box-level util would false-negative a
 real render hang because ollama keeps the box GPU > 0 %).
 
 
@@ -21,7 +21,7 @@ NVIDIA (box-c/Blackwell): ``nvidia-smi pmon -c 1 -s u`` reports a per-PROCESS
 namespace and lists ONLY the GPU processes visible in that namespace, so a call
 from inside the gpu worker container returns rows for this container's own
 processes only — the ollama sidecar (a different container / PID namespace) is
-not listed (verified on box-a2: ollama's busy python is invisible from the
+not listed (verified on host-b: ollama's busy python is invisible from the
 render container's pmon, and vice-versa). We take the MAX ``sm%`` across the
 returned rows as the per-container GPU-busy signal.
 
@@ -35,11 +35,11 @@ doing real GPU work that pmon can't measure — is covered by the watchdog's
 SECOND arm: it only trips when GPU looks idle AND container RAM is static, so a
 working-but-unmeasurable job whose RAM moves is never killed.
 
-ROCm (box-b overflow worker) + any non-NVIDIA / no-pmon box: pmon isn't
+ROCm (host-c overflow worker) + any non-NVIDIA / no-pmon box: pmon isn't
 available, so ``gpu_util_pct()`` falls back to the box-level
 ``nvidia-smi``/``rocm-smi`` utilization (via ``hw_metrics._gpu_probe``). On
-box-b there is no ollama GPU sidecar, so the box-level signal is already
-per-host-clean there; and box-b runs the qwen pipeline fine (the stall is
+host-c there is no ollama GPU sidecar, so the box-level signal is already
+per-host-clean there; and host-c runs the qwen pipeline fine (the stall is
 box-c-specific), so the fallback's coarser attribution is acceptable for the
 overflow host.
 
@@ -158,7 +158,7 @@ def _box_gpu_util_pct() -> int:
     Fallback for ROCm / no-pmon hosts. NOTE: this is BOX-level — on a box-c with
     the ollama sidecar it can read > 0 even when this container's render is
     wedged (false-negative), which is exactly why the NVIDIA path above is
-    preferred. Used only where the per-container path is unavailable (box-b
+    preferred. Used only where the per-container path is unavailable (host-c
     ROCm overflow worker, where there is no GPU sidecar anyway). Returns 0 on
     any failure."""
     try:

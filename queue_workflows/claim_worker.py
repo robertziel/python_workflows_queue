@@ -1175,6 +1175,7 @@ class HeartbeatEmitter:
                 concurrency=1,
                 current_model=self._current_model(),
                 known_models=model_registry.known_ids(),
+                llm_servers_available=get_config().llm_servers_available,
             )
         except Exception:
             log.exception("[claim-worker:%s] heartbeat upsert failed", self._queue)
@@ -1601,6 +1602,20 @@ class ClaimWorker:
         self.heartbeat.start()
         # (hw-metrics sampler already started above, before the park gate, so it
         # survives an OFF→park cycle.)
+        # GPU only: arm the LLM-backend factory's config-change LISTEN invalidator
+        # so an operator's ollama↔vllm / tunable edit (worker_controls, 0013) is
+        # picked up instantly by the co-tenant VLM backend. Cheap, isolated, and
+        # env-gated (AI_LEADS_DISABLE_LLM_CONFIG_LISTENER) so it's inert in tests.
+        # Wrapped because the LLM backend is an OPTIONAL subsystem (a host may run
+        # no VLM at all) — its arming must never take down the claim worker.
+        if self.queue == "gpu":
+            try:
+                from queue_workflows.llm_backends import factory as _llm_factory
+                _llm_factory.start()
+            except Exception:
+                log.exception(
+                    "[claim-worker:gpu] LLM backend factory start failed (ignored)"
+                )
         # Operator control watcher: HARD-stop this worker the instant it's turned
         # OFF (re-queue in-flight + os._exit to free RAM; the supervisor restart
         # re-enters the park gate above). Honours AI_LEADS_DISABLE_WORKER_CONTROL.
@@ -1627,6 +1642,17 @@ class ClaimWorker:
             if self._control_watcher is not None:
                 self._control_watcher.stop()
                 self._control_watcher = None
+            # Stop the LLM-backend factory (invalidator thread + release any cached
+            # backends → frees a vllm sidecar's VRAM). GPU only / best-effort, the
+            # mirror of the gpu-gated start() above.
+            if self.queue == "gpu":
+                try:
+                    from queue_workflows.llm_backends import factory as _llm_factory
+                    _llm_factory.stop()
+                except Exception:
+                    log.exception(
+                        "[claim-worker:gpu] LLM backend factory stop failed (ignored)"
+                    )
             self.heartbeat.stop()
             # Stop the sampler iff THIS process won the flock.
             if self._hw_sampler is not None:

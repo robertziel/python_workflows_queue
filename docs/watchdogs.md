@@ -36,7 +36,7 @@ doing nothing — see [Gating the no-progress trip](#gating-the-no-progress-trip
 ## Why a wall-clock budget isn't enough
 
 ```
-observed hang (box-a2, job 374568c6):
+observed hang (host-b, job 374568c6):
 
   21:50:58  claim          ┐
   21:51:00  load qwen_edit │  legit cold load (~6 min on a cold cache)
@@ -330,7 +330,7 @@ as a daemon **thread**. That shares a fatal assumption: the worker's Python
 interpreter is still schedulable enough to run those threads and execute their
 trip. A **GPU hardware-hang** can break that assumption.
 
-### The incident (box-b / ROCm, observed 11:35)
+### The incident (host-c / ROCm, observed 11:35)
 
 A `wan_i2v` render hit a ROCr **"GPU Hang"** HW exception:
 
@@ -340,7 +340,7 @@ A `wan_i2v` render hit a ROCr **"GPU Hang"** HW exception:
   11:35   inference call blocks inside the dead HIP context   │  PID 1 stuck in this call
   11:35   worker_heartbeats.last_seen FREEZES …………………………………  ┘  stops claiming overflow work
    ⋯      (29 min of a wedged worker)
-  11:35+  DB lease-reclaim re-queues the JOB onto box-a  ← good, the work is safe
+  11:35+  DB lease-reclaim re-queues the JOB onto host-a  ← good, the work is safe
    ⋯      …but the wedged PROCESS sat there until a manual `docker restart`.
 ```
 
@@ -426,7 +426,7 @@ flowchart LR
 
 The orchestrator **flags** but does **not kill** the wedged worker. A
 cross-host container restart isn't safe or feasible from the orchestrator: it
-has no docker socket, and the worker is on a *different host* (box-a / box-a2)
+has no docker socket, and the worker is on a *different host* (host-a / host-b)
 reachable only over SSH/FRP. Killing belongs to whatever supervises the worker
 **on its own host** (systemd / docker restart-policy / a small host daemon).
 The engine's contract is to expose a clean, durable, queryable signal; the host

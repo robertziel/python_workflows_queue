@@ -31,8 +31,8 @@ beating — exactly when its heartbeat row is aging out — so it cannot live th
 
 Keyed `(host_label, queue)` — the same identity the heartbeat and the claim's
 `claimed_by`/`queue` use. A host runs several workers under one `host_label`
-(box-b runs a cpu *and* a gpu worker), so control is **per-queue**: turning off
-"box-a gpu" never touches "box-a cpu".
+(host-c runs a cpu *and* a gpu worker), so control is **per-queue**: turning off
+"host-a gpu" never touches "host-a cpu".
 
 A row trigger fires `pg_notify('worker_control', '<host>:<queue>')` on every
 INSERT/UPDATE, so a worker wakes immediately and a plain SQL write from any
@@ -97,12 +97,12 @@ Python against this registry):
 ```python
 from queue_workflows import worker_control
 
-worker_control.disable_worker("box-a", "gpu")            # hard stop + stay off
-worker_control.enable_worker("box-a", "gpu")             # resume
-worker_control.set_worker_control("box-a", "gpu",
+worker_control.disable_worker("host-a", "gpu")            # hard stop + stay off
+worker_control.enable_worker("host-a", "gpu")             # resume
+worker_control.set_worker_control("host-a", "gpu",
     desired_state="off", stop_policy="hard", requested_by="ops")
-worker_control.get_worker_control("box-a", "gpu")        # row or None
-worker_control.desired_state_for("box-a", "gpu")         # 'on' | 'off' (None/absent ⇒ 'on')
+worker_control.get_worker_control("host-a", "gpu")        # row or None
+worker_control.desired_state_for("host-a", "gpu")         # 'on' | 'off' (None/absent ⇒ 'on')
 ```
 
 CLI (console script): `queue-worker-control --queue gpu --off [--host H] [--policy hard]` / `--on`.

@@ -338,13 +338,13 @@ def test_stall_trip_clears_current_model_busy_ghost():
         run_id=run_id, node_id="n", node_module="x", queue="gpu",
         required_model="qwen_edit",
     )
-    node_queue.claim_next_gpu_job(0, host="box-a2")
-    _seed_busy_heartbeat("box-a2", "gpu", "qwen_edit")
+    node_queue.claim_next_gpu_job(0, host="host-b")
+    _seed_busy_heartbeat("host-b", "gpu", "qwen_edit")
 
     exits: list[int] = []
     wd = _wedged_stall_watchdog(
         job_id, on_exit=lambda c: exits.append(c),
-        host_label="box-a2", queue="gpu",
+        host_label="host-b", queue="gpu",
     )
     wd.start(); wd.beat()
     deadline = time.time() + 3.0
@@ -352,7 +352,7 @@ def test_stall_trip_clears_current_model_busy_ghost():
         time.sleep(0.02)
     wd.stop()
     assert exits and exits[0] == 76
-    row = _heartbeat_row("box-a2", "gpu")
+    row = _heartbeat_row("host-b", "gpu")
     assert row is not None and row["current_model"] is None, (
         "a hard-exiting worker must clear its current_model busy-ghost"
     )
@@ -362,13 +362,13 @@ def test_gpu_health_trip_clears_current_model_busy_ghost():
     """A confirmed GpuHealthWatchdog trip clears current_model too (same Part-C
     fix, both re-queue and fail paths go through _clear_busy_ghost)."""
     run_id, job_id = _running_gpu_job_with_retries(3)  # == cap → fail path
-    _seed_busy_heartbeat("box-a", "gpu", "wan_i2v")
+    _seed_busy_heartbeat("host-a", "gpu", "wan_i2v")
     exits: list[int] = []
     wd = claim_worker.GpuHealthWatchdog(
         job_id=job_id, interval_s=0.05, idle_pct=5, ram_delta_mb=5120, poll_s=0.01,
         gpu_sampler=lambda: 0, ram_sampler=lambda: 2048,
         on_exit=lambda c: exits.append(c),
-        host_label="box-a", queue="gpu",
+        host_label="host-a", queue="gpu",
     )
     wd.start(); wd.beat()
     deadline = time.time() + 3.0
@@ -376,27 +376,27 @@ def test_gpu_health_trip_clears_current_model_busy_ghost():
         time.sleep(0.02)
     wd.stop()
     assert exits and exits[0] == 78
-    row = _heartbeat_row("box-a", "gpu")
+    row = _heartbeat_row("host-a", "gpu")
     assert row is not None and row["current_model"] is None
 
 
 def test_busy_ghost_clear_marks_heartbeat_stale_so_gauge_drops_it():
     """Clearing the busy-ghost also ages last_seen past the 30 s gauge window so
     the dead worker drops out of the live-worker count at once (not after 30 s)."""
-    _seed_busy_heartbeat("box-a2", "gpu", "qwen_edit")
+    _seed_busy_heartbeat("host-b", "gpu", "qwen_edit")
     # Fresh before.
     with connection() as c, c.cursor() as cur:
         cur.execute(
             "SELECT last_seen > now() - interval '30 seconds' AS fresh "
-            "FROM worker_heartbeats WHERE host_label='box-a2' AND queue='gpu'"
+            "FROM worker_heartbeats WHERE host_label='host-b' AND queue='gpu'"
         )
         assert cur.fetchone()["fresh"] is True
-    claim_worker._clear_busy_ghost("box-a2", "gpu")
+    claim_worker._clear_busy_ghost("host-b", "gpu")
     with connection() as c, c.cursor() as cur:
         cur.execute(
             "SELECT current_model, "
             "       last_seen > now() - interval '30 seconds' AS fresh "
-            "FROM worker_heartbeats WHERE host_label='box-a2' AND queue='gpu'"
+            "FROM worker_heartbeats WHERE host_label='host-b' AND queue='gpu'"
         )
         r = cur.fetchone()
     assert r["current_model"] is None
@@ -647,11 +647,11 @@ def test_job_status_watcher_kills_when_job_requeued():
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="n", node_module="x", queue="gpu",
     )
-    node_queue.claim_next_gpu_job(0, host="box-a")  # running, claimed_by=box-a
+    node_queue.claim_next_gpu_job(0, host="host-a")  # running, claimed_by=host-a
 
     exits: list[int] = []
     w = claim_worker.JobStatusWatcher(
-        job_id=job_id, claimed_by="box-a",
+        job_id=job_id, claimed_by="host-a",
         on_exit=lambda c: exits.append(c), poll_s=0.02,
     )
     w.start()
@@ -668,11 +668,11 @@ def test_job_status_watcher_quiet_while_job_ours_and_running():
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="n", node_module="x", queue="gpu",
     )
-    node_queue.claim_next_gpu_job(0, host="box-a")
+    node_queue.claim_next_gpu_job(0, host="host-a")
 
     exits: list[int] = []
     w = claim_worker.JobStatusWatcher(
-        job_id=job_id, claimed_by="box-a",
+        job_id=job_id, claimed_by="host-a",
         on_exit=lambda c: exits.append(c), poll_s=0.02,
     )
     w.start()
@@ -688,11 +688,11 @@ def test_job_status_watcher_ignores_own_completion():
     job_id = node_queue.enqueue_node_job(
         run_id=run_id, node_id="n", node_module="x", queue="gpu",
     )
-    node_queue.claim_next_gpu_job(0, host="box-a")
+    node_queue.claim_next_gpu_job(0, host="host-a")
 
     exits: list[int] = []
     w = claim_worker.JobStatusWatcher(
-        job_id=job_id, claimed_by="box-a",
+        job_id=job_id, claimed_by="host-a",
         on_exit=lambda c: exits.append(c), poll_s=0.02,
     )
     w.start()
@@ -888,7 +888,7 @@ def test_run_node_threads_a_callable_status_callback_to_gpu_node():
         def mark_busy(self): ...
         def mark_idle(self): ...
 
-    worker = claim_worker.ClaimWorker(queue="gpu", host="box-a2", model_cache=_Cache())
+    worker = claim_worker.ClaimWorker(queue="gpu", host="host-b", model_cache=_Cache())
     assert worker.run_once() is True
     assert seen.get("is_callable") is True
     assert node_queue.get_node_job(job_id)["status"] == "completed"
@@ -942,7 +942,7 @@ def test_stall_watchdog_not_armed_for_video_models(monkeypatch):
         def mark_busy(self): ...
         def mark_idle(self): ...
 
-    worker = claim_worker.ClaimWorker(queue="gpu", host="box-a", model_cache=_Cache())
+    worker = claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=_Cache())
     assert worker.run_once() is True
     # Health watchdog armed (video is the point); StallWatchdog NOT constructed.
     assert "health" in constructed, "video model must get the GpuHealthWatchdog"
@@ -991,7 +991,7 @@ def test_gpu_job_gets_health_watchdog_and_no_wallclock_watchdog(monkeypatch):
         run_id=run_id, node_id="g", node_module="_cw_gpu_guard", queue="gpu",
     )
     assert claim_worker.ClaimWorker(
-        queue="gpu", host="box-a", model_cache=_Cache(),
+        queue="gpu", host="host-a", model_cache=_Cache(),
     ).run_once() is True
     assert "health" in constructed
     assert "wallclock" not in constructed, "GPU job must NOT get a fixed wall-clock cap"
@@ -1002,7 +1002,7 @@ def test_gpu_job_gets_health_watchdog_and_no_wallclock_watchdog(monkeypatch):
     node_queue.enqueue_node_job(
         run_id=run_id, node_id="c", node_module="_cw_gpu_guard", queue="cpu",
     )
-    assert claim_worker.ClaimWorker(queue="cpu", host="box-b").run_once() is True
+    assert claim_worker.ClaimWorker(queue="cpu", host="host-c").run_once() is True
     assert "wallclock" in constructed
     assert "health" not in constructed, "CPU job must NOT get a health watchdog"
 
@@ -1049,7 +1049,7 @@ def test_gpu_node_with_no_model_and_no_progress_still_gets_started_health_watchd
         queue="gpu",  # NOTE: no required_model
     )
     assert claim_worker.ClaimWorker(
-        queue="gpu", host="box-a", model_cache=_Cache(),
+        queue="gpu", host="host-a", model_cache=_Cache(),
     ).run_once() is True
     assert started == ["health"], (
         "a no-model/no-progress GPU node must still get a STARTED health watchdog "
@@ -1337,7 +1337,7 @@ def test_gpu_health_env_parsers_override_and_fall_back(monkeypatch):
 
 def test_claim_worker_accepts_fetch_and_load_queues():
     for q in ("fetch", "load"):
-        w = claim_worker.ClaimWorker(queue=q, host="box-b")
+        w = claim_worker.ClaimWorker(queue=q, host="host-c")
         assert w.queue == q
 
 
@@ -1357,16 +1357,16 @@ def test_run_once_claims_and_executes_ingest_job():
     job_id = node_queue.enqueue_ingest_job(
         task_name="run_fetch_all", queue="fetch", reason="tick",
     )
-    worker = claim_worker.ClaimWorker(queue="fetch", host="box-b")
+    worker = claim_worker.ClaimWorker(queue="fetch", host="host-c")
     assert worker.run_once() is True
     assert ran == ["tick"]
     row = node_queue.get_ingest_job(job_id)
     assert row["status"] == "completed"
-    assert row["claimed_by"] == "box-b"
+    assert row["claimed_by"] == "host-c"
 
 
 def test_run_once_ingest_returns_false_when_empty():
-    worker = claim_worker.ClaimWorker(queue="load", host="box-b")
+    worker = claim_worker.ClaimWorker(queue="load", host="host-c")
     assert worker.run_once() is False
 
 
@@ -1380,7 +1380,7 @@ def test_budget_for_fetch_and_load():
 
 def test_claim_worker_accepts_host_configured_ingest_queue():
     queue_workflows.configure(ingest_queues=frozenset({"hydro", "hydraulic", "corrdiff"}))
-    w = claim_worker.ClaimWorker(queue="hydraulic", host="box-b")
+    w = claim_worker.ClaimWorker(queue="hydraulic", host="host-c")
     assert w.queue == "hydraulic"
     assert w._is_ingest is True
     assert w._wake_channel == "ingest_job_ready"
@@ -1452,7 +1452,7 @@ def test_run_once_gpu_passes_current_model_for_affinity(monkeypatch):
         def require_model(self, model_id):
             return object()
 
-    worker = claim_worker.ClaimWorker(queue="gpu", host="box-a", model_cache=_Cache())
+    worker = claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=_Cache())
     worker.run_once()
     assert seen["current_model"] == "sdxl"
 
@@ -1509,6 +1509,79 @@ def test_run_forever_awaits_schema_before_listening(monkeypatch):
     assert order[0] == "await_schema"
     assert "listen" in order
     assert order.index("await_schema") < order.index("listen")
+
+
+def test_run_forever_gpu_starts_and_stops_llm_backend_factory(monkeypatch):
+    """The minimal LLM-factory hook: a GPU worker arms the backend factory's
+    config-change LISTEN invalidator after its heartbeat and stops it on teardown.
+    Driven through run_forever with a fake LISTEN + immediate stop, asserting the
+    gpu-gated factory.start()/stop() both fire (spied on the factory module)."""
+    from queue_workflows.llm_backends import factory as llm_factory
+
+    calls: list[str] = []
+    monkeypatch.setattr(llm_factory, "start", lambda: calls.append("start"))
+    monkeypatch.setattr(llm_factory, "stop", lambda: calls.append("stop"))
+
+    worker = claim_worker.ClaimWorker(queue="gpu", host="host-a")
+    # Skip the real schema gate, the hw sampler, and the boot park-gate; stop the
+    # loop on the first claim so run_forever drains once then tears down.
+    monkeypatch.setattr(worker, "await_schema", lambda: None)
+    monkeypatch.setattr(worker, "_park_until_enabled", lambda: True)
+    monkeypatch.setattr(worker, "run_once", lambda: worker.stop() or False)
+
+    import queue_workflows.hw_metrics as hw_metrics
+
+    class _Sampler:
+        def stop(self): ...
+        def join(self, timeout=None): ...
+
+    monkeypatch.setattr(
+        hw_metrics, "start_hw_metrics_sampler_flocked", lambda: _Sampler(),
+    )
+
+    import psycopg
+
+    class _FakeListen:
+        def execute(self, *a, **kw): ...
+        def notifies(self, *a, **kw): return iter(())
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(psycopg, "connect", lambda *a, **kw: _FakeListen())
+
+    worker.run_forever()
+    assert calls == ["start", "stop"], (
+        "a gpu worker must arm the LLM factory after the heartbeat and stop it on "
+        "teardown"
+    )
+
+
+def test_run_forever_cpu_does_not_touch_llm_backend_factory(monkeypatch):
+    """The hook is GPU-only: a CPU worker must never start/stop the LLM factory
+    (no co-tenant VLM on a CPU worker)."""
+    from queue_workflows.llm_backends import factory as llm_factory
+
+    calls: list[str] = []
+    monkeypatch.setattr(llm_factory, "start", lambda: calls.append("start"))
+    monkeypatch.setattr(llm_factory, "stop", lambda: calls.append("stop"))
+
+    worker = claim_worker.ClaimWorker(queue="cpu", host="host-c")
+    monkeypatch.setattr(worker, "await_schema", lambda: None)
+    monkeypatch.setattr(worker, "_park_until_enabled", lambda: True)
+    monkeypatch.setattr(worker, "run_once", lambda: worker.stop() or False)
+
+    import psycopg
+
+    class _FakeListen:
+        def execute(self, *a, **kw): ...
+        def notifies(self, *a, **kw): return iter(())
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(psycopg, "connect", lambda *a, **kw: _FakeListen())
+
+    worker.run_forever()
+    assert calls == [], "a CPU worker must not touch the LLM backend factory"
 
 
 def test_wait_for_schema_returns_when_version_present(monkeypatch):
@@ -1568,9 +1641,9 @@ def _heartbeat_enabled(monkeypatch):
 
 
 def test_heartbeat_emit_once_upserts_cpu_row(_heartbeat_enabled):
-    emitter = claim_worker.HeartbeatEmitter(queue="cpu", host_label="box-b")
+    emitter = claim_worker.HeartbeatEmitter(queue="cpu", host_label="host-c")
     emitter.emit_once()
-    row = _heartbeat_row("box-b", "cpu")
+    row = _heartbeat_row("host-c", "cpu")
     assert row is not None
     assert row["concurrency"] == 1
     assert row["current_model"] is None
@@ -1582,29 +1655,29 @@ def test_heartbeat_emit_once_gpu_reports_current_model(_heartbeat_enabled):
 
     cache = _Cache()
     emitter = claim_worker.HeartbeatEmitter(
-        queue="gpu", host_label="box-a", model_cache=cache,
+        queue="gpu", host_label="host-a", model_cache=cache,
     )
 
     emitter.emit_once()
-    assert _heartbeat_row("box-a", "gpu")["current_model"] is None
+    assert _heartbeat_row("host-a", "gpu")["current_model"] is None
 
     cache.current_model = "qwen_edit"
     emitter.emit_once()
-    assert _heartbeat_row("box-a", "gpu")["current_model"] == "qwen_edit"
+    assert _heartbeat_row("host-a", "gpu")["current_model"] == "qwen_edit"
 
     cache.current_model = None
     emitter.emit_once()
-    assert _heartbeat_row("box-a", "gpu")["current_model"] is None
+    assert _heartbeat_row("host-a", "gpu")["current_model"] is None
 
 
 @pytest.mark.parametrize("queue", ["fetch", "load", "hydro"])
 def test_heartbeat_emits_for_ingest_queues(queue, _heartbeat_enabled):
     # G5 + migration 0008: ingest-family workers heartbeat too (the cpu/gpu-only
     # CHECK is gone), with current_model NULL, so a host's queue gauge sees them.
-    emitter = claim_worker.HeartbeatEmitter(queue=queue, host_label="box-b")
+    emitter = claim_worker.HeartbeatEmitter(queue=queue, host_label="host-c")
     assert emitter._enabled is True
     emitter.emit_once()
-    row = _heartbeat_row("box-b", queue)
+    row = _heartbeat_row("host-c", queue)
     assert row is not None
     assert row["concurrency"] == 1
     assert row["current_model"] is None
@@ -1612,25 +1685,25 @@ def test_heartbeat_emits_for_ingest_queues(queue, _heartbeat_enabled):
 
 def test_heartbeat_disabled_by_env(monkeypatch):
     monkeypatch.setenv("AI_LEADS_DISABLE_WORKER_HEARTBEAT", "1")
-    emitter = claim_worker.HeartbeatEmitter(queue="cpu", host_label="box-b")
+    emitter = claim_worker.HeartbeatEmitter(queue="cpu", host_label="host-c")
     assert emitter._enabled is False
     emitter.start()
     assert emitter._thread is None
-    assert _heartbeat_row("box-b", "cpu") is None
+    assert _heartbeat_row("host-c", "cpu") is None
 
 
 def test_heartbeat_thread_refreshes_then_stops(_heartbeat_enabled):
     emitter = claim_worker.HeartbeatEmitter(
-        queue="cpu", host_label="box-b", interval_s=0.02,
+        queue="cpu", host_label="host-c", interval_s=0.02,
     )
     emitter.start()
-    first = _heartbeat_row("box-b", "cpu")
+    first = _heartbeat_row("host-c", "cpu")
     assert first is not None
 
     with connection() as c, c.cursor() as cur:
         cur.execute(
             "SELECT last_seen FROM worker_heartbeats "
-            "WHERE host_label='box-b' AND queue='cpu'"
+            "WHERE host_label='host-c' AND queue='cpu'"
         )
         before = cur.fetchone()["last_seen"]
 
@@ -1644,7 +1717,7 @@ def test_heartbeat_thread_refreshes_then_stops(_heartbeat_enabled):
         with connection() as c, c.cursor() as cur:
             cur.execute(
                 "SELECT last_seen FROM worker_heartbeats "
-                "WHERE host_label='box-b' AND queue='cpu'"
+                "WHERE host_label='host-c' AND queue='cpu'"
             )
             after = cur.fetchone()["last_seen"]
         if after > before:
@@ -1659,10 +1732,10 @@ def test_claim_worker_wires_heartbeat_emitter():
     class _Cache:
         current_model = "sdxl"
 
-    w = claim_worker.ClaimWorker(queue="gpu", host="box-a", model_cache=_Cache())
+    w = claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=_Cache())
     assert w.heartbeat._queue == "gpu"
-    assert w.heartbeat._host_label == "box-a"
+    assert w.heartbeat._host_label == "host-a"
     assert w.heartbeat._current_model() == "sdxl"
 
-    cpu = claim_worker.ClaimWorker(queue="cpu", host="box-b")
+    cpu = claim_worker.ClaimWorker(queue="cpu", host="host-c")
     assert cpu.heartbeat._current_model() is None

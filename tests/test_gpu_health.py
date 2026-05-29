@@ -21,7 +21,7 @@ from queue_workflows import gpu_health
 # ── pmon sm% parser ─────────────────────────────────────────────────────────
 
 
-# A real box-c sample (box-a2): the render PID busy at sm=95, the idle gnome/Xorg
+# A real box-c sample (host-b): the render PID busy at sm=95, the idle gnome/Xorg
 # G-type rows at "-", taken from `nvidia-smi pmon -c 1 -s u` inside a container.
 _PMON_BUSY = """\
 # gpu        pid  type    sm   mem   enc   dec   command

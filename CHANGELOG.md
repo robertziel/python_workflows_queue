@@ -8,6 +8,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Worker LLM-server capability advertisement (migration 0014): a worker publishes
+  `worker_heartbeats.llm_servers_available text[]` (default `{ollama}`) — which
+  server types it can actually run — set via `set_llm_servers_available([...])` /
+  `config.llm_servers_available` and emitted in the heartbeat alongside
+  `known_models`. Lets a UI gate its per-machine server-type control (an AMD box
+  that can't run the CUDA vllm sidecar advertises `{ollama}` only). Additive +
+  default-safe: other consumers and CPU/ingest workers keep the `{ollama}` baseline.
+- `queue_workflows.set_vllm_lifecycle(stop_fn, start_fn)` + the
+  `config.vllm_stop_fn` / `vllm_start_fn` hooks — a host that runs vllm as a
+  SEPARATE container wires how to stop/start it (ai_leads → docker Engine API
+  over the unix socket). The backend factory threads them into `VLLMBackend`'s
+  `kill_fn` / `ensure_up_fn`, so the in-worker idle supervisor can free the
+  sibling sidecar's VRAM WITHOUT a docker restart policy (which would re-trigger
+  the consumer's NFS boot race). `None` (the default) keeps the backend's
+  built-in pkill / no-op seams, so an unconfigured deployment is unchanged.
+- `BackendFactory` + `get_backend(host, queue)` — the per-`(host, queue)` owner
+  of the live `LLMBackend` + its `LLMSupervisor`, kept in sync with the DB config
+  (0013). A snapshot read-through cache preserves backend identity (request
+  counters + vllm state survive) while config is unchanged, rebuilds on an actual
+  change, and refreshes on a 10 s TTL or a `worker_llm_config_changed` NOTIFY
+  (gated by `AI_LEADS_DISABLE_LLM_CONFIG_LISTENER`). The gpu claim worker starts
+  the config listener at boot.
+- `VLLMBackend` (+ `VLLMState` enum) — the vllm concrete backend. A lifecycle
+  state machine (`DEAD`/`LOADING`/`SERVING`/`SLEEPING_L2`/`RELOADING`/
+  `UNSUPPORTED_SLEEP`) over fully-injected I/O seams (kill / ensure-up / health /
+  served-model probes — httpx lazy-imported only inside the defaults). `chat_url`
+  → `/v1/chat/completions`, `health_url` → `/health`. Model switch tries Sleep-L2
+  reload (stubbed `NotImplementedError` → sticky `UNSUPPORTED_SLEEP`) then falls
+  back to stop+bring-up. Satisfies the `LLMSupervisor` duck-typed surface so an
+  idle vllm sidecar gets SIGTERMed to free VRAM.
+- `queue_workflows.llm_backends` — the per-machine LLM server abstraction.
+  `LLMBackend` ABC owns RLock-guarded request accounting (`mark_request_start`/
+  `mark_request_end`/`inflight`/`idle_seconds`) so the idle supervisor can decide
+  when to free VRAM, and exposes `chat_url`/`health_url` for the HOST to POST
+  against (the library never makes the LLM call itself). `OllamaBackend` is the
+  trivial reference backend — lifecycle is inert (the daemon self-manages idle via
+  `OLLAMA_KEEP_ALIVE`). `LLMSupervisor` + the pure `vllm_should_stop(...)` decision
+  mirror `ModelCache`'s idle reaper: a daemon that SIGTERMs an idle vllm sidecar
+  (inert for ollama; gated by `AI_LEADS_DISABLE_LLM_SUPERVISOR`).
+- Per-machine LLM server config on `worker_controls` (migration 0013): new
+  `llm_server_type` (`'ollama'` | `'vllm'`, default `ollama`), `llm_parallelism`
+  (sidecar concurrent-request capacity — NOT the claim-worker concurrency, which
+  stays 1 by contract; default 1) and `vllm_idle_ttl_s` (idle window before the
+  vllm supervisor frees VRAM; default 60) columns. `worker_control.set_llm_config`
+  (partial COALESCE upsert, soft — never touches `desired_state`/`stop_policy`) +
+  `worker_control.llm_config_for -> LLMConfig` (default-safe on a pre-0012/pre-0013
+  DB). A dedicated `worker_llm_config_changed` NOTIFY channel (payload
+  `host|queue`, distinct from `worker_control`) lets a worker refresh its backend
+  without the hard-stop watcher mistaking a config edit for an OFF switch.
 - `paint_mask` gains an optional `initial_mask_opacity` field (0.0-1.0) —
   when a workflow step ships it, the dispatcher passes it through on the
   input spec so the host widget can render the pre-painted mask at that

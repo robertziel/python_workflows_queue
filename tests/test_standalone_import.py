@@ -82,6 +82,8 @@ def test_migrations_dir_ships_the_sql():
         "0010_node_job_watchdog_retries.sql",
         "0011_node_events.sql",
         "0012_worker_controls.sql",
+        "0013_worker_controls_llm.sql",
+        "0014_worker_heartbeats_llm_servers.sql",
     ]
 
 
