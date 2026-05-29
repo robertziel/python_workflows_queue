@@ -19,7 +19,7 @@ Orchestrate model jobs across the machines you already own — keep each model w
 **queue_workflows** is a small, self-hosted workflow engine where **the database _is_ the message bus**. Inserting a row enqueues work; a trigger fires `LISTEN/NOTIFY` inside the writer's transaction, so there's no "queued but never woken" gap. Workers claim jobs with `SELECT … FOR UPDATE SKIP LOCKED`, renew a lease while they run, and a dead or wedged worker's job is automatically re-queued onto a healthy peer. It runs DAG node-jobs and periodic background jobs over a handful of heterogeneous boxes, lets you flip any machine's worker **ON/OFF** on demand, and keeps a GPU model warm across same-model jobs — all on hardware you already own. _(It began as the queue core of a larger self-hosted stack, now extracted as one DRY, reusable library.)_
 
 <p align="center">
-  <img src="https://i.imgur.com/hw1me0m.png" alt="An example operator dashboard built on the engine's telemetry — per-host CPU/GPU/RAM, live queue depth, and per-(host, queue) ON/OFF toggles" width="760">
+  <img src="https://i.imgur.com/hw1me0m.png" alt="An example operator dashboard built on the engine's telemetry — per-host CPU/GPU/RAM, live queue depth, and per-(host, queue) ON/OFF toggles" width="480">
 </p>
 
 > **The dashboard is _not_ part of the package — the engine just emits what one needs.** The shot above is an example UI built on `pg_notify('hw_metrics', …)`, `worker_heartbeats`, the `node_queue.*_snapshot()` snapshots, and the `worker_control` ON/OFF toggles. Bring your own front-end — it's a great task to hand a coding agent.
