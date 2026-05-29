@@ -39,6 +39,7 @@ import logging
 import os
 import socket
 import threading
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from queue_workflows import node_queue
@@ -68,6 +69,39 @@ NOTIFY_CHANNEL = "worker_control"
 #: Catches a dropped NOTIFY and a control row written before this worker booted.
 #: Env-overridable for ops/tests (matches node_queue.STALE_WORKER_AFTER_S shape).
 WORKER_CONTROL_POLL_S = 5.0
+
+
+# ── per-machine LLM server config (migration 0013) ─────────────────────────────
+
+#: pg_notify channel the 0013 trigger fires when an LLM-config column changes.
+#: DELIBERATELY separate from NOTIFY_CHANNEL ('worker_control') so a config edit
+#: does NOT look like an ON/OFF change to the WorkerControlWatcher — the backend
+#: factory LISTENs this one for instant refresh (10 s TTL is the fallback).
+LLM_CONFIG_NOTIFY_CHANNEL = "worker_llm_config_changed"
+
+SERVER_TYPE_OLLAMA = "ollama"
+SERVER_TYPE_VLLM = "vllm"
+#: The valid LLM server types — kept in lockstep with the 0013 column CHECK.
+VALID_SERVER_TYPES = frozenset({SERVER_TYPE_OLLAMA, SERVER_TYPE_VLLM})
+
+#: Defaults mirroring the 0013 column DEFAULTs (single source of truth for the
+#: insert-COALESCE path and the default-safe llm_config_for fallback).
+DEFAULT_LLM_SERVER_TYPE = SERVER_TYPE_OLLAMA
+DEFAULT_LLM_PARALLELISM = 1
+DEFAULT_VLLM_IDLE_TTL_S = 60
+
+
+@dataclass(frozen=True)
+class LLMConfig:
+    """The per-``(host_label, queue)`` LLM server config a worker reads to decide
+    which backend to drive. ``parallelism`` is the SIDECAR's concurrent-request
+    capacity (ollama OLLAMA_NUM_PARALLEL / vllm --max-num-seqs), NOT the
+    claim-worker concurrency (1 by contract). ``vllm_idle_ttl_s`` is the idle
+    window before the supervisor SIGTERMs the vllm sidecar (ignored for ollama)."""
+
+    server_type: str = DEFAULT_LLM_SERVER_TYPE
+    parallelism: int = DEFAULT_LLM_PARALLELISM
+    vllm_idle_ttl_s: int = DEFAULT_VLLM_IDLE_TTL_S
 
 
 def _worker_control_poll_s() -> float:
@@ -189,6 +223,106 @@ def enable_worker(
     :func:`set_worker_control`."""
     set_worker_control(
         host_label, queue, desired_state=STATE_ON, requested_by=requested_by,
+    )
+
+
+# ── per-machine LLM server config accessors (migration 0013) ───────────────────
+
+
+def set_llm_config(
+    host_label: str,
+    queue: str,
+    *,
+    server_type: str | None = None,
+    parallelism: int | None = None,
+    vllm_idle_ttl_s: int | None = None,
+    conn: Any = None,
+) -> None:
+    """Upsert the LLM server config for a ``(host_label, queue)`` worker.
+
+    This is a SOFT config change, NOT the ON/OFF switch: it writes ONLY the LLM
+    columns and leaves ``desired_state`` / ``stop_policy`` untouched (a config
+    edit must never stop a running worker). The 0013 trigger fires the dedicated
+    :data:`LLM_CONFIG_NOTIFY_CHANNEL` so the worker's backend factory refreshes.
+
+    PARTIAL by design — pass only the field(s) you're changing. A ``None`` field
+    keeps the existing value on an UPDATE (``COALESCE(EXCLUDED, existing)``) and
+    falls back to the module default on the INSERT of a brand-new row (the
+    columns are NOT NULL, so we can't write NULL). Validates each given value
+    BEFORE the write (fail-before-write, matching :func:`set_worker_control`).
+
+    ``conn`` threads an optional host connection so the row + wake NOTIFY commit
+    inside the caller's txn; ``None`` autocommits on a pooled connection."""
+    if server_type is not None and server_type not in VALID_SERVER_TYPES:
+        raise ValueError(
+            f"server_type must be in {sorted(VALID_SERVER_TYPES)}, got {server_type!r}"
+        )
+    if parallelism is not None and parallelism < 1:
+        raise ValueError(f"parallelism must be >= 1, got {parallelism!r}")
+    if vllm_idle_ttl_s is not None and vllm_idle_ttl_s < 0:
+        raise ValueError(f"vllm_idle_ttl_s must be >= 0, got {vllm_idle_ttl_s!r}")
+
+    sql = """
+        INSERT INTO worker_controls
+            (host_label, queue, llm_server_type, llm_parallelism, vllm_idle_ttl_s,
+             updated_at)
+        VALUES (
+            %(host)s, %(queue)s,
+            COALESCE(%(server_type)s, %(def_type)s),
+            COALESCE(%(parallelism)s, %(def_par)s),
+            COALESCE(%(idle_ttl)s, %(def_ttl)s),
+            now()
+        )
+        ON CONFLICT (host_label, queue) DO UPDATE SET
+            llm_server_type = COALESCE(%(server_type)s, worker_controls.llm_server_type),
+            llm_parallelism = COALESCE(%(parallelism)s, worker_controls.llm_parallelism),
+            vllm_idle_ttl_s = COALESCE(%(idle_ttl)s, worker_controls.vllm_idle_ttl_s),
+            updated_at = now()
+    """
+    params = {
+        "host": host_label,
+        "queue": queue,
+        "server_type": server_type,
+        "parallelism": parallelism,
+        "idle_ttl": vllm_idle_ttl_s,
+        "def_type": DEFAULT_LLM_SERVER_TYPE,
+        "def_par": DEFAULT_LLM_PARALLELISM,
+        "def_ttl": DEFAULT_VLLM_IDLE_TTL_S,
+    }
+    if conn is not None:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+    else:
+        with connection() as own, own.cursor() as cur:
+            cur.execute(sql, params)
+
+
+def llm_config_for(host_label: str, queue: str) -> LLMConfig:
+    """The effective :class:`LLMConfig` for a worker: the row's LLM columns, or
+    the all-defaults config when no row exists.
+
+    Never raises on a partially-migrated DB — both ``UndefinedTable`` (pre-0012,
+    no worker_controls) and ``UndefinedColumn`` (0012 applied but not 0013) fall
+    back to defaults, so the engine + every consumer runs unchanged before 0013
+    is applied (mirrors :func:`get_worker_control`'s pre-0012 tolerance)."""
+    import psycopg
+
+    try:
+        with connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT llm_server_type, llm_parallelism, vllm_idle_ttl_s "
+                "FROM worker_controls WHERE host_label = %s AND queue = %s",
+                (host_label, queue),
+            )
+            row = cur.fetchone()
+    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
+        return LLMConfig()
+    if not row:
+        return LLMConfig()
+    return LLMConfig(
+        server_type=row["llm_server_type"],
+        parallelism=row["llm_parallelism"],
+        vllm_idle_ttl_s=row["vllm_idle_ttl_s"],
     )
 
 

@@ -46,6 +46,8 @@ __all__ = [
     "set_builtin_model_registrar",
     "set_workflow_provider",
     "set_invoke_context",
+    "set_vllm_lifecycle",
+    "set_llm_servers_available",
     "register_ingest_task",
     "set_ingest_schedule",
     "get_config",
@@ -193,6 +195,36 @@ def set_invoke_context(factory: Callable[[dict, dict], Any]) -> None:
     cfg = get_config()
     with cfg._lock:
         cfg.invoke_context = factory
+
+
+def set_llm_servers_available(servers: list[str]) -> None:
+    """Declare which LLM server types THIS host can actually run — published in
+    the worker heartbeat (migration 0014) so the queue UI gates its per-machine
+    server-type control. ``["ollama"]`` is the universal baseline; an NVIDIA host
+    with the vllm sidecar rendered passes ``["ollama", "vllm"]``. See
+    :attr:`queue_workflows.config.EngineConfig.llm_servers_available`."""
+    cfg = get_config()
+    with cfg._lock:
+        cfg.llm_servers_available = list(servers)
+
+
+def set_vllm_lifecycle(
+    stop_fn: Callable[[], bool],
+    start_fn: Callable[[str], None],
+) -> None:
+    """Wire the vllm-sidecar stop/start the idle supervisor + model-switch drive.
+
+    ``stop_fn() -> bool`` frees the sidecar's VRAM (True iff it stopped one);
+    ``start_fn(model_id) -> None`` (re)starts it serving ``model_id``. A host
+    that runs vllm as a SEPARATE container wires these so the in-worker supervisor
+    can control the SIBLING sidecar without a docker restart policy (ai_leads →
+    docker Engine API over the unix socket). Threaded into ``VLLMBackend`` by the
+    backend factory. See
+    :attr:`queue_workflows.config.EngineConfig.vllm_stop_fn`."""
+    cfg = get_config()
+    with cfg._lock:
+        cfg.vllm_stop_fn = stop_fn
+        cfg.vllm_start_fn = start_fn
 
 
 # ── ingest task + schedule registration (periodic work) ──

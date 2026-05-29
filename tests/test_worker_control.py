@@ -65,12 +65,12 @@ def _running_ingest_job(host: str, *, queue: str = "fetch") -> str:
 
 def test_set_and_get_round_trip():
     worker_control.set_worker_control(
-        "beelink", "gpu", desired_state="off", stop_policy="hard",
+        "host-c", "gpu", desired_state="off", stop_policy="hard",
         requested_by="op@example",
     )
-    row = worker_control.get_worker_control("beelink", "gpu")
+    row = worker_control.get_worker_control("host-c", "gpu")
     assert row is not None
-    assert row["host_label"] == "beelink"
+    assert row["host_label"] == "host-c"
     assert row["queue"] == "gpu"
     assert row["desired_state"] == "off"
     assert row["stop_policy"] == "hard"
@@ -100,18 +100,18 @@ def test_desired_state_for_defaults_on_when_absent():
 
 
 def test_desired_state_for_reads_off_and_on():
-    worker_control.disable_worker("spark", "gpu")
-    assert worker_control.desired_state_for("spark", "gpu") == "off"
-    worker_control.enable_worker("spark", "gpu")
-    assert worker_control.desired_state_for("spark", "gpu") == "on"
+    worker_control.disable_worker("host-a", "gpu")
+    assert worker_control.desired_state_for("host-a", "gpu") == "off"
+    worker_control.enable_worker("host-a", "gpu")
+    assert worker_control.desired_state_for("host-a", "gpu") == "on"
 
 
 def test_enable_disable_helpers():
-    worker_control.disable_worker("spark2", "gpu", requested_by="me")
-    r = worker_control.get_worker_control("spark2", "gpu")
+    worker_control.disable_worker("host-b", "gpu", requested_by="me")
+    r = worker_control.get_worker_control("host-b", "gpu")
     assert r["desired_state"] == "off" and r["stop_policy"] == "hard"
-    worker_control.enable_worker("spark2", "gpu")
-    assert worker_control.get_worker_control("spark2", "gpu")["desired_state"] == "on"
+    worker_control.enable_worker("host-b", "gpu")
+    assert worker_control.get_worker_control("host-b", "gpu")["desired_state"] == "on"
 
 
 # ── validation (fail-before-write) ────────────────────────────────────────────
@@ -192,17 +192,17 @@ def test_set_worker_control_fires_notify():
 
     with psycopg.connect(db_url(), autocommit=True) as conn:
         conn.execute("LISTEN worker_control")
-        worker_control.set_worker_control("beelink", "gpu", desired_state="off")
+        worker_control.set_worker_control("host-c", "gpu", desired_state="off")
         payloads = [n.payload for n in conn.notifies(timeout=3.0, stop_after=1)]
-    assert payloads == ["beelink:gpu"]
+    assert payloads == ["host-c:gpu"]
 
 
 # ── node_queue.requeue_running_for_worker (resume-style, scoped) ───────────────
 
 
 def test_requeue_running_for_worker_node():
-    job_id = _running_node_job("spark", queue="gpu")
-    n = node_queue.requeue_running_for_worker("spark", "gpu")
+    job_id = _running_node_job("host-a", queue="gpu")
+    n = node_queue.requeue_running_for_worker("host-a", "gpu")
     assert n == 1
     row = node_queue.get_node_job(job_id)
     assert row["status"] == "queued"
@@ -214,32 +214,32 @@ def test_requeue_running_for_worker_node():
 def test_requeue_does_not_increment_watchdog_retries():
     """Resume-style redistribution, NOT a watchdog retry — turning a machine off
     must not burn the per-job retry cap."""
-    job_id = _running_node_job("spark", queue="gpu")
-    node_queue.requeue_running_for_worker("spark", "gpu")
+    job_id = _running_node_job("host-a", queue="gpu")
+    node_queue.requeue_running_for_worker("host-a", "gpu")
     assert (node_queue.get_node_job(job_id).get("watchdog_retries") or 0) == 0
 
 
 def test_requeue_scoped_to_host():
-    mine = _running_node_job("spark", queue="gpu")
-    theirs = _running_node_job("beelink", queue="gpu")
-    assert node_queue.requeue_running_for_worker("spark", "gpu") == 1
+    mine = _running_node_job("host-a", queue="gpu")
+    theirs = _running_node_job("host-c", queue="gpu")
+    assert node_queue.requeue_running_for_worker("host-a", "gpu") == 1
     assert node_queue.get_node_job(mine)["status"] == "queued"
     assert node_queue.get_node_job(theirs)["status"] == "running"  # untouched
 
 
 def test_requeue_scoped_to_queue():
-    """beelink runs a cpu AND a gpu worker under one host_label: turning OFF the
+    """host-c runs a cpu AND a gpu worker under one host_label: turning OFF the
     gpu worker must not release the cpu worker's in-flight job."""
-    gpu_job = _running_node_job("beelink", queue="gpu")
-    cpu_job = _running_node_job("beelink", queue="cpu")
-    assert node_queue.requeue_running_for_worker("beelink", "gpu") == 1
+    gpu_job = _running_node_job("host-c", queue="gpu")
+    cpu_job = _running_node_job("host-c", queue="cpu")
+    assert node_queue.requeue_running_for_worker("host-c", "gpu") == 1
     assert node_queue.get_node_job(gpu_job)["status"] == "queued"
     assert node_queue.get_node_job(cpu_job)["status"] == "running"  # untouched
 
 
 def test_requeue_targets_ingest_table_for_ingest_queue():
-    job_id = _running_ingest_job("beelink", queue="fetch")
-    n = node_queue.requeue_running_for_worker("beelink", "fetch")
+    job_id = _running_ingest_job("host-c", queue="fetch")
+    n = node_queue.requeue_running_for_worker("host-c", "fetch")
     assert n == 1
     assert node_queue.get_ingest_job(job_id)["status"] == "queued"
     assert node_queue.get_ingest_job(job_id)["claimed_by"] is None

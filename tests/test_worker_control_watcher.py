@@ -52,9 +52,9 @@ def _worker(host: str, *, queue: str = "cpu") -> claim_worker.ClaimWorker:
 
 
 def test_check_once_hard_stops_when_off():
-    worker = _worker("spark")
-    job_id = _running_node_job("spark", queue="cpu")
-    worker_control.disable_worker("spark", "cpu")  # OFF, hard
+    worker = _worker("host-a")
+    job_id = _running_node_job("host-a", queue="cpu")
+    worker_control.disable_worker("host-a", "cpu")  # OFF, hard
 
     exits: list[int] = []
     w = worker_control.WorkerControlWatcher(
@@ -71,13 +71,13 @@ def test_check_once_hard_stops_when_off():
 
 
 def test_check_once_noop_when_on_or_absent():
-    worker = _worker("spark")
+    worker = _worker("host-a")
     exits: list[int] = []
     w = worker_control.WorkerControlWatcher(
         worker=worker, on_exit=lambda code: exits.append(code),
     )
     assert w.check_once() is False             # no row ⇒ ON
-    worker_control.enable_worker("spark", "cpu")
+    worker_control.enable_worker("host-a", "cpu")
     assert w.check_once() is False             # explicit ON
     assert exits == []
 
@@ -104,8 +104,8 @@ def test_check_once_falls_back_to_hard_for_unknown_policy():
 def test_check_once_scoped_to_this_workers_queue():
     """A cpu worker must not stop because the GPU worker on the same host was
     turned off."""
-    worker = _worker("beelink", queue="cpu")
-    worker_control.disable_worker("beelink", "gpu")  # gpu off, cpu still on
+    worker = _worker("host-c", queue="cpu")
+    worker_control.disable_worker("host-c", "gpu")  # gpu off, cpu still on
     exits: list[int] = []
     w = worker_control.WorkerControlWatcher(
         worker=worker, on_exit=lambda code: exits.append(code),

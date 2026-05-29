@@ -134,7 +134,7 @@ def test_claim_worker_gpu_starts_flocked_sampler(monkeypatch):
         lambda: started.append("gpu") or _FakeSampler(),
     )
 
-    worker = claim_worker.ClaimWorker(queue="gpu", host="spark")
+    worker = claim_worker.ClaimWorker(queue="gpu", host="host-a")
     _drive_run_forever(worker, monkeypatch)
 
     assert started == ["gpu"]
@@ -148,7 +148,7 @@ def test_claim_worker_non_gpu_does_not_start_sampler(queue, monkeypatch):
         lambda: started.append(queue) or _FakeSampler(),
     )
 
-    worker = claim_worker.ClaimWorker(queue=queue, host="spark")
+    worker = claim_worker.ClaimWorker(queue=queue, host="host-a")
     _drive_run_forever(worker, monkeypatch)
 
     assert started == []
@@ -160,7 +160,7 @@ def test_claim_worker_stops_sampler_on_exit(monkeypatch):
     monkeypatch.setattr(
         hw_metrics, "start_hw_metrics_sampler_flocked", lambda: sampler,
     )
-    worker = claim_worker.ClaimWorker(queue="gpu", host="spark")
+    worker = claim_worker.ClaimWorker(queue="gpu", host="host-a")
     _drive_run_forever(worker, monkeypatch)
     assert sampler.stopped is True
 
@@ -169,7 +169,7 @@ def test_claim_worker_gpu_sampler_loss_is_non_fatal(monkeypatch):
     monkeypatch.setattr(
         hw_metrics, "start_hw_metrics_sampler_flocked", lambda: None,
     )
-    worker = claim_worker.ClaimWorker(queue="gpu", host="beelink")
+    worker = claim_worker.ClaimWorker(queue="gpu", host="host-c")
     monkeypatch.setattr(worker, "await_schema", lambda: None)
     ran: list = []
     monkeypatch.setattr(worker, "run_once", lambda: ran.append(1) and False)

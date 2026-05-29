@@ -672,7 +672,7 @@ def flag_stale_workers_holding_running_jobs(
     ``j.claimed_by = wh.host_label`` AND ``j.queue = wh.queue``: the claim stamps
     ``claimed_by`` with the worker's host label (the value ``worker_heartbeats``
     is keyed on), and the queue match attributes the job to the right worker
-    PROCESS on a host that runs several (e.g. beelink runs a cpu AND a gpu worker
+    PROCESS on a host that runs several (e.g. host-c runs a cpu AND a gpu worker
     under one ``host_label`` — a wedged gpu worker must not flag the healthy cpu
     worker's row, and vice-versa). It stamps ``last_flagged_dead_at = now()`` on
     the matching rows and RETURNS them so the caller logs a clear, actionable
@@ -821,6 +821,7 @@ def upsert_worker_heartbeat(
     concurrency: int,
     current_model: str | None = None,
     known_models: Iterable[str] | None = None,
+    llm_servers_available: Iterable[str] | None = None,
     update_current_model: bool = True,
 ) -> None:
     """Upsert this worker's ``(host_label, queue)`` capacity row, refreshing
@@ -833,6 +834,13 @@ def upsert_worker_heartbeat(
     routing; ``None`` is normalised to an empty array so the column is never
     left stale.
 
+    ``llm_servers_available`` is the OBSERVED LLM-server capability (migration
+    0014) — which server types this host can actually run (e.g. ``['ollama']`` on
+    an AMD box, ``['ollama', 'vllm']`` on an NVIDIA host with the vllm sidecar).
+    ``None`` is normalised to the ``['ollama']`` baseline so the column is never
+    left stale and a caller that doesn't care (cpu/ingest workers, other consumer
+    projects) keeps the safe default.
+
     ``update_current_model`` controls whether the ON CONFLICT path
     overwrites ``current_model``.
 
@@ -843,6 +851,9 @@ def upsert_worker_heartbeat(
     staying latched from the previous incident.
     """
     known = list(known_models) if known_models is not None else []
+    llm_servers = (
+        list(llm_servers_available) if llm_servers_available is not None else ["ollama"]
+    )
     model_set = (
         "current_model = EXCLUDED.current_model," if update_current_model else ""
     )
@@ -851,16 +862,17 @@ def upsert_worker_heartbeat(
             f"""
             INSERT INTO worker_heartbeats
                 (host_label, queue, concurrency, last_seen,
-                 current_model, known_models)
-            VALUES (%s, %s, %s, now(), %s, %s)
+                 current_model, known_models, llm_servers_available)
+            VALUES (%s, %s, %s, now(), %s, %s, %s)
             ON CONFLICT (host_label, queue) DO UPDATE
                 SET concurrency   = EXCLUDED.concurrency,
                     {model_set}
                     known_models  = EXCLUDED.known_models,
+                    llm_servers_available = EXCLUDED.llm_servers_available,
                     last_seen     = EXCLUDED.last_seen,
                     last_flagged_dead_at = NULL
             """,
-            (host_label, queue, int(concurrency), current_model, known),
+            (host_label, queue, int(concurrency), current_model, known, llm_servers),
         )
 
 

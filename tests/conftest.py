@@ -28,6 +28,8 @@ import pytest
 os.environ.setdefault("AI_LEADS_DISABLE_HW_METRICS", "1")
 os.environ.setdefault("AI_LEADS_DISABLE_WORKER_HEARTBEAT", "1")
 os.environ.setdefault("AI_LEADS_DISABLE_GPU_IDLE_REAPER", "1")
+os.environ.setdefault("AI_LEADS_DISABLE_LLM_SUPERVISOR", "1")
+os.environ.setdefault("AI_LEADS_DISABLE_LLM_CONFIG_LISTENER", "1")
 
 # The env var the engine reads its DSN from, for THIS test session.
 _TEST_DB_ENV = "QUEUE_WORKFLOWS_TEST_DB_URL"

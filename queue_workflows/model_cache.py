@@ -51,7 +51,7 @@ def gpu_should_unload(
 
 # Default idle TTL (s); <= 0 disables. Default 60s (1 min) — offload a
 # warm model quickly so the shared GPU (the vLLM / ollama co-tenant on
-# spark) frees VRAM between bursts. Override per-host via the env var.
+# host-a) frees VRAM between bursts. Override per-host via the env var.
 DEFAULT_IDLE_TTL_S = float(os.environ.get("AI_LEADS_GPU_MODEL_IDLE_TTL_S", "60"))
 
 

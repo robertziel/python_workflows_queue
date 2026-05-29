@@ -142,7 +142,7 @@ def test_run_node_holds_active_during_inference_so_reaper_keeps_model():
         required_model="qwen_edit",
     )
 
-    worker = _claim_worker.ClaimWorker(queue="gpu", host="spark", model_cache=cache)
+    worker = _claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=cache)
     assert worker.run_once() is True
 
     assert observed["active_during"] >= 1
@@ -164,7 +164,7 @@ def test_run_node_releases_active_after_job_so_reaper_can_unload():
         required_model="qwen_edit",
     )
 
-    worker = _claim_worker.ClaimWorker(queue="gpu", host="spark", model_cache=cache)
+    worker = _claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=cache)
     worker.run_once()
 
     assert cache.active == 0
@@ -187,7 +187,7 @@ def test_run_node_releases_active_even_when_node_raises():
         required_model="qwen_edit",
     )
 
-    worker = _claim_worker.ClaimWorker(queue="gpu", host="spark", model_cache=cache)
+    worker = _claim_worker.ClaimWorker(queue="gpu", host="host-a", model_cache=cache)
     assert worker.run_once() is True
     assert _node_queue.get_node_job(job_id)["status"] == "failed"
     assert cache.active == 0
@@ -204,6 +204,6 @@ def test_run_node_cpu_does_not_touch_busy_bracket():
     job_id = _node_queue.enqueue_node_job(
         run_id=run_id, node_id="c", node_module="_idle_cpu_node", queue="cpu",
     )
-    worker = _claim_worker.ClaimWorker(queue="cpu", host="beelink")
+    worker = _claim_worker.ClaimWorker(queue="cpu", host="host-c")
     assert worker.run_once() is True
     assert _node_queue.get_node_job(job_id)["status"] == "completed"

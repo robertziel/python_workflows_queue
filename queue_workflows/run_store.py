@@ -132,7 +132,7 @@ def reenqueue_running_for_resume() -> int:
     watchdog hard-exit, or an operator fleet-restart) without marking its node
     terminal. Such a run must go back to the queue so it can finish — possibly
     on a *different* host (e.g. the Blackwell qwen stall hangs a GB10 but
-    completes on beelink). The old behaviour capped at 5 resumes then marked the
+    completes on host-c). The old behaviour capped at 5 resumes then marked the
     run ``failed`` ("[auto-resume cap reached]"), which conflated a poison-pill
     run with a healthy one that merely rode through restarts/host-specific hangs
     — and killed the healthy case. ``resume_count`` is still bumped (visibility:

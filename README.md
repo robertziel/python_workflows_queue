@@ -94,6 +94,10 @@ rationale.
 - [`docs/storage_backends.md`](docs/storage_backends.md) — the pluggable
   `StorageBackend` SPI (`pg` / `redis` / `mongodb`): the contract, the
   capability matrix, and the integration boundary.
+- [`docs/llm_backends.md`](docs/llm_backends.md) — the per-machine ollama / vLLM
+  server abstraction: the `LLMBackend` port, the idle supervisor, the
+  config-synced factory, and the `set_vllm_lifecycle` /
+  `set_llm_servers_available` host seams (migrations 0013/0014).
 
 ## Quick start
 
@@ -187,21 +191,21 @@ process sharing the DB can flip it.
 ```bash
 # CLI (console script) — defaults host to the local hostname:
 queue-worker-control --queue gpu --off            # hard-stop this box's gpu worker
-queue-worker-control --queue gpu --on  --host spark   # turn it back on
+queue-worker-control --queue gpu --on  --host host-a   # turn it back on
 ```
 
 ```python
 from queue_workflows import worker_control
 
-worker_control.disable_worker("spark", "gpu")     # hard stop + stay off
-worker_control.enable_worker("spark", "gpu")      # resume in place (no restart)
-worker_control.desired_state_for("spark", "gpu")  # 'on' | 'off'  (absent ⇒ 'on')
+worker_control.disable_worker("host-a", "gpu")     # hard stop + stay off
+worker_control.enable_worker("host-a", "gpu")      # resume in place (no restart)
+worker_control.desired_state_for("host-a", "gpu")  # 'on' | 'off'  (absent ⇒ 'on')
 ```
 
 ```sql
 -- or a plain SQL write from any consumer sharing the DB (the trigger wakes the worker):
 INSERT INTO worker_controls (host_label, queue, desired_state, stop_policy, requested_by)
-VALUES ('spark', 'gpu', 'off', 'hard', 'ops')
+VALUES ('host-a', 'gpu', 'off', 'hard', 'ops')
 ON CONFLICT (host_label, queue) DO UPDATE
   SET desired_state = EXCLUDED.desired_state, updated_at = now();
 ```

@@ -36,10 +36,10 @@ def test_claim_cpu_stamps_claimed_by_and_future_lease():
         run_id=run_id, node_id="a", node_module="x", queue="cpu",
     )
     before = datetime.now(timezone.utc)
-    claimed = node_queue.claim_next_cpu_job(0, host="beelink", lease_s=600)
+    claimed = node_queue.claim_next_cpu_job(0, host="host-c", lease_s=600)
     assert claimed is not None
     assert claimed["status"] == "running"
-    assert claimed["claimed_by"] == "beelink"
+    assert claimed["claimed_by"] == "host-c"
     assert claimed["lease_expires_at"] is not None
     assert claimed["lease_expires_at"] > before
 
@@ -51,10 +51,10 @@ def test_claim_gpu_stamps_claimed_by_and_future_lease():
         required_model="sdxl",
     )
     claimed = node_queue.claim_next_gpu_job(
-        0, current_model="sdxl", host="spark", lease_s=900,
+        0, current_model="sdxl", host="host-a", lease_s=900,
     )
     assert claimed is not None
-    assert claimed["claimed_by"] == "spark"
+    assert claimed["claimed_by"] == "host-a"
     delta = claimed["lease_expires_at"] - datetime.now(timezone.utc)
     assert timedelta(seconds=600) < delta < timedelta(seconds=1200)
 
@@ -102,7 +102,7 @@ def test_warm_gpu_worker_claims_matching_model_first():
                                 queue="gpu", required_model="sdxl")
     flux = node_queue.enqueue_node_job(run_id=run_id, node_id="b", node_module="x",
                                        queue="gpu", required_model="flux")
-    claimed = node_queue.claim_next_gpu_job(0, current_model="flux", host="spark")
+    claimed = node_queue.claim_next_gpu_job(0, current_model="flux", host="host-a")
     assert claimed["id"] == flux
 
 
@@ -113,7 +113,7 @@ def test_cold_gpu_worker_claims_by_priority_then_fifo():
                                         priority=100)
     node_queue.enqueue_node_job(run_id=run_id, node_id="b", node_module="x",
                                 queue="gpu", required_model="flux", priority=100)
-    claimed = node_queue.claim_next_gpu_job(0, current_model=None, host="beelink")
+    claimed = node_queue.claim_next_gpu_job(0, current_model=None, host="host-c")
     assert claimed["id"] == early
 
 
@@ -124,7 +124,7 @@ def test_warm_affinity_respects_null_required_model_with_null_current():
                                         priority=100)
     untyped = node_queue.enqueue_node_job(run_id=run_id, node_id="b", node_module="x",
                                           queue="gpu", priority=100)
-    claimed = node_queue.claim_next_gpu_job(0, current_model=None, host="spark")
+    claimed = node_queue.claim_next_gpu_job(0, current_model=None, host="host-a")
     assert claimed["id"] == untyped
     assert typed
 
@@ -141,11 +141,11 @@ def test_host_priority_high_takes_head_low_takes_tail():
                                          queue="gpu", required_model="sdxl",
                                          priority=100)
     low = node_queue.claim_next_gpu_job(
-        0, current_model="sdxl", host="beelink", host_priority=-1,
+        0, current_model="sdxl", host="host-c", host_priority=-1,
     )
     assert low["id"] == second
     high = node_queue.claim_next_gpu_job(
-        0, current_model="sdxl", host="spark", host_priority=10,
+        0, current_model="sdxl", host="host-a", host_priority=10,
     )
     assert high["id"] == first
 
@@ -167,9 +167,9 @@ def test_host_priority_applies_to_cpu_too():
                                         queue="cpu", priority=100)
     second = node_queue.enqueue_node_job(run_id=run_id, node_id="b", node_module="x",
                                          queue="cpu", priority=100)
-    low = node_queue.claim_next_cpu_job(0, host="beelink", host_priority=-1)
+    low = node_queue.claim_next_cpu_job(0, host="host-c", host_priority=-1)
     assert low["id"] == second
-    high = node_queue.claim_next_cpu_job(0, host="spark", host_priority=10)
+    high = node_queue.claim_next_cpu_job(0, host="host-a", host_priority=10)
     assert high["id"] == first
 
 
@@ -362,14 +362,43 @@ def _heartbeat(host, queue, model):
     )
 
 
+def test_heartbeat_advertises_llm_servers_available():
+    """A worker advertises which LLM servers it can run (migration 0014) so the
+    queue UI can gate its per-machine server-type control."""
+    node_queue.upsert_worker_heartbeat(
+        host_label="host-a", queue="gpu", concurrency=1,
+        llm_servers_available=["ollama", "vllm"],
+    )
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT llm_servers_available FROM worker_heartbeats "
+            "WHERE host_label='host-a' AND queue='gpu'"
+        )
+        assert cur.fetchone()["llm_servers_available"] == ["ollama", "vllm"]
+
+
+def test_heartbeat_llm_servers_defaults_to_ollama_baseline():
+    """Omitting the capability ⇒ the ``['ollama']`` baseline, never NULL — so a
+    cpu/ingest worker (or another consumer project) leaves a safe value."""
+    node_queue.upsert_worker_heartbeat(
+        host_label="host-c", queue="cpu", concurrency=1,
+    )
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT llm_servers_available FROM worker_heartbeats "
+            "WHERE host_label='host-c' AND queue='cpu'"
+        )
+        assert cur.fetchone()["llm_servers_available"] == ["ollama"]
+
+
 def test_clear_current_model_nulls_the_busy_signal_and_ages_last_seen():
-    _heartbeat("spark", "gpu", "qwen_edit")
-    out = node_queue.clear_worker_current_model("spark", "gpu")
+    _heartbeat("host-a", "gpu", "qwen_edit")
+    out = node_queue.clear_worker_current_model("host-a", "gpu")
     assert out is not None and out["current_model"] is None
     with connection() as c, c.cursor() as cur:
         cur.execute(
             "SELECT current_model, last_seen < now() - interval '30 seconds' AS stale "
-            "FROM worker_heartbeats WHERE host_label='spark' AND queue='gpu'"
+            "FROM worker_heartbeats WHERE host_label='host-a' AND queue='gpu'"
         )
         r = cur.fetchone()
     assert r["current_model"] is None
@@ -377,12 +406,12 @@ def test_clear_current_model_nulls_the_busy_signal_and_ages_last_seen():
 
 
 def test_clear_current_model_keeps_last_seen_when_mark_stale_false():
-    _heartbeat("spark", "gpu", "qwen_edit")
-    node_queue.clear_worker_current_model("spark", "gpu", mark_stale=False)
+    _heartbeat("host-a", "gpu", "qwen_edit")
+    node_queue.clear_worker_current_model("host-a", "gpu", mark_stale=False)
     with connection() as c, c.cursor() as cur:
         cur.execute(
             "SELECT current_model, last_seen > now() - interval '30 seconds' AS fresh "
-            "FROM worker_heartbeats WHERE host_label='spark' AND queue='gpu'"
+            "FROM worker_heartbeats WHERE host_label='host-a' AND queue='gpu'"
         )
         r = cur.fetchone()
     assert r["current_model"] is None
@@ -394,13 +423,13 @@ def test_clear_current_model_noop_returns_none_when_row_absent():
 
 
 def test_clear_current_model_only_touches_the_named_worker():
-    _heartbeat("spark", "gpu", "qwen_edit")
-    _heartbeat("spark2", "gpu", "wan_i2v")
-    node_queue.clear_worker_current_model("spark", "gpu")
+    _heartbeat("host-a", "gpu", "qwen_edit")
+    _heartbeat("host-b", "gpu", "wan_i2v")
+    node_queue.clear_worker_current_model("host-a", "gpu")
     with connection() as c, c.cursor() as cur:
         cur.execute(
             "SELECT current_model FROM worker_heartbeats "
-            "WHERE host_label='spark2' AND queue='gpu'"
+            "WHERE host_label='host-b' AND queue='gpu'"
         )
         assert cur.fetchone()["current_model"] == "wan_i2v"
 
