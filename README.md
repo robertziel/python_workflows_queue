@@ -4,9 +4,11 @@
 
 ### Turn your local GPUs into one self-healing inference fleet.
 
+> A local-GPU inference-fleet workflow engine that uses Postgres as the queue/message bus to dispatch DAG and periodic ingest jobs across worker processes (e.g. running warm-cached models on GPUs).
+
 Orchestrate model jobs across the machines you already own — keep each model warm, flip any box ON/OFF, auto-recover from crashes — with nothing but Postgres. No Celery, no Redis, no cluster scheduler to babysit.
 
-⭐ **Give me a star if you find it useful :)**
+⭐⭐⭐
 
 [![Release](https://img.shields.io/github/v/release/robertziel/python_workflows_queue?sort=semver&label=release)](https://github.com/robertziel/python_workflows_queue/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
