@@ -31,6 +31,7 @@ Orchestrate model jobs across the machines you already own — keep each model w
 ## Table of Contents
 
 - [Why queue_workflows?](#-why-queue_workflows)
+- [How it compares (vs. Triton Inference Server)](#-how-it-compares-vs-triton-inference-server)
 - [Highlights](#-highlights)
 - [Installation](#installation)
 - [Core concepts](#-core-concepts)
@@ -57,7 +58,32 @@ The pitch in one line: **your Postgres is already the most durable thing you run
 
 **Look elsewhere when** you need a hosted UI, multi-region durability, or versioned-workflow replay at large scale — that's a different class of tool.
 
-> ⭐ **Give me a star if you find it useful :)** — it genuinely helps other small‑fleet operators find the project.
+---
+
+## 🆚 How it compares (vs. Triton Inference Server)
+
+People often ask how this relates to [NVIDIA Triton Inference Server](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/index.html). **They solve different problems and compose rather than compete.** Triton is a *model server* — it loads models into one process and answers inference requests synchronously, optimized for raw throughput. queue_workflows is a *durable job orchestrator* — it routes async work across a fleet of boxes with crash recovery, using Postgres as the bus. Triton makes one model fast on one node; queue_workflows reliably moves a unit of work to whichever node holds the right warm model and survives failure. You can even run **Triton (or vLLM/ollama) _as a node body inside_ a queue_workflows job** — the engine schedules and recovers the work, Triton serves the tensors.
+
+| Dimension | **queue_workflows** | **Triton Inference Server** |
+|---|---|---|
+| **Category** | Durable async workflow / job-queue engine | Real-time model inference server |
+| **Core interaction** | `INSERT` a row → job runs later, durably | HTTP/gRPC request → synchronous response |
+| **Latency profile** | Async, seconds–hours; survives restarts | Sub-second request/response |
+| **Unit of work** | Arbitrary node body / ingest task (`run(...)`); a model call is just one kind | A model inference (tensors in → tensors out) |
+| **Multi-step / pipelines** | First-class **DAG** dispatch with a durable outbox, deps, skip-if, fan-out | Model **ensembles** + Business Logic Scripting (in-process model graph) |
+| **Throughput tricks** | None by design — concurrency-1 per worker by contract | **Dynamic batching**, concurrent model execution, sequence batching |
+| **Model lifecycle** | Warm `ModelCache`, idle-unload, **warm-model affinity routing** across the fleet | Model repository: load/unload, versioning, per-model scheduler config |
+| **Framework backends** | Host-agnostic — you bring `run(...)`; no framework coupling | TensorRT, PyTorch, ONNX, OpenVINO, vLLM, TensorRT-LLM, FIL, Python |
+| **Fleet & scheduling** | Postgres `FOR UPDATE SKIP LOCKED` claim + `LISTEN/NOTIFY`, lease + reclaim across N heterogeneous boxes | Per-node server; fleet scaling delegated to **Kubernetes** / autoscaler |
+| **Crash recovery** | Lease lapse → orchestrator re-queues onto a healthy peer; wall-clock / stall / GPU-health watchdogs re-queue-and-retry | K8s health endpoints restart the pod; no built-in job re-queue |
+| **Operator control** | Per-`(host, queue)` **ON/OFF** control plane (hard-stop frees VRAM) | No fleet ON/OFF; managed by the orchestrator/K8s |
+| **State & durability** | Everything in Postgres — jobs, leases, append-only event log, heartbeats | Stateless server; metrics only, no durable job state |
+| **Background / periodic work** | First-class **ingest jobs** + scheduler ticker | Out of scope — request-driven only |
+| **Dependencies** | Just **Postgres** (psycopg 3); optional redis/mongo backends | NVIDIA runtime / CUDA; typically GPU + K8s for scale |
+| **Protocols** | None exposed — the DB *is* the bus | HTTP/REST + gRPC (KServe), C/Java in-process API |
+| **Telemetry** | `pg_notify` hw-metrics, heartbeats, queue snapshots, dead-worker detection | Prometheus metrics (GPU util, throughput, latency), request tracing |
+
+**Where they overlap:** both keep models warm and care about GPU efficiency. **Where they don't:** Triton has no durable queue, no DAG, no cross-host crash-recovery, no operator ON/OFF, and no periodic work; queue_workflows has no dynamic batching, no native framework backends, and isn't a low-latency request server. Use Triton to make an inference *fast*; use queue_workflows to make the *work* reliable across the fleet.
 
 ---
 
@@ -451,8 +477,6 @@ The `cpu` worker from step 4 claims the `greet` node, runs it, writes `hello.txt
 </p>
 
 > This engine was extracted from a larger self‑hosted stack and generalized into a standalone library — so the example above is the same machinery that runs in production, just trimmed to one node.
->
-> Found it useful? **Give me a star :)** ⭐
 
 ---
 
@@ -676,7 +700,3 @@ PRs and issues are **welcome** — bug reports, backend providers, docs, and rou
 **MIT** © Robert Zieliński — see [`LICENSE`](LICENSE). Use it, fork it, ship it.
 
 📓 [Changelog](CHANGELOG.md) · 📚 [Docs](docs/) · 🏷️ [Releases](https://github.com/robertziel/python_workflows_queue/releases)
-
-### ⭐ Give me a star if you find it useful :)
-
-If `queue_workflows` saved you from standing up a broker, **drop a star on the repo** — it's the simplest way to say thanks and helps others find it.
