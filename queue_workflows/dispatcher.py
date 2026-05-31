@@ -557,10 +557,16 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
         if det_options:
             spec["detections_rel_path"] = det_options[0].get("rel_path")
             spec["detections_abs_path"] = det_options[0].get("abs_path")
-    elif widget == "paint_mask":
+    elif widget in ("paint_mask", "paint_fence_regions"):
         # Resolves the source image the user will paint a mask on. The widget
         # uploads a binary mask PNG back through the standard multipart pipe;
         # the spec just needs to tell it which image to display.
+        #
+        # ``paint_fence_regions`` (the one-canvas Fence/Gate/Concrete labeled
+        # painter) shares this exact source resolution — including the scalar
+        # ``$from: pick_clean.clean_plate_path`` abs-path wrap below. It simply
+        # carries no ``initial_mask`` (regions are painted from scratch, not
+        # predefined), so the optional initial_mask block further down no-ops.
         context = _run_context_for_refs(run)
         source = step.get("source")
         try:

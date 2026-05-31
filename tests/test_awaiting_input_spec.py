@@ -541,3 +541,70 @@ def test_paint_mask_source_wraps_scalar_abs_path_from_upstream_pick(tmp_path, pr
     # rel_path is the path relative to ``out_dir`` — the same convention
     # the file-endpoint uses when streaming the artefact.
     assert spec.get("source_rel_path") == "remove_fence/lane_sd15_inpaint/no_fence.jpg"
+
+
+def test_paint_fence_regions_source_wraps_scalar_abs_path_like_paint_mask(tmp_path, provider):
+    """The one-canvas Fence/Gate/Concrete labeled painter
+    (``paint_fence_regions``) shares paint_mask's source resolution.
+
+    A scalar ``$from: pick_clean.clean_plate_path`` pick must surface as
+    the spec's ``source_abs_path`` so the widget renders that exact clean
+    plate. Pins the dispatcher branch that was MISSING entirely: with no
+    ``elif`` arm for ``paint_fence_regions`` the spec carried no
+    ``source_options`` key at all and the widget showed its missing-source
+    error instead of the painter (observed live: run parked at paint_fence
+    rendered a blank/alert pane). The fix folds the widget into the
+    paint_mask arm; its absent ``initial_mask`` simply no-ops.
+    """
+    from queue_workflows import dispatcher, node_queue
+
+    name = "_pick_then_paint_fence"
+    provider.workflows[name] = {
+        "name": name, "mode": "node",
+        "steps": [
+            {"id": "pick_clean", "kind": "input", "widget": "choose_one",
+             "prompt": "pick", "target": "clean_plate_path",
+             "depends_on": []},
+            {"id": "paint_fence", "kind": "input", "widget": "paint_fence_regions",
+             "prompt": "paint", "target": "labeled_mask_path",
+             "source": {"$from": "pick_clean.clean_plate_path"},
+             "depends_on": ["pick_clean"]},
+        ],
+    }
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    lane_dir = out_dir / "remove_fence" / "lane_qwen_erase"
+    lane_dir.mkdir(parents=True)
+    picked = lane_dir / "no_fence.jpg"
+    picked.write_bytes(b"\xff\xd8\xff fake")
+
+    run_id = _insert_run(name, out_dir)
+
+    pick_job = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="pick_clean",
+        node_module="__input__choose_one", queue="cpu",
+        inputs={"widget": "choose_one", "target": "clean_plate_path"},
+        priority=50,
+    )
+    import json
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_node_jobs SET status='completed', "
+            "context_delta=%s::jsonb, finished_at=now() WHERE id=%s",
+            (json.dumps({"clean_plate_path": str(picked)}), pick_job),
+        )
+        conn.commit()
+
+    _insert_awaiting_job(run_id, "paint_fence", target="labeled_mask_path")
+    dispatcher.on_node_awaiting_input(run_id, "paint_fence")
+
+    spec = _job_spec(run_id, "paint_fence")
+    assert spec is not None, "paint_fence_regions spec should be persisted"
+    options = spec.get("source_options") or []
+    assert len(options) == 1, (
+        f"source_options must wrap the scalar pick into ONE option, got {options!r}"
+    )
+    assert options[0]["abs_path"] == str(picked)
+    assert spec.get("source_abs_path") == str(picked)
+    assert spec.get("source_rel_path") == "remove_fence/lane_qwen_erase/no_fence.jpg"
