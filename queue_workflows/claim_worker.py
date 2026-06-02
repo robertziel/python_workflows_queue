@@ -1388,16 +1388,46 @@ class ClaimWorker:
     def run_once(self) -> bool:
         """Claim the next ready job and run it to a terminal state. Returns
         ``True`` if a job was claimed + executed, ``False`` when the queue had
-        nothing claimable (caller should block on NOTIFY)."""
+        nothing claimable (caller should block on NOTIFY).
+
+        GPU per-machine cap (both lanes, one budget). A GPU worker runs two
+        claim lanes in ONE host process — the inline diffusion lane (here) and
+        the PAR-sized VLM pool feeder. A machine's TOTAL concurrent node-jobs
+        (inline + pool) must never exceed PAR (``worker_controls.llm_parallelism``).
+        The pool feeder already enforces its half (``_pool_budget = PAR -
+        inline_running`` — it yields a slot to a running inline job). This is the
+        mirror gate the inline lane was MISSING: before claiming, it reserves its
+        slot under ``_pool_lock`` gated on ``_pool_inflight < PAR``. So a machine
+        already full of pool work claims NO inline job — it returns ``False`` and
+        the queued job spills to an idle peer instead of stacking PAR+1 here (the
+        ``2/1`` over-claim that starved an idle box). One gpu worker per host ⇒
+        the in-process lock is the whole coordination surface."""
+        if self.queue == "gpu":
+            par = self._pool_parallelism()
+            with self._pool_lock:
+                # The inline lane contributes one slot; admit it only if the
+                # machine's total (pool already in flight + this inline) stays
+                # <= PAR. Reserve _inline_running under the SAME lock the feeder
+                # reads so the two lanes can't both slip past a PAR=1 budget.
+                if self._pool_inflight >= par:
+                    return False
+                self._inline_running = True
+            try:
+                job = self._claim()
+                if job is None:
+                    return False
+                return self._run_node(job)
+            finally:
+                self._inline_running = False
+        # CPU / ingest: a single serial poll-claim loop, no pool lane — claim
+        # then run, byte-identical to before.
         job = self._claim()
         if job is None:
             return False
         if self._is_ingest:
             return self._run_ingest(job)
-        # The inline lane holds the warm-model (diffusion) slot for this job's
-        # duration. Flag it so the gpu VLM-pool feeder budgets PAR - 1 while the
-        # diffusion runs — capping the machine's TOTAL node-jobs at PAR (the
-        # diffusion takes one of the PAR slots). Harmless for cpu (no feeder).
+        # The inline lane holds the warm-model slot for this job's duration; the
+        # flag is harmless for cpu (no feeder reads it).
         self._inline_running = True
         try:
             return self._run_node(job)
