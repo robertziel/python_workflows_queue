@@ -76,6 +76,14 @@ class EngineConfig:
     # ── value config ──────────────────────────────────────────────────────────
     #: GPU model ids on the tight per-job video render budget (claim_worker).
     video_model_ids: frozenset[str] = frozenset()
+    #: Node modules that are genuine VLM-facade (HTTP to the per-host vLLM/ollama
+    #: server) and therefore SAFE to run PAR-concurrently in the GPU pool lane.
+    #: When non-empty, every OTHER no-model GPU job (heavy in-process work —
+    #: erasers, detectors, builders) is routed to the conc-1 inline lane instead,
+    #: so a PAR>1 box never runs several heavy in-process GPU loads at once.
+    #: Empty (default) ⇒ legacy behaviour: every no-model GPU job is pool-eligible
+    #: (keeps other consumers byte-identical).
+    vlm_pool_node_modules: frozenset[str] = frozenset()
     #: Dotted package the node-module resolver imports under (e.g.
     #: ``"workflows.nodes"``). Empty ⇒ the stored ``node_module`` is treated as
     #: a fully-qualified importable module name.

@@ -291,6 +291,7 @@ def claim_next_gpu_job(
     host_priority: int = 0,
     known_models: Iterable[str] | None = None,
     require_model: bool | None = None,
+    pool_modules: Iterable[str] | None = None,
 ) -> dict[str, Any] | None:
     """Atomically grab the next queued GPU job (the GPU claim worker's
     claim).
@@ -315,13 +316,21 @@ def claim_next_gpu_job(
       claim-any behaviour; ``True`` adds ``AND c.required_model IS NOT NULL``
       (model-backed diffusion jobs only); ``False`` adds
       ``AND c.required_model IS NULL`` (no-model GPU jobs — VLM/HTTP — only).
-      Orthogonal to and ANDed with the capability gate above."""
+      Orthogonal to and ANDed with the capability gate above.
+    * **VLM-pool eligibility** (``pool_modules``) — when non-empty, only these
+      node modules are genuine VLM-facade (pool-safe). The POOL lane then claims
+      a no-model job ONLY if its ``node_module`` is in ``pool_modules``; the
+      INLINE lane additionally claims no-model jobs whose module is NOT in the
+      set, so heavy in-process GPU work (erasers, detectors, builders) runs on
+      the conc-1 serial lane instead of PAR-concurrently in the pool. Empty /
+      unset ⇒ legacy split (every no-model GPU job is pool-eligible)."""
     order = (
         f"{_AFFINITY_TERM}, "
         f"c.priority ASC, "
         f"{_HOST_DIR_TERM}"
     )
     known = [m for m in (known_models or []) if m]
+    pool = [m for m in (pool_modules or []) if m]
     capability_terms = []
     if known:
         capability_terms.append(
@@ -329,9 +338,26 @@ def claim_next_gpu_job(
             "OR c.required_model = ANY(%(known_models)s::text[]))"
         )
     if require_model is True:
-        capability_terms.append("AND c.required_model IS NOT NULL")
+        if pool:
+            # Inline lane: model-backed jobs PLUS no-model jobs whose module is
+            # NOT VLM-pool-eligible — heavy in-process GPU work (erasers,
+            # detectors, builders) runs conc-1 here, never concurrently in the
+            # pool.
+            capability_terms.append(
+                "AND (c.required_model IS NOT NULL "
+                "OR NOT (c.node_module = ANY(%(pool_modules)s::text[])))"
+            )
+        else:
+            capability_terms.append("AND c.required_model IS NOT NULL")
     elif require_model is False:
-        capability_terms.append("AND c.required_model IS NULL")
+        if pool:
+            # Pool lane: no-model jobs whose module IS VLM-pool-eligible only.
+            capability_terms.append(
+                "AND c.required_model IS NULL "
+                "AND c.node_module = ANY(%(pool_modules)s::text[])"
+            )
+        else:
+            capability_terms.append("AND c.required_model IS NULL")
     capability = " ".join(capability_terms)
     sql = _CLAIM_SQL.format(order=order, capability=capability)
     params = {
@@ -344,6 +370,8 @@ def claim_next_gpu_job(
     }
     if known:
         params["known_models"] = known
+    if pool:
+        params["pool_modules"] = pool
     with connection() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
         return cur.fetchone()

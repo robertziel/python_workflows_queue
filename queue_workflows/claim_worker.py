@@ -1336,6 +1336,7 @@ class ClaimWorker:
                 host_priority=self.host_priority,
                 known_models=model_registry.known_ids(),
                 require_model=True,
+                pool_modules=get_config().vlm_pool_node_modules,
             )
         return node_queue.claim_next_cpu_job(
             0, host=self.host, lease_s=self.lease_s,
@@ -1356,6 +1357,7 @@ class ClaimWorker:
             host_priority=self.host_priority,
             known_models=model_registry.known_ids(),
             require_model=False,
+            pool_modules=get_config().vlm_pool_node_modules,
         )
 
     def _pool_parallelism(self) -> int:
