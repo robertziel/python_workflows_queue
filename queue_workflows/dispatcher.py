@@ -445,6 +445,85 @@ def on_node_awaiting_input(run_id: str, node_id: str) -> None:
             )
 
 
+def reconcile_run(run_id: str) -> str:
+    """Reconcile a run the engine still calls non-terminal (``queued`` /
+    ``running``) but which has NO live node-job (``queued`` / ``running`` /
+    ``awaiting_input``) backing it — a phantom that would otherwise sit
+    ``queued`` forever with nothing for a worker to claim.
+
+    Why it arises: the run-state machine only advances on a node reaching
+    ``completed`` / ``skipped`` (→ enqueue downstream / finish the run, see
+    :func:`on_node_completed`) or ``failed`` (→ :func:`on_node_failed`). A
+    ``cancelled`` node is an unhandled dead-end — it satisfies neither
+    :func:`_find_ready_nodes` nor the all-terminal completion check, and there
+    is no ``on_node_cancelled``. So once a node is ``cancelled`` while its run
+    is non-terminal and :func:`run_store.reenqueue_running_for_resume` blindly
+    re-queues the run on the next restart, the run is wedged.
+
+    Ordered resolution (returns the action tag, for the sweep's log line):
+
+    * ``noop``      — run already terminal, or it actually has a live job after
+                      all (raced a fresh claim/enqueue between the sweep's SELECT
+                      and here).
+    * ``completed`` — every node is ``completed`` / ``skipped`` already; the
+                      terminal event was lost, so finalise the run.
+    * ``enqueued``  — ready nodes existed but never got enqueued (a dropped
+                      fan-out event); enqueue them — NON-destructive, no delete.
+    * ``requeued``  — wedged behind ``cancelled`` / ``failed`` dead rows: drop
+                      them (:func:`node_queue.delete_non_terminal_jobs_for_run`)
+                      and re-expand from the completed/skipped cursor so the
+                      blocked node(s) go BACK ON THE QUEUE. Completed work is
+                      preserved (those rows survive the delete).
+    * ``failed``    — no live job, not complete, nothing re-expandable: make the
+                      lying status honest so an operator can retry/purge.
+    """
+    run = run_store.get_run(run_id)
+    if not run or run.get("status") in ("completed", "failed", "cancelled"):
+        return "noop"
+    existing = _jobs_by_node_id(run_id)
+    if any(
+        j.get("status") in ("queued", "running", "awaiting_input")
+        for j in existing.values()
+    ):
+        return "noop"
+    wf = _load_workflow(run["workflow_name"])
+    all_nodes = [n["id"] for n in _nodes_of(wf, run=run)]
+    if all_nodes and all(
+        existing.get(nid) and existing[nid]["status"] in ("completed", "skipped")
+        for nid in all_nodes
+    ):
+        run_store.update_run(run_id, status="completed", finished_at=_now())
+        return "completed"
+    # Non-destructive first: a dropped fan-out event leaves ready nodes
+    # un-enqueued — just enqueue them, touching no existing row.
+    if _process_ready(run_id, wf, run) > 0:
+        run_store.update_run(run_id, status="running")
+        return "enqueued"
+    # Wedged: the frontier is blocked by cancelled/failed rows. Drop the
+    # non-terminal (NOT completed/skipped) rows and re-expand so the blocked
+    # node(s) re-queue from the surviving completed/skipped cursor.
+    dropped = node_queue.delete_non_terminal_jobs_for_run(run_id)
+    if dropped and _process_ready(run_id, wf, run) > 0:
+        log.warning(
+            "[dispatcher] run %s was wedged behind %d dead node-job(s) %s — "
+            "dropped them and re-queued the blocked node(s)",
+            run_id, len(dropped), dropped,
+        )
+        run_store.update_run(run_id, status="running")
+        return "requeued"
+    run_store.update_run(
+        run_id,
+        status="failed",
+        finished_at=_now(),
+        error=(
+            "reconciler: no runnable node-jobs and run not complete "
+            "(dead-ended DAG — a cancelled node with no forward path); "
+            "retry to re-run"
+        ),
+    )
+    return "failed"
+
+
 def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
     """Assemble the payload the frontend reads off ``run.input_spec``.
 

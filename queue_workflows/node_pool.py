@@ -135,6 +135,18 @@ class NodePool:
         )
         self._orphan_cancel_last_run: float = 0.0
 
+        # Stuck-run reconciler — recovery for a run the engine still calls
+        # ``queued`` / ``running`` but which has NO live node-job backing it (a
+        # ``cancelled`` node dead-ends the DAG; the dispatcher only advances on
+        # completed/skipped/failed, then a resume re-queues the run into the
+        # dead-end). ``last_run=0`` so a fresh instance reconciles on its FIRST
+        # tick — "run instantly after instance start" — then every 5 min. See
+        # :func:`dispatcher.reconcile_run`.
+        self._stuck_run_interval_s: float = float(
+            os.environ.get("AI_LEADS_STUCK_RUN_SWEEP_INTERVAL_S", "300")
+        )
+        self._stuck_run_last_run: float = 0.0
+
     def start(self) -> None:
         if self._register_builtins is not None:
             try:
@@ -420,6 +432,63 @@ class NodePool:
             self._sweep_orphan_queued_jobs()
         except Exception:
             log.exception("[node-pool] orphan-cancel sweep failed")
+
+        # 8) Stuck-run reconciler — re-drive / re-queue / finalise runs the
+        # engine still calls non-terminal but which have no live node-job (a
+        # cancelled-node dead-end that a resume re-queued). Interval-gated to
+        # 5 min; fires on the first tick after start (instant recovery).
+        try:
+            self._sweep_stuck_runs()
+        except Exception:
+            log.exception("[node-pool] stuck-run sweep failed")
+
+    def _sweep_stuck_runs(self) -> None:
+        """Reconcile phantom runs: the engine still calls them ``queued`` /
+        ``running`` but they have NO live node-job (``queued`` / ``running`` /
+        ``awaiting_input``), so a worker has nothing to claim and the run sits
+        there forever. Arises when a ``cancelled`` node dead-ends the DAG (the
+        dispatcher only advances on completed/skipped/failed) and a resume
+        (:func:`run_store.reenqueue_running_for_resume`) re-queues the run into
+        that dead-end. :func:`dispatcher.reconcile_run` re-drives each — putting
+        the blocked node(s) BACK ON THE QUEUE where it can, finalising the rest.
+
+        Interval-gated (``_stuck_run_interval_s``, default 300 s); ``last_run``
+        starts at 0 so a fresh instance reconciles on its FIRST tick (instant
+        recovery after a deploy/restart) then every 5 min.
+        """
+        import time as _time
+
+        now = _time.time()
+        if now - self._stuck_run_last_run < self._stuck_run_interval_s:
+            return
+        self._stuck_run_last_run = now
+
+        with connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT r.id FROM workflow_runs r
+                WHERE r.mode = 'node'
+                  AND r.status IN ('queued', 'running')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM workflow_node_jobs j
+                    WHERE j.run_id = r.id
+                      AND j.status IN ('queued', 'running', 'awaiting_input')
+                  )
+                """
+            )
+            ids = [r["id"] for r in cur.fetchall()]
+        for run_id in ids:
+            try:
+                action = dispatcher.reconcile_run(run_id)
+                if action != "noop":
+                    log.info(
+                        "[node-pool] reconciled stuck run %s → %s",
+                        run_id, action,
+                    )
+            except Exception:
+                log.exception(
+                    "[node-pool] reconcile of stuck run %s failed", run_id,
+                )
 
     def _sweep_expired_leases(self) -> None:
         """Re-queue ``running`` rows whose PG lease has lapsed.

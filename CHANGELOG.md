@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Stuck-run reconciler — a `cancelled` node no longer wedges its run in
+  `queued`/`running` forever.** The run-state machine only advanced on a node
+  reaching `completed`/`skipped` (enqueue downstream / finish the run) or
+  `failed` (fail the run); a `cancelled` node was an unhandled dead-end (there is
+  no `on_node_cancelled`), satisfying neither `_find_ready_nodes` nor the
+  all-terminal completion check. So once a node was cancelled while its run was
+  non-terminal and `run_store.reenqueue_running_for_resume` re-queued the run on
+  the next restart, the run sat non-terminal with NO live node-job — nothing for
+  a worker to claim, never completing, never failing. New
+  `dispatcher.reconcile_run` re-drives such a phantom: finalise it if every node
+  is already terminal, enqueue a dropped fan-out (non-destructive), or drop the
+  dead `cancelled`/`failed` rows and re-expand so the blocked node(s) go BACK ON
+  THE QUEUE (completed work preserved); failing that, mark the run `failed` so
+  the status stops lying. Wired as `NodePool._sweep_stuck_runs` — interval-gated
+  (`AI_LEADS_STUCK_RUN_SWEEP_INTERVAL_S`, default 300 s), firing on the first
+  tick after start (instant recovery) then every 5 min.
+
 ## [0.4.0] — 2026-05-30
 
 ### Added
