@@ -532,6 +532,18 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
             src_options = []
         if isinstance(src_options, dict):
             src_options = [src_options]
+        elif isinstance(src_options, str):
+            # Scalar abs_path — e.g. ``$from: pick_clean_car.car_clean_path``,
+            # which an upstream ChooseOne wrote into ``context_delta`` as a
+            # single string. Wrap into a single-element file-info list so the
+            # widget renders that exact image — without this branch the code
+            # fell into the ``else: []`` arm below, the widget showed
+            # ``source_options=[]``, and the operator saw "No source image was
+            # attached to this step." (the masked-compose experiment is the one
+            # flow that feeds pick_fence a scalar source). Mirrors the
+            # paint_mask / paint_fence_regions source blocks. Regression test:
+            # ``test_pick_fence_source_wraps_scalar_abs_path_from_upstream_pick``.
+            src_options = [_file_info_for_abs_path(src_options, run.get("out_dir"))]
         elif not isinstance(src_options, list):
             src_options = []
         spec["source_options"] = src_options
@@ -804,30 +816,39 @@ def _file_info_for_abs_path(
     return info
 
 
-def _run_context_for_refs(run: dict[str, Any]) -> dict[str, Any]:
-    """Build the context dict ``$from`` refs resolve against when paused at an
-    input step.
+def _ref_context(run: dict[str, Any]) -> dict[str, Any]:
+    """Build the context dict ``$from`` refs resolve against for a run.
+
+    This is the ONE shared context-builder used by every resolver —
+    :func:`_run_context_for_refs` (input-spec build time), :func:`_enqueue`
+    (pipeline-node enqueue time) and :func:`resolve_inputs_for_job` (worker
+    execute time). They MUST agree: a ``$from: <step>.files`` ref has to
+    resolve identically whether an input step or a pipeline node consumes it
+    (see failed run ffc5d63c, where the pipeline-node resolvers lacked the
+    on-disk scan and raised "missing segment 'split_labeled_mask'").
 
     Starts with ``run.context`` and augments it with:
 
-      * ``<step_id>: {"files": [...]}`` for each pipeline step whose output
-        directory exists on disk (each file has ``rel_path`` + ``kind`` so
-        ``$filter`` clauses work).
       * Every completed sibling job's ``context_delta`` merged under its
-        ``node_id`` — so an input step downstream of another input step (e.g.
+        ``node_id`` — so a node downstream of another (e.g.
         ``pick_install_area`` referencing ``$from: pick_clean.clean_plate_path``)
-        sees the operator's prior pick. Without this, the context-builder only
-        saw on-disk artefacts; user picks that aren't physical files were
-        invisible and the downstream resolver raised "missing segment".
+        sees the operator's prior pick / upstream node output. Without this,
+        user picks that aren't physical files were invisible and the resolver
+        raised "missing segment".
+      * ``<step_dir_name>: {"files": [...]}`` for each top-level dir of the
+        run's ``out_dir`` on disk (each file has ``rel_path`` + ``kind`` +
+        ``abs_path`` + ``size_bytes`` so ``$filter`` clauses work). At enqueue
+        time the upstream step's files ARE on disk (a node only enqueues after
+        its deps complete), so the scan is valid there too.
+
+    Resilient: a missing / non-directory ``out_dir`` yields just the
+    context_delta merge. The on-disk scan only sets/overwrites the ``files``
+    key per step — non-files keys (operator picks, scalar paths) survive.
     """
     from pathlib import Path
     ctx: dict[str, Any] = dict(run.get("context") or {})
-    # Merge completed sibling jobs' context_delta. Mirror ``_enqueue``'s
-    # merge so the context shape is identical whether the resolver runs
-    # at enqueue-time (for pipeline nodes) or input-spec-build-time (for
-    # input nodes). The dispatcher mutates ``ctx`` LATER from the
-    # on-disk scan, but ``files`` only — non-files keys (operator picks,
-    # scalar paths) survive untouched.
+    # Merge completed sibling jobs' context_delta. The on-disk scan below
+    # mutates ``ctx`` LATER, but ``files`` only — non-files keys survive.
     run_id = run.get("id") or run.get("run_id")
     if run_id:
         try:
@@ -848,13 +869,6 @@ def _run_context_for_refs(run: dict[str, Any]) -> dict[str, Any]:
     root = Path(out_dir)
     if not root.is_dir():
         return ctx
-    ext_kind = {
-        ".png": "image", ".jpg": "image", ".jpeg": "image",
-        ".webp": "image", ".gif": "image",
-        ".json": "json", ".geojson": "json",
-        ".csv": "csv", ".txt": "text", ".md": "text",
-        ".ply": "pointcloud", ".obj": "mesh", ".glb": "mesh",
-    }
     # ``rel_path`` is relative to ``out_dir`` (NOT to ``step_dir``) because the
     # frontend feeds it straight into ``/api/workflow/:id/file?path=<rel_path>``.
     for step_dir in root.iterdir():
@@ -867,7 +881,7 @@ def _run_context_for_refs(run: dict[str, Any]) -> dict[str, Any]:
             rel = f.relative_to(root).as_posix()
             files.append({
                 "rel_path": rel,
-                "kind": ext_kind.get(f.suffix.lower(), "file"),
+                "kind": _EXT_KIND.get(f.suffix.lower(), "file"),
                 "abs_path": str(f),
                 "size_bytes": f.stat().st_size,
             })
@@ -876,6 +890,13 @@ def _run_context_for_refs(run: dict[str, Any]) -> dict[str, Any]:
             "files": files,
         }
     return ctx
+
+
+def _run_context_for_refs(run: dict[str, Any]) -> dict[str, Any]:
+    """Build the context dict ``$from`` refs resolve against when paused at an
+    input step. Thin alias over :func:`_ref_context` (kept as the named entry
+    point the input-spec builder calls)."""
+    return _ref_context(run)
 
 
 def resume_after_input(run_id: str, node_id: str, value: Any = None) -> int:
@@ -936,10 +957,11 @@ def resolve_inputs_for_job(
     if (job.get("node_module") or "").startswith("__input__"):
         return dict(raw)
     run = run_store.get_run(job["run_id"]) or {}
-    context = dict(run.get("context") or {})
-    for sibling in node_queue.list_jobs_for_run(job["run_id"]):
-        if sibling.get("status") == "completed" and sibling.get("context_delta"):
-            context = {**context, sibling["node_id"]: sibling["context_delta"]}
+    # Build the ref context with the SAME helper input steps use, so a
+    # ``$from: <step>.files`` ref resolves against the on-disk scan here too
+    # (not just run.context + node-id-keyed deltas). Without this a pipeline
+    # node referencing an upstream step's ``.files`` got "missing segment".
+    context = _ref_context(run)
     resolved: dict[str, Any] = {}
     for k, v in raw.items():
         try:
@@ -976,13 +998,14 @@ def _enqueue(run_id: str, node: dict[str, Any], run: dict[str, Any]) -> str:
     # Resolve $from refs in the node's inputs against the run's context *at
     # enqueue time*. Any ref that can't resolve yet raises KeyError; we let it
     # bubble so the caller can mark the run failed with a clear error.
+    #
+    # Use the shared ref-context builder (run.context + completed siblings'
+    # context_delta keyed by node_id + the on-disk ``<step>.files`` scan) so a
+    # ``$from: <step>.files`` ref resolves the SAME way it does for an input
+    # step. A node only enqueues after its deps complete, so the upstream
+    # step's files are already on disk and the scan is valid here.
     raw = node.get("inputs", {}) or {}
-    context = (run.get("context") or {})
-    # Merge in sibling nodes' context_delta so refs like "detect.mask_path"
-    # work after 'detect' completes.
-    for sibling in node_queue.list_jobs_for_run(run_id):
-        if sibling["status"] == "completed" and sibling.get("context_delta"):
-            context = {**context, sibling["node_id"]: sibling["context_delta"]}
+    context = _ref_context(run)
     resolved = {k: _resolve_ref(v, context) for k, v in raw.items()}
 
     queue = _queue_of(node)

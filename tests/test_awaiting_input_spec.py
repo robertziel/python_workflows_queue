@@ -666,3 +666,78 @@ def test_paint_fence_regions_initial_mask_wraps_scalar_from_pick(tmp_path, provi
     assert im[0]["abs_path"] == str(picked)
     assert spec.get("initial_mask_abs_path") == str(picked)
     assert spec.get("initial_mask_rel_path") == "pick_fence/fence_mask.png"
+
+
+def test_pick_fence_source_wraps_scalar_abs_path_from_upstream_pick(tmp_path, provider):
+    """Regression pin for the masked-compose "No source image was attached
+    to this step. Cancel and re-run." bug.
+
+    Workflow shape (qwen_fence_masked_compose_experiment):
+      pick_clean_car (choose_one, target=car_clean_path)
+        ↓
+      pick_fence (pick_fence, source={"$from": "pick_clean_car.car_clean_path"})
+
+    pick_clean_car writes the operator's chosen plate as a scalar abs_path
+    string in its ``context_delta``. The dispatcher's pick_fence block must
+    wrap that scalar into a single-element file-info list so the spec carries
+    ``source_options``/``source_abs_path`` for the widget background.
+
+    Before the fix the pick_fence block only handled dict/list (unlike its
+    paint_mask / paint_fence_regions siblings); a scalar string fell into the
+    ``elif not isinstance(src_options, list): src_options = []`` arm, the spec
+    had ``source_options=[]``, and PickFence.tsx rendered "No source image was
+    attached to this step." This is the one workflow that feeds pick_fence a
+    scalar source, so it was the only place the gap surfaced.
+    """
+    from queue_workflows import dispatcher, node_queue
+
+    name = "_pick_car_then_pick_fence"
+    provider.workflows[name] = {
+        "name": name, "mode": "node",
+        "steps": [
+            {"id": "pick_clean_car", "kind": "input", "widget": "choose_one",
+             "prompt": "pick", "target": "car_clean_path",
+             "depends_on": []},
+            {"id": "pick_fence", "kind": "input", "widget": "pick_fence",
+             "prompt": "pick", "target": "selected_mask_path",
+             "source": {"$from": "pick_clean_car.car_clean_path"},
+             "depends_on": ["pick_clean_car"]},
+        ],
+    }
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    lane_dir = out_dir / "remove_car" / "lane_qwen_erase"
+    lane_dir.mkdir(parents=True)
+    picked = lane_dir / "no_car.jpg"
+    picked.write_bytes(b"\xff\xd8\xff fake")
+
+    run_id = _insert_run(name, out_dir)
+    pick_job = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="pick_clean_car",
+        node_module="__input__choose_one", queue="cpu",
+        inputs={"widget": "choose_one", "target": "car_clean_path"},
+        priority=50,
+    )
+    import json
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_node_jobs SET status='completed', "
+            "context_delta=%s::jsonb, finished_at=now() WHERE id=%s",
+            (json.dumps({"car_clean_path": str(picked)}), pick_job),
+        )
+        conn.commit()
+
+    _insert_awaiting_job(run_id, "pick_fence", target="selected_mask_path")
+    dispatcher.on_node_awaiting_input(run_id, "pick_fence")
+
+    spec = _job_spec(run_id, "pick_fence")
+    assert spec is not None, "pick_fence spec should be persisted"
+    options = spec.get("source_options") or []
+    assert len(options) == 1, (
+        f"source_options must wrap the scalar pick into ONE option, "
+        f"got {options!r}"
+    )
+    assert options[0]["abs_path"] == str(picked)
+    assert spec.get("source_abs_path") == str(picked)
+    assert spec.get("source_rel_path") == "remove_car/lane_qwen_erase/no_car.jpg"

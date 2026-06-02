@@ -98,6 +98,64 @@ def test_resolve_inputs_falls_back_to_snapshot_on_missing_ref():
     assert dispatcher.resolve_inputs_for_job(job_id) == {"k": {"$from": "absent_sibling.k"}}
 
 
+def test_resolve_inputs_resolves_upstream_pipeline_step_files_ref(tmp_path):
+    """A pipeline node referencing an upstream pipeline STEP's ``.files``
+    (``{"$from": "<step>.files", "$filter": {...}}``) must resolve against the
+    on-disk ``<out_dir>/<step>/`` scan — exactly like an input step does.
+
+    Regression pin for failed run ffc5d63c
+    (``qwen_fence_install_methods_experiment``): ``resolve_inputs_for_job`` only
+    built ``run.context`` + siblings' ``context_delta`` keyed by ``node_id``
+    (e.g. ``split_labeled_mask/split``). It NEVER did the on-disk
+    ``<step>.files`` scan ``_run_context_for_refs`` does, so a ref to the STEP
+    name ``split_labeled_mask.files`` blew up with
+    ``KeyError: "... missing segment 'split_labeled_mask'"`` → 10 dispatch
+    retries → run failed.
+    """
+    run_id = make_run(status="running", out_dir=str(tmp_path))
+
+    # Upstream pipeline step's output IS on disk by the time a dependent job is
+    # resolved (deps complete first). One step dir, one nested mask file.
+    step_dir = tmp_path / "split_labeled_mask" / "split"
+    step_dir.mkdir(parents=True)
+    (step_dir / "mask_main.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    (step_dir / "mask_gate.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    (step_dir / "manifest.json").write_text("{}")
+
+    # A completed sibling node-job for that step — keyed by NODE id
+    # (``split_labeled_mask/split``), the only thing the old context-builder saw.
+    sib_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="split_labeled_mask/split",
+        node_module="split", queue="cpu",
+    )
+    _set_context_delta(sib_id, {})
+
+    # The downstream PIPELINE node referencing the STEP's ``.files``.
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="install_masked_compose/qwen_fence_edit",
+        node_module="qwen_fence_edit", queue="gpu",
+        inputs={
+            "mask_path": {
+                "$from": "split_labeled_mask.files",
+                "$filter": {
+                    "kind:eq": "image",
+                    "rel_path:matches": r"mask_main\.png$",
+                },
+            },
+        },
+    )
+
+    resolved = dispatcher.resolve_inputs_for_job(job_id)
+    files = resolved["mask_path"]
+    assert isinstance(files, list), f"expected file-info list, got {resolved!r}"
+    assert len(files) == 1, f"filter should select exactly mask_main.png, got {files!r}"
+    info = files[0]
+    assert info["rel_path"] == "split_labeled_mask/split/mask_main.png"
+    assert info["kind"] == "image"
+    assert info["abs_path"] == str(step_dir / "mask_main.png")
+    assert info["size_bytes"] > 0
+
+
 # ── Snapshot column behaviour ─────────────────────────────────────────────
 
 
