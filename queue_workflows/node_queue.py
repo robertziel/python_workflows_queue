@@ -1070,7 +1070,12 @@ def mark_completed_in_txn(
             finished_at = now(),
             context_delta = %s,
             seconds = %s,
-            vm_rss_mb_peak = %s
+            vm_rss_mb_peak = %s,
+            -- Stamp the executing machine on the terminal row so per-host error /
+            -- log queries work off workflow_node_jobs too (claimed_by is the real
+            -- host identity; host_label was left NULL in practice). COALESCE keeps
+            -- any value a worker already set.
+            host_label = COALESCE(host_label, claimed_by)
         WHERE id = %s
           AND status NOT IN ('completed', 'failed', 'cancelled')
         RETURNING *
@@ -1118,7 +1123,11 @@ def mark_failed_in_txn(
         SET status = 'failed',
             finished_at = now(),
             error = %s,
-            seconds = %s
+            seconds = %s,
+            -- Stamp the failing machine on the terminal row (claimed_by = the real
+            -- host) so "which machine failed?" is answerable from workflow_node_jobs,
+            -- not just the events table. COALESCE keeps an already-set value.
+            host_label = COALESCE(host_label, claimed_by)
         WHERE id = %s
           AND status NOT IN ('completed', 'failed', 'cancelled')
         RETURNING *

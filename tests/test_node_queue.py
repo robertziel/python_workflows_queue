@@ -169,6 +169,32 @@ def test_mark_failed_stores_error_truncated():
     assert len(row["error"]) == 8000
 
 
+def test_terminal_jobs_stamp_host_label_from_claimed_by():
+    """A terminal job records its executing machine (claimed_by) on the row so
+    per-host error/log queries work off workflow_node_jobs, not just events —
+    host_label was left NULL in practice. (The test env configures no host, so we
+    set claimed_by directly to exercise the COALESCE stamp.)"""
+    from queue_workflows import db
+
+    def _set_claimed_by(job_id, host):
+        with db.connection() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE workflow_node_jobs SET claimed_by=%s WHERE id=%s", (host, job_id))
+
+    run_id = _make_run()
+    # failed → host_label stamped from claimed_by
+    f_id = node_queue.enqueue_node_job(run_id=run_id, node_id="f", node_module="x", queue="cpu")
+    node_queue.claim_next_cpu_job(0)
+    _set_claimed_by(f_id, "box-a2")
+    frow = node_queue.mark_failed(f_id, error="boom", seconds=0.1)
+    assert frow["host_label"] == "box-a2"
+    # completed → same stamp
+    c_id = node_queue.enqueue_node_job(run_id=run_id, node_id="c", node_module="x", queue="cpu")
+    node_queue.claim_next_cpu_job(0)
+    _set_claimed_by(c_id, "box-b")
+    crow = node_queue.mark_completed(c_id, context_delta={}, seconds=0.1)
+    assert crow["host_label"] == "box-b"
+
+
 def test_cancel_queued_jobs_for_run_leaves_running_alone():
     run_id = _make_run()
     node_queue.enqueue_node_job(run_id=run_id, node_id="a", node_module="x",

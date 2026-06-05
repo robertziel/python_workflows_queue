@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Terminal node jobs now record the executing machine.** `mark_completed` /
+  `mark_failed` stamp `workflow_node_jobs.host_label = COALESCE(host_label,
+  claimed_by)` on the terminal row (it was left NULL in practice — only the
+  events table carried the host). So "which machine ran / failed this node?" is
+  answerable directly from `workflow_node_jobs`, powering a per-host error/log
+  surface without joining `workflow_node_events`. Additive + idempotent
+  (`COALESCE` keeps any value a worker already set).
+
 ### Fixed
 - **Stuck-run reconciler — a `cancelled` node no longer wedges its run in
   `queued`/`running` forever.** The run-state machine only advanced on a node
