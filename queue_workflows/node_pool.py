@@ -147,6 +147,15 @@ class NodePool:
         )
         self._stuck_run_last_run: float = 0.0
 
+        # Unassignable-job sweep (migration 0015) — red-flag queued GPU model-jobs
+        # that NO live machine has enough VRAM to hold, and emit one
+        # ``unassignable`` node event each. Interval-gated (default 15 s); the
+        # underlying flag UPDATE is idempotent so the gate is a load optimisation.
+        self._unassignable_interval_s: float = float(
+            os.environ.get("AI_LEADS_UNASSIGNABLE_SWEEP_INTERVAL_S", "15")
+        )
+        self._unassignable_last_run: float = 0.0
+
     def start(self) -> None:
         if self._register_builtins is not None:
             try:
@@ -441,6 +450,45 @@ class NodePool:
             self._sweep_stuck_runs()
         except Exception:
             log.exception("[node-pool] stuck-run sweep failed")
+
+        # 9) Unassignable-job sweep — red-flag queued GPU model-jobs no live
+        # machine has enough VRAM to hold, and emit one ``unassignable`` event
+        # each (capacity-aware assignment, migration 0015).
+        try:
+            self._sweep_unassignable_jobs()
+        except Exception:
+            log.exception("[node-pool] unassignable-job sweep failed")
+
+    def _sweep_unassignable_jobs(self) -> None:
+        """Red-flag queued GPU model-jobs that NO live machine can hold (none has
+        enough VRAM) and emit one ``unassignable`` node event per newly-flagged
+        job; the flag clears automatically once a big-enough machine appears or
+        the job leaves the queue (see :func:`node_queue.flag_unassignable_gpu_jobs`).
+
+        Interval-gated (``_unassignable_interval_s``, default 15 s); ``last_run``
+        starts at 0 so a fresh instance evaluates on its FIRST tick. The flag
+        UPDATE is idempotent (only the NULL→now transition is returned), so an
+        event fires exactly once per flagging episode."""
+        import time as _time
+
+        now = _time.time()
+        if now - self._unassignable_last_run < self._unassignable_interval_s:
+            return
+        self._unassignable_last_run = now
+
+        flagged = node_queue.flag_unassignable_gpu_jobs()
+        for row in flagged:
+            log.error(
+                "[node-pool] UNASSIGNABLE: run=%s node=%s model=%s — %s",
+                row.get("run_id"), row.get("node_id"),
+                row.get("required_model"), row.get("unassignable_reason"),
+            )
+            node_queue.record_node_event(
+                run_id=row["run_id"], node_id=row["node_id"], job_id=row.get("id"),
+                event_type="unassignable", queue="gpu",
+                model=row.get("required_model"),
+                error=row.get("unassignable_reason"),
+            )
 
     def _sweep_stuck_runs(self) -> None:
         """Reconcile phantom runs: the engine still calls them ``queued`` /

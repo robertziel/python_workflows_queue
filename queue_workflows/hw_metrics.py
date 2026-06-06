@@ -78,6 +78,25 @@ def _gpu_probe() -> list[dict[str, Any]]:
     return _GPU_PROBE()
 
 
+def total_vram_mb() -> int | None:
+    """The machine's TOTAL GPU VRAM in MB — the capacity a single model load is
+    measured against.
+
+    A model's weights load onto ONE device, so capacity is the LARGEST single
+    GPU's ``vram_total_mb`` (not the sum across cards). Returns ``None`` when no
+    GPU is detected or the probe fails / reports zero — callers treat ``None`` as
+    "capacity unknown" (advertise nothing, fall back to claim-any). Best-effort:
+    never raises."""
+    try:
+        gpus = _gpu_probe()
+    except Exception:
+        log.exception("[hw_metrics] total_vram_mb probe failed; treating as unknown")
+        return None
+    totals = [int(g.get("vram_total_mb") or 0) for g in (gpus or [])]
+    totals = [t for t in totals if t > 0]
+    return max(totals) if totals else None
+
+
 def _select_gpu_probe() -> typing.Callable[[], list[dict[str, Any]]]:
     """Pick nvidia-smi if present, else rocm-smi, else a no-op."""
     if _which("nvidia-smi"):

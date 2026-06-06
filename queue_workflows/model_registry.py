@@ -65,6 +65,36 @@ def known_ids() -> list[str]:
     return sorted(MODELS)
 
 
+def fits_within(vram_total_mb: int | None, *, headroom: float = 1.0) -> list[str]:
+    """The registered model ids whose ``est_vram_gb`` fits a machine with
+    ``vram_total_mb`` of total GPU VRAM — sorted, the worker's advertised
+    ``fits_models``.
+
+    A model fits iff ``est_vram_gb * 1024 * headroom <= vram_total_mb``.
+    ``headroom`` (>= 1.0) reserves margin over the bare estimate for runtime
+    overshoot (activations, fragmentation); default 1.0 = the raw estimate.
+
+    Semantics of the edges:
+      * ``vram_total_mb is None`` (capacity unknown — no GPU probe / cold worker)
+        ⇒ return ALL known ids. The claim gate must NOT wedge the queue on a
+        worker that simply hasn't measured its VRAM yet; the existing capability
+        gate already falls back to claim-any on an empty/uninformative set, and
+        a "fits everything" advertisement keeps that behaviour.
+      * A model with ``est_vram_gb <= 0`` (unset / informational) fits anywhere —
+        it carries no capacity claim, so it is never filtered out.
+    """
+    if vram_total_mb is None:
+        return known_ids()
+    cap = int(vram_total_mb)
+    hr = max(1.0, float(headroom))
+    out = [
+        mid for mid, spec in MODELS.items()
+        if (spec.est_vram_gb or 0.0) <= 0.0
+        or float(spec.est_vram_gb) * 1024.0 * hr <= cap
+    ]
+    return sorted(out)
+
+
 def clear_for_tests() -> None:
     """TEST-ONLY. Drops the registry so a test can populate it freshly."""
     MODELS.clear()

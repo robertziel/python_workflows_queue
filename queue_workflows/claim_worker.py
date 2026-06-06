@@ -1159,6 +1159,9 @@ class HeartbeatEmitter:
         self._concurrency_fn = concurrency_fn
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # Cached total-VRAM probe (stable hardware property; sampled once).
+        self._vram_probed = False
+        self._vram_total: int | None = None
 
     @property
     def _enabled(self) -> bool:
@@ -1191,20 +1194,59 @@ class HeartbeatEmitter:
             )
             return 1
 
+    def _vram_total_mb(self) -> int | None:
+        """This machine's total GPU VRAM (MB), GPU queue only — the capacity the
+        fit decision is measured against (migration 0015). Sampled once and
+        cached: VRAM total is a stable hardware property, so we don't re-shell
+        ``nvidia-smi`` / ``rocm-smi`` every 10 s tick. ``None`` for cpu/ingest or
+        when no GPU is detected. Best-effort: a probe failure caches ``None`` for
+        this process (re-probed only on a new worker)."""
+        if self._queue != "gpu":
+            return None
+        if not self._vram_probed:
+            try:
+                from queue_workflows import hw_metrics
+                self._vram_total = hw_metrics.total_vram_mb()
+            except Exception:
+                log.exception("[claim-worker:gpu] total VRAM probe failed; unknown")
+                self._vram_total = None
+            self._vram_probed = True
+        return self._vram_total
+
+    def _fits_models(self, known: list[str], vram_total_mb: int | None) -> list[str]:
+        """The subset of ``known`` whose est_vram_gb fits this machine's VRAM —
+        the worker's advertised ``fits_models`` (GPU queue only). Computed from
+        the registry the worker holds (the orchestrator has none), so the fleet
+        fit decision can be pure SQL over the heartbeat. ``[]`` for cpu/ingest."""
+        if self._queue != "gpu":
+            return []
+        from queue_workflows import model_registry
+        fits = model_registry.fits_within(vram_total_mb)
+        # Intersect with the ids actually advertised as known this tick (defends
+        # against a registry/known drift), preserving sorted order.
+        known_set = set(known)
+        return [m for m in fits if m in known_set]
+
     def emit_once(self) -> None:
         """Upsert this worker's row once (concurrency = 1 for cpu/ingest, or
         ``max(1, PAR)`` for GPU via ``concurrency_fn``; GPU also carries its live
-        ``current_model``, the diffusion busy signal). Failures are swallowed +
+        ``current_model``, the diffusion busy signal, plus its ``vram_total_mb``
+        capacity + ``fits_models`` — the registered models its VRAM can hold —
+        for capacity-aware assignment, migration 0015). Failures are swallowed +
         logged — a transient DB blip must never crash a worker mid-job."""
         try:
             from queue_workflows import model_registry
+            known = model_registry.known_ids()
+            vram_total = self._vram_total_mb()
             node_queue.upsert_worker_heartbeat(
                 host_label=self._host_label,
                 queue=self._queue,
                 concurrency=self._concurrency(),
                 current_model=self._current_model(),
-                known_models=model_registry.known_ids(),
+                known_models=known,
                 llm_servers_available=get_config().llm_servers_available,
+                vram_total_mb=vram_total,
+                fits_models=self._fits_models(known, vram_total),
             )
         except Exception:
             log.exception("[claim-worker:%s] heartbeat upsert failed", self._queue)
@@ -1287,6 +1329,10 @@ class ClaimWorker:
         # the diffusion occupies one of the PAR slots. Plain bool: written by the
         # inline loop, read by the feeder thread (GIL-atomic; best-effort cap).
         self._inline_running = False
+        # Cached total-VRAM probe for the capacity claim gate (migration 0015) —
+        # stable hardware property, sampled once per worker process.
+        self._vram_probed_claim = False
+        self._vram_total_claim: int | None = None
         # Worker capacity heartbeat — a no-op for fetch/load. cpu/ingest advertise
         # 1 (one poll-claim loop). GPU advertises max(1, PAR): the machine's GPU
         # job concurrency = its VLM pool size (worker_controls.llm_parallelism),
@@ -1314,6 +1360,35 @@ class ClaimWorker:
 
     # ── claim ────────────────────────────────────────────────────────────
 
+    def _gpu_capacity_for_claim(self) -> tuple[int | None, list[str], bool]:
+        """``(vram_total_mb, fits_models, has_models)`` for the GPU claim gate
+        (migration 0015). ``vram_total_mb`` is this machine's total GPU VRAM,
+        probed once and cached (stable hardware property); ``fits_models`` is the
+        registered ids whose est_vram_gb fits it (the full known set when VRAM is
+        unknown — claim-any-capable); ``has_models`` is whether the registry is
+        populated at all. The registry is re-read each claim (it can grow as the
+        host registers models) but the VRAM probe is not re-shelled.
+
+        ``has_models`` matters for the empty-registry case: a COLD worker that
+        hasn't registered its models yet has ``fits == []`` for the same reason a
+        too-small machine does, but the two must behave differently — a cold
+        worker falls back to claim-any (it must not wedge the queue), a too-small
+        machine claims nothing. The caller branches on ``has_models`` to tell them
+        apart."""
+        from queue_workflows import hw_metrics, model_registry
+        if not self._vram_probed_claim:
+            try:
+                self._vram_total_claim = hw_metrics.total_vram_mb()
+            except Exception:
+                log.exception("[claim-worker:gpu] total VRAM probe failed; unknown")
+                self._vram_total_claim = None
+            self._vram_probed_claim = True
+        vram_total = self._vram_total_claim
+        known = model_registry.known_ids()
+        known_set = set(known)
+        fits = [m for m in model_registry.fits_within(vram_total) if m in known_set]
+        return vram_total, fits, bool(known)
+
     def _claim(self) -> dict | None:
         """Claim the next job for the INLINE lane.
 
@@ -1328,13 +1403,24 @@ class ClaimWorker:
                 self.queue, host=self.host, lease_s=self.lease_s,
             )
         if self.queue == "gpu":
-            from queue_workflows import model_registry
             current_model = getattr(self.model_cache, "current_model", None)
+            vram_total, fits, has_models = self._gpu_capacity_for_claim()
+            # Capacity gate (migration 0015): the inline lane claims a model-job
+            # ONLY if this machine's VRAM can hold the model. ``fits`` is the
+            # capacity-filtered known set. When the registry IS populated and VRAM
+            # is KNOWN but nothing fits, this machine can run NO model — return
+            # None rather than fall through to claim_next_gpu_job's empty-known
+            # claim-any (which would let a too-small box grab a model it can't
+            # load). A COLD worker (registry not yet populated ⇒ ``has_models``
+            # False) or UNKNOWN VRAM keeps the claim-any-capable fallback so it
+            # never wedges the queue.
+            if has_models and vram_total is not None and not fits:
+                return None
             return node_queue.claim_next_gpu_job(
                 0, current_model,
                 host=self.host, lease_s=self.lease_s,
                 host_priority=self.host_priority,
-                known_models=model_registry.known_ids(),
+                known_models=fits,
                 require_model=True,
                 pool_modules=get_config().vlm_pool_node_modules,
             )

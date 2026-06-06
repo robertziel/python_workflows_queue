@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Capacity-aware GPU model assignment + an "unassignable" red flag**
+  (migration `0015`). A GPU **model** job is now only assigned to a machine whose
+  VRAM can actually hold the model, and a queued model that **no** live machine
+  can fit is red-flagged with a `unassignable` node event — closing the gap where
+  any GPU worker would claim any model and then OOM/fail at load, and where an
+  un-runnable model would sit `queued` forever with no visible reason.
+  - **Capacity advertised on the heartbeat.** `worker_heartbeats` gains
+    `vram_total_mb` (the machine's total GPU VRAM, sampled once via
+    `hw_metrics.total_vram_mb` — the largest single device) and `fits_models`
+    (the registered ids whose `ModelSpec.est_vram_gb` fits that VRAM, computed by
+    the **worker** via `model_registry.fits_within` — the orchestrator holds no
+    registry, so the fit decision is pushed to the worker and advertised as plain
+    data). Unknown VRAM ⇒ "fits everything" so a cold/un-probed worker never
+    wedges the queue; an `est_vram_gb <= 0` model carries no capacity claim and
+    fits anywhere.
+  - **Per-machine claim gate.** The inline GPU lane (`ClaimWorker._claim`) passes
+    its `fits_models` as the capability filter, so a worker never claims a model
+    larger than its VRAM. When VRAM is *known* but nothing fits, the lane claims
+    nothing (it does **not** fall through to the empty-known claim-any path).
+  - **Fleet unassignable sweep.** `node_queue.flag_unassignable_gpu_jobs` is a
+    pure-SQL sweep over fresh GPU heartbeats: a queued `gpu` model-job whose
+    `required_model` is in no live worker's `fits_models` gets `unassignable_at` /
+    `unassignable_reason` stamped (the node stays `queued` — a big-enough machine
+    can appear and the flag clears) and one `unassignable` event emitted. Guarded
+    on at least one *fresh* GPU heartbeat existing, so a whole-fleet bounce is a
+    no-op (liveness is the dead-worker sweep's concern, not a capacity verdict).
+    Idempotent (only the NULL→now transition is returned) and self-clearing (when
+    a capable machine appears or the job leaves `queued`). Wired as
+    `NodePool._sweep_unassignable_jobs` (interval-gated,
+    `AI_LEADS_UNASSIGNABLE_SWEEP_INTERVAL_S`, default 15 s). The `unassignable`
+    value joins the `workflow_node_events` `event_type` CHECK.
+
 ### Changed
 - **Terminal node jobs now record the executing machine.** `mark_completed` /
   `mark_failed` stamp `workflow_node_jobs.host_label = COALESCE(host_label,

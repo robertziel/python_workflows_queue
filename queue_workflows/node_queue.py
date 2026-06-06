@@ -955,6 +955,8 @@ def upsert_worker_heartbeat(
     current_model: str | None = None,
     known_models: Iterable[str] | None = None,
     llm_servers_available: Iterable[str] | None = None,
+    vram_total_mb: int | None = None,
+    fits_models: Iterable[str] | None = None,
     update_current_model: bool = True,
 ) -> None:
     """Upsert this worker's ``(host_label, queue)`` capacity row, refreshing
@@ -987,6 +989,13 @@ def upsert_worker_heartbeat(
     llm_servers = (
         list(llm_servers_available) if llm_servers_available is not None else ["ollama"]
     )
+    # Capacity advertisement (migration 0015). ``fits_models`` is the worker-
+    # computed subset of known ids whose est_vram_gb fits this machine, used by
+    # the claim gate and the fleet unassignable sweep; ``None`` ⇒ empty array
+    # (advertise no capacity claim) so a non-GPU / pre-capacity worker leaves the
+    # column at its '{}' default rather than stale.
+    fits = list(fits_models) if fits_models is not None else []
+    vram = int(vram_total_mb) if vram_total_mb is not None else None
     model_set = (
         "current_model = EXCLUDED.current_model," if update_current_model else ""
     )
@@ -995,17 +1004,21 @@ def upsert_worker_heartbeat(
             f"""
             INSERT INTO worker_heartbeats
                 (host_label, queue, concurrency, last_seen,
-                 current_model, known_models, llm_servers_available)
-            VALUES (%s, %s, %s, now(), %s, %s, %s)
+                 current_model, known_models, llm_servers_available,
+                 vram_total_mb, fits_models)
+            VALUES (%s, %s, %s, now(), %s, %s, %s, %s, %s)
             ON CONFLICT (host_label, queue) DO UPDATE
                 SET concurrency   = EXCLUDED.concurrency,
                     {model_set}
                     known_models  = EXCLUDED.known_models,
                     llm_servers_available = EXCLUDED.llm_servers_available,
+                    vram_total_mb = EXCLUDED.vram_total_mb,
+                    fits_models   = EXCLUDED.fits_models,
                     last_seen     = EXCLUDED.last_seen,
                     last_flagged_dead_at = NULL
             """,
-            (host_label, queue, int(concurrency), current_model, known, llm_servers),
+            (host_label, queue, int(concurrency), current_model, known, llm_servers,
+             vram, fits),
         )
 
 
@@ -1370,6 +1383,96 @@ def prune_node_events(older_than_days: int = 30) -> int:
             (days,),
         )
         return cur.rowcount or 0
+
+
+def flag_unassignable_gpu_jobs(*, stale_s: int | None = None) -> list[dict[str, Any]]:
+    """Capacity-aware fleet sweep (migration 0015): red-flag queued GPU model-jobs
+    that **no live machine can hold**, and clear the flag when they become
+    assignable again. Returns the rows NEWLY flagged this call (the NULL→now
+    transition) so the caller emits one ``unassignable`` event each.
+
+    A queued ``gpu`` job with a ``required_model`` is *unassignable* iff NO fresh
+    GPU worker advertises that model in its ``fits_models`` (the worker-computed
+    set of ids whose ``est_vram_gb`` fits its VRAM). The decision is pure SQL over
+    ``worker_heartbeats`` — the worker pushed the fit computation into the
+    heartbeat precisely so the orchestrator (which holds no model registry) can
+    decide here.
+
+    CRITICAL liveness guard: flagging requires at least ONE fresh GPU heartbeat.
+    "No machine has enough VRAM" is a CAPACITY verdict, not a liveness one — if
+    the whole GPU fleet is momentarily down (a deploy / all-workers bounce) we
+    must NOT red-flag every job as unassignable (that's the dead-worker sweep's
+    concern). With zero fresh GPU workers the sweep is a no-op.
+
+    Idempotent: the flag UPDATE is guarded ``unassignable_at IS NULL`` so a job
+    already flagged is not re-returned (no duplicate event) until it clears and
+    re-flags. The clear path un-flags rows that became fittable OR left ``queued``
+    (claimed / cancelled), so a stale red flag never lingers.
+
+    ``stale_s`` overrides the freshness window (default ``_stale_worker_after_s``,
+    30 s = 3× the 10 s heartbeat).
+    """
+    window = int(stale_s) if stale_s is not None else _stale_worker_after_s()
+    with connection() as conn, conn.cursor() as cur:
+        # CLEAR first: un-flag any flagged job that is now fittable, or that has
+        # left the queued state (claimed / cancelled / terminal) — so a red flag
+        # never outlives the condition that set it.
+        cur.execute(
+            """
+            WITH live_gpu AS (
+                SELECT fits_models FROM worker_heartbeats
+                WHERE queue = 'gpu'
+                  AND last_seen > now() - make_interval(secs => %(window)s)
+            )
+            UPDATE workflow_node_jobs j
+            SET unassignable_at = NULL, unassignable_reason = NULL
+            WHERE j.unassignable_at IS NOT NULL
+              AND (
+                    j.status <> 'queued'
+                 OR EXISTS (
+                        SELECT 1 FROM live_gpu lg
+                        WHERE j.required_model = ANY(lg.fits_models)
+                    )
+              )
+            """,
+            {"window": window},
+        )
+        # FLAG: queued gpu model-jobs that no fresh GPU worker can hold. Guarded
+        # on at least one fresh GPU heartbeat existing (liveness vs capacity).
+        cur.execute(
+            """
+            WITH live_gpu AS (
+                SELECT fits_models, vram_total_mb FROM worker_heartbeats
+                WHERE queue = 'gpu'
+                  AND last_seen > now() - make_interval(secs => %(window)s)
+            ),
+            fleet AS (
+                SELECT count(*) AS n, max(vram_total_mb) AS max_vram
+                FROM live_gpu
+            )
+            UPDATE workflow_node_jobs j
+            SET unassignable_at = now(),
+                unassignable_reason =
+                    'no live GPU machine can hold model ' || j.required_model
+                    || ' — none of ' || (SELECT n FROM fleet)::text
+                    || ' live GPU machine(s) has enough VRAM (max '
+                    || COALESCE((SELECT max_vram FROM fleet)::text, 'unknown')
+                    || 'MB)'
+            WHERE j.queue = 'gpu'
+              AND j.status = 'queued'
+              AND j.required_model IS NOT NULL
+              AND j.unassignable_at IS NULL
+              AND (SELECT n FROM fleet) > 0
+              AND NOT EXISTS (
+                    SELECT 1 FROM live_gpu lg
+                    WHERE j.required_model = ANY(lg.fits_models)
+              )
+            RETURNING j.id, j.run_id, j.node_id, j.required_model,
+                      j.unassignable_reason
+            """,
+            {"window": window},
+        )
+        return list(cur.fetchall())
 
 
 def cancel_queued_jobs_for_run(run_id: str) -> int:
