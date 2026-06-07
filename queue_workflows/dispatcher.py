@@ -771,6 +771,36 @@ def _build_input_spec(step: dict[str, Any], run: dict[str, Any]) -> dict[str, An
                 spec["initial_mask_opacity"] = max(0.0, min(1.0, float(op)))
             except (TypeError, ValueError):
                 pass
+        # Optional ``predefined_layers`` + ``hide_mask`` refs (v1.5) — when set, an
+        # upstream node (``fence_preassign_layers``) pre-computed the perspective
+        # fence rectangles (a JSON) + a bottom-only occluder mask (a PNG); the editor
+        # opens PRE-POPULATED from them instead of a blank canvas. Same $from ref
+        # shape as ``source``/``initial_mask``; the widget fetches each file via
+        # /workflow/:id/file?path=... . Carrying only the paths keeps this engine
+        # branch agnostic to the JSON's contents.
+        for _key, _rel, _abs in (
+            ("predefined_layers", "predefined_layers_rel_path", "predefined_layers_abs_path"),
+            ("hide_mask", "hide_mask_rel_path", "hide_mask_abs_path"),
+        ):
+            _ref = step.get(_key)
+            if _ref is None:
+                continue
+            try:
+                _opts = _resolve_ref(_ref, context)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "[dispatcher] failed to resolve %s for %s: %s", _key, step["id"], exc,
+                )
+                _opts = []
+            if isinstance(_opts, dict):
+                _opts = [_opts]
+            elif isinstance(_opts, str):
+                _opts = [_file_info_for_abs_path(_opts, run.get("out_dir"))]
+            elif not isinstance(_opts, list):
+                _opts = []
+            if _opts:
+                spec[_rel] = _opts[0].get("rel_path")
+                spec[_abs] = _opts[0].get("abs_path")
     elif widget == "assign_walls":
         # Operator-facing wall-assignment widget for the facade-merge workflow.
         import json
