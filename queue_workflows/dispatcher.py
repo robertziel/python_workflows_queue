@@ -408,12 +408,140 @@ def start_run(run_id: str) -> int:
     return _process_ready(run_id, wf, run)
 
 
+# ---------------------------------------------------------------------------
+# PATCH jobs — "fix an earlier step in place" (single-node rerun, mode B).
+#
+# A patch job is a synthetic node-job row OUTSIDE the workflow DAG: same
+# module/queue/model as the node it re-runs, but with its primary image input
+# pointed at the CURRENT input image and an extra operator prompt. The run
+# stays parked at its awaiting-input node the whole time. The marker lives in
+# the job's ``inputs`` (node_executor maps inputs by signature param name, so
+# the marker never reaches the module):
+#
+#     {"__patch__": {"target_input": "<input node_id>",
+#                    "source_node":  "<patched node_id>"}}
+#
+# Dispatch/terminal logic is naturally blind to patch rows (it iterates DAG
+# node ids), so only the two worker callbacks need explicit branches.
+# ---------------------------------------------------------------------------
+
+PATCH_INPUT_KEY = "__patch__"
+
+
+def _patch_meta(job: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The ``__patch__`` marker dict, or None for ordinary jobs."""
+    if not job:
+        return None
+    meta = (job.get("inputs") or {}).get(PATCH_INPUT_KEY)
+    return meta if isinstance(meta, dict) else None
+
+
+def _bump_input_spec(
+    run_id: str, target_input: str | None, **fields: Any
+) -> None:
+    """Merge ``fields`` into the target input node's parked ``input_spec``.
+
+    ``patched_at`` doubles as the UI cache-buster (the spec's source PATHS
+    don't change on a patch — only the bytes underneath). A no-op when the
+    target isn't currently awaiting input (``set_input_spec`` guards on
+    status), or has no spec yet.
+    """
+    if not target_input:
+        return
+    job = _jobs_by_node_id(run_id).get(target_input)
+    spec = (job or {}).get("input_spec")
+    if not isinstance(spec, dict):
+        return
+    spec = dict(spec)
+    for key, val in fields.items():
+        if val is None:
+            spec.pop(key, None)
+        else:
+            spec[key] = val
+    node_queue.set_input_spec(run_id, target_input, spec)
+
+
+def _finish_patch_job(
+    run: dict[str, Any], job: dict[str, Any], meta: dict[str, Any]
+) -> None:
+    """Make a completed patch job's outputs CANONICAL.
+
+    For every ``context_delta`` key the patch shares with the source node
+    whose values are two different file paths under the run's ``out_dir``,
+    copy the patch file over the source node's original path. Downstream
+    ``$from <source_node>.<key>`` refs and the parked input spec keep their
+    paths — the content changes underneath (the patch job's own node dir
+    remains on disk as the audit trail). Then bump the spec's ``patched_at``.
+    """
+    import shutil
+    from pathlib import Path
+
+    run_id = run.get("id") or run.get("run_id") or ""
+    out_dir = str(run.get("out_dir") or "")
+    src_job = _jobs_by_node_id(run_id).get(str(meta.get("source_node") or ""))
+    delta_new = job.get("context_delta") or {}
+    delta_old = (src_job or {}).get("context_delta") or {}
+    copied: list[str] = []
+    for key, new_val in delta_new.items():
+        old_val = delta_old.get(key)
+        if (
+            isinstance(new_val, str)
+            and isinstance(old_val, str)
+            and new_val != old_val
+            and out_dir
+            and new_val.startswith(out_dir)
+            and old_val.startswith(out_dir)
+            and Path(new_val).is_file()
+        ):
+            Path(old_val).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(new_val, old_val)
+            copied.append(key)
+    _bump_input_spec(
+        run_id,
+        str(meta.get("target_input") or "") or None,
+        patched_at=_now().isoformat(),
+        patch_error=None,
+        # Re-enable the input: the consumer set patch_pending at enqueue time
+        # so polling UIs disable interaction while the re-run is in flight.
+        patch_pending=None,
+        patch_node_id=None,
+    )
+    log.info(
+        "[dispatcher] patch %s for %s made canonical (keys: %s)",
+        job.get("node_id"), meta.get("source_node"), ", ".join(copied) or "none",
+    )
+
+
+def _flag_patch_error(
+    run: dict[str, Any], job: dict[str, Any], meta: dict[str, Any]
+) -> None:
+    """Surface a failed patch on the parked input's spec — run stays alive."""
+    run_id = run.get("id") or run.get("run_id") or ""
+    err = str(job.get("error") or "patch failed")[:500]
+    _bump_input_spec(
+        run_id,
+        str(meta.get("target_input") or "") or None,
+        patch_error=err,
+        # Failure also re-enables the input — operator retries or continues.
+        patch_pending=None,
+        patch_node_id=None,
+    )
+    log.warning(
+        "[dispatcher] patch %s failed (run %s stays parked): %s",
+        job.get("node_id"), run_id, err,
+    )
+
+
 def on_node_completed(run_id: str, node_id: str) -> int:
     """Called by workers after a node-job flips to ``completed``.
 
     Finds newly-satisfied downstream nodes and enqueues (or skips) them. If
     every node in the DAG has reached a terminal status, flips the run row to
     ``completed``. Returns the number of new node-jobs inserted.
+
+    PATCH jobs (synthetic non-DAG rows carrying a ``__patch__`` inputs marker —
+    the operator's "fix an earlier step in place") never cascade: their outputs
+    are made canonical and the parked input's spec is bumped instead.
     """
     run = run_store.get_run(run_id)
     if not run:
@@ -423,6 +551,11 @@ def on_node_completed(run_id: str, node_id: str) -> int:
     # the dispatch-event drain firing this callback, we must NOT enqueue
     # downstream nodes.
     if run.get("status") in ("cancelled", "failed"):
+        return 0
+    job = _jobs_by_node_id(run_id).get(node_id)
+    meta = _patch_meta(job)
+    if meta:
+        _finish_patch_job(run, job, meta)
         return 0
     wf = _load_workflow(run["workflow_name"])
     new_rows = _process_ready(run_id, wf, run)
@@ -448,6 +581,14 @@ def on_node_failed(run_id: str, node_id: str) -> None:
     """
     run = run_store.get_run(run_id) or {}
     if run.get("status") in ("cancelled", "failed"):
+        return
+    job = _jobs_by_node_id(run_id).get(node_id)
+    meta = _patch_meta(job)
+    if meta:
+        # A failed PATCH must not take the parked run down with it — the
+        # operator just retries (or continues with the un-patched image).
+        # Surface the error on the target input's spec instead.
+        _flag_patch_error(run, job, meta)
         return
     node_queue.cancel_siblings_after_failure(run_id)
     run_store.update_run(
