@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-06-16
+
 ### Added
+- **Per-node "run next" priority flag** (migration `0016`). A new boolean
+  `workflow_node_jobs.is_priority` (DEFAULT FALSE) and
+  `node_queue.prioritize_node_job(job_id)` let an operator flag a **queued** node
+  so the next worker asking for a node in its queue claims it first. `is_priority`
+  sorts **first** in the claim `ORDER BY` — ahead of the integer `priority` band
+  and, on GPU, ahead of the warm-model affinity tiebreak (a flagged cold-model
+  node preempts a warm one; the model reload is the accepted cost of "run this
+  next"). A no-op on a non-queued row (a running/terminal job can't be reordered).
+  Backward compatible: existing rows default to FALSE, so the term is inert until
+  a flag is set.
 - **Capacity-aware GPU model assignment + an "unassignable" red flag**
   (migration `0015`). A GPU **model** job is now only assigned to a machine whose
   VRAM can actually hold the model, and a queued model that **no** live machine

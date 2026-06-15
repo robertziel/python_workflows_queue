@@ -37,7 +37,7 @@ from typing import Any, Callable
 
 from queue_workflows.config import EngineConfig, get_config
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "configure",

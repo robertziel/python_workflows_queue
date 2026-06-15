@@ -161,6 +161,26 @@ def list_jobs_for_run(run_id: str) -> list[dict[str, Any]]:
         return list(cur.fetchall())
 
 
+def prioritize_node_job(job_id: str) -> dict[str, Any] | None:
+    """Flag a QUEUED node job to "run next" — set ``is_priority`` so the next
+    worker asking for a node in its queue + capability claims it before older +
+    default-priority peers (``is_priority`` sorts FIRST in the claim ORDER BY,
+    ahead of the priority band and the GPU warm-model affinity tiebreak).
+
+    A no-op on a non-queued row — a job that's already running/terminal can't be
+    re-ordered. Returns the updated row, or ``None`` if nothing was queued under
+    that id (so the caller can tell the flag didn't take).
+    """
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_node_jobs SET is_priority = TRUE "
+            "WHERE id = %s AND status = 'queued' "
+            "RETURNING *",
+            (job_id,),
+        )
+        return cur.fetchone()
+
+
 # ── Claim / update ───────────────────────────────────────────────────────
 #
 # The live claim path for the Postgres-as-queue backend. These ``claim_next_*``
@@ -265,9 +285,10 @@ def claim_next_cpu_job(
     Stamps the lease (``claimed_by=host``,
     ``lease_expires_at=now()+lease_s``) and applies the run-cancel guard.
     CPU has no model cache, so there's no warm-affinity term; ordering
-    is ``priority ASC`` then the ``host_priority``-directed creation
+    is ``is_priority DESC`` (the operator "run next" flag jumps the queue),
+    then ``priority ASC``, then the ``host_priority``-directed creation
     tiebreak."""
-    order = f"c.priority ASC, {_HOST_DIR_TERM}"
+    order = f"c.is_priority DESC, c.priority ASC, {_HOST_DIR_TERM}"
     # CPU jobs carry no required_model, so no capability gate applies.
     sql = _CLAIM_SQL.format(order=order, capability="")
     params = {
@@ -325,6 +346,10 @@ def claim_next_gpu_job(
       the conc-1 serial lane instead of PAR-concurrently in the pool. Empty /
       unset ⇒ legacy split (every no-model GPU job is pool-eligible)."""
     order = (
+        # The operator "run next" flag jumps the whole queue — ahead of the
+        # warm-model affinity tiebreak too (a flagged cold-model node preempts a
+        # warm one; the reload is the accepted cost of "run this next").
+        f"c.is_priority DESC, "
         f"{_AFFINITY_TERM}, "
         f"c.priority ASC, "
         f"{_HOST_DIR_TERM}"
