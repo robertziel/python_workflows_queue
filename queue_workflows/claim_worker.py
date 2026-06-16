@@ -1284,6 +1284,30 @@ _NODE_QUEUES = frozenset({"cpu", "gpu"})
 _DEFAULT_INGEST_QUEUES = frozenset({"fetch", "load"})
 
 
+def _probe_gpu_usable() -> bool | None:
+    """Tri-state CUDA-usability probe for the GPU-blind claim gate.
+
+    * ``True``  — a CUDA device is usable right now.
+    * ``False`` — torch imports but reports NO usable device (incl. a probe that
+      raises, e.g. ``Can't initialize NVML``). THIS is the box-c post-recreate
+      blind condition: the worker image always ships torch, the HOST GPU is
+      healthy, but the container's device cgroup was not injected.
+    * ``None``  — torch is not importable at all. NOT the blind condition (a GPU
+      worker image always has torch) — most likely a non-GPU / test environment.
+      The caller must NOT refuse on ``None`` (that would false-park a box that
+      merely lacks torch, and would break every torch-less GPU unit test).
+
+    Best-effort: never raises. Module-level so a test can monkeypatch it."""
+    try:
+        import torch
+    except Exception:
+        return None
+    try:
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
 class ClaimWorker:
     """One Postgres-as-queue worker. ``queue`` ∈ {cpu, gpu, fetch, load}.
 
@@ -2049,6 +2073,37 @@ class ClaimWorker:
         listen_with_reconnect(worker_control.NOTIFY_CHANNEL, self._stop, _body)
         return result["on"]
 
+    def _refuse_blind_gpu(self) -> bool:
+        """True iff this is a GPU worker whose container cannot use the GPU
+        (``torch.cuda.is_available()`` is False) — the box-c post-recreate race
+        where the HOST GPU is healthy but the device cgroup was not injected.
+
+        Such a worker MUST NOT claim GPU jobs: it would fast-fail every one with
+        ``cudaErrorNoDevice`` ~1 s after claiming — a silent black hole that
+        poisons every run a lane fans onto it (seen on box-a2 2026-06-16: ~70 min
+        GPU-blind, every ``remove_fence`` lane it drew failed while sibling lanes
+        on healthy hosts completed). ``run_forever`` calls this right after the
+        park-gate and exits BEFORE ``heartbeat.start`` when it's True, so the
+        worker also ages out of the capacity gauge. Recovery is a worker restart,
+        which re-probes. cpu/ingest workers never probe and never refuse."""
+        if self.queue != "gpu":
+            return False
+        usable = _probe_gpu_usable()
+        if usable is None or usable:
+            # None ⇒ can't judge (no torch — NOT the blind condition); True ⇒ the
+            # GPU is fine. Either way, don't refuse. Only a definitive False (torch
+            # present but no usable device) is the box-c-blind black hole.
+            return False
+        log.error(
+            "[claim-worker:gpu] host=%s: torch.cuda is unavailable in this "
+            "container (the host GPU may be healthy but the device cgroup was "
+            "not injected — box-c recreate race). REFUSING to claim GPU jobs so "
+            "this worker does not fast-fail every job it draws. Restart this "
+            "worker to re-probe the GPU.",
+            self.host,
+        )
+        return True
+
     def run_forever(self) -> None:
         """Block on ``LISTEN <wake_channel>`` and drain the queue greedily on
         each wake (and on the 1 s safety poll for a dropped NOTIFY). Uses a
@@ -2072,6 +2127,13 @@ class ClaimWorker:
         # RAM is already free; parking keeps us idle + out of the capacity gauge.
         # Returns False only if stopped while parked ⇒ exit without starting up.
         if not self._park_until_enabled():
+            return
+        # GPU-blind self-park: a container that can't use a CUDA device (the box-c
+        # recreate race — host GPU healthy, device cgroup missing) must NOT claim.
+        # It would fast-fail every GPU job ~1 s after claiming (cudaErrorNoDevice)
+        # — a silent black hole. Refuse BEFORE heartbeat.start so it also ages out
+        # of the capacity gauge; recovery is a worker restart, which re-probes.
+        if self._refuse_blind_gpu():
             return
         log.info(
             "[claim-worker:%s] starting (host=%s priority=%d lease=%ds channel=%s)",
