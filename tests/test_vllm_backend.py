@@ -22,9 +22,19 @@ the library's "pure logic with injectable now_fn/sleep_fn seams" philosophy.
 
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 
-from queue_workflows.llm_backends.vllm import VLLMBackend, VLLMState
+from queue_workflows.llm_backends import vllm as vllm_mod
+from queue_workflows.llm_backends.vllm import (
+    VLLMBackend,
+    VLLMState,
+    _default_health_fn,
+    _default_kill_fn,
+    _default_served_model_fn,
+)
 
 
 # ── in-file fake sidecar + seam fns ─────────────────────────────────────────
@@ -481,3 +491,194 @@ def test_request_accounting_inherited():
     assert b.current_model == "m"
     b.mark_request_end()
     assert b.inflight == 0
+
+
+# ── default I/O seams: the ONLY place httpx / subprocess appear ───────────────
+#
+# WHY THIS MATTERS. Every other test in this module injects fakes for the four
+# seams, so the REAL default bodies (vllm.py:116-172) — the sole spot httpx and
+# subprocess are touched — never run. They encode three load-bearing facts:
+#   * health   = an HTTP GET whose status_code is EXACTLY 200 (not "2xx-ish");
+#   * served   = GET /v1/models -> json()['data'][0]['id'] (FIRST entry, after
+#                raise_for_status);
+#   * kill     = pkill exit code == 0 means "signalled one" (exit 1 == none).
+# Flipping any of these (status != 200, indexing data[-1], treating returncode 1
+# as success, or skipping the shutil.which guard) would ship green without these
+# tests. We drive them with a fake httpx module (the bodies `import httpx`
+# lazily, so swapping sys.modules['httpx'] is enough) and fake shutil/subprocess
+# on the vllm module — no live server, no real process signalled.
+
+
+class _FakeResp:
+    """Minimal httpx.Response stand-in: a settable status_code, a json() payload,
+    and a raise_for_status() that optionally raises (mirrors a 4xx/5xx)."""
+
+    def __init__(self, *, status_code: int = 200, json_data=None, raise_exc=None):
+        self.status_code = status_code
+        self._json = json_data
+        self._raise_exc = raise_exc
+
+    def raise_for_status(self):
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        return None
+
+    def json(self):
+        return self._json
+
+
+def _install_fake_httpx(monkeypatch, get_impl):
+    """Make `import httpx` (done lazily inside the default seams) resolve to a fake
+    module whose `get` is `get_impl`. Returns nothing — the patch is undone by
+    monkeypatch teardown."""
+    fake = types.ModuleType("httpx")
+    fake.get = get_impl
+    monkeypatch.setitem(sys.modules, "httpx", fake)
+
+
+# (a) _default_health_fn — health == HTTP 200, EXACTLY.
+
+
+def test_default_health_fn_200_is_true(monkeypatch):
+    seen = {}
+
+    def _get(url, timeout=None):
+        seen["url"] = url
+        seen["timeout"] = timeout
+        return _FakeResp(status_code=200)
+
+    _install_fake_httpx(monkeypatch, _get)
+    assert _default_health_fn("http://h:8000/health") is True
+    # It actually hit the URL it was handed (not a hard-coded path).
+    assert seen["url"] == "http://h:8000/health"
+    assert seen["timeout"] == 5.0
+
+
+def test_default_health_fn_503_is_false(monkeypatch):
+    """A reachable-but-unhealthy sidecar (503) must read as DOWN — only 200 is up.
+    Guards against a `status_code < 500` / truthy-response slip."""
+    _install_fake_httpx(monkeypatch, lambda url, timeout=None: _FakeResp(status_code=503))
+    assert _default_health_fn("http://h:8000/health") is False
+
+
+def test_default_health_fn_get_raising_is_false(monkeypatch):
+    """Connection refused / DNS blip ⇒ False, never propagates (the supervisor
+    polls this on a thread and must not crash)."""
+
+    def _boom(url, timeout=None):
+        raise OSError("connection refused")
+
+    _install_fake_httpx(monkeypatch, _boom)
+    assert _default_health_fn("http://h:8000/health") is False
+
+
+# (b) _default_served_model_fn — first served id from /v1/models.
+
+
+def test_default_served_model_fn_returns_first_id(monkeypatch):
+    seen = {}
+
+    def _get(url, timeout=None):
+        seen["url"] = url
+        return _FakeResp(
+            json_data={"data": [{"id": "Qwen/X"}, {"id": "other/Y"}]}
+        )
+
+    _install_fake_httpx(monkeypatch, _get)
+    assert _default_served_model_fn("http://h:8000") == "Qwen/X"
+    # Probes the /v1/models endpoint built off base_url (not a stray path).
+    assert seen["url"] == "http://h:8000/v1/models"
+
+
+def test_default_served_model_fn_empty_data_is_none(monkeypatch):
+    """An empty `data` list (endpoint up but no model loaded yet) ⇒ None, so the
+    caller takes its optimistic-fallback path rather than IndexError-ing on [0]."""
+    _install_fake_httpx(
+        monkeypatch, lambda url, timeout=None: _FakeResp(json_data={"data": []})
+    )
+    assert _default_served_model_fn("http://h:8000") is None
+
+
+def test_default_served_model_fn_get_raising_is_none(monkeypatch):
+    """A raised get (or a non-2xx that raise_for_status() turns into an exception)
+    ⇒ None, swallowed — the cold-start poll treats it as "not ready yet"."""
+
+    def _boom(url, timeout=None):
+        raise OSError("connection refused")
+
+    _install_fake_httpx(monkeypatch, _boom)
+    assert _default_served_model_fn("http://h:8000") is None
+
+
+def test_default_served_model_fn_4xx_raise_for_status_is_none(monkeypatch):
+    """A non-2xx response whose raise_for_status() raises must also be swallowed to
+    None (the function calls raise_for_status BEFORE json)."""
+
+    def _get(url, timeout=None):
+        return _FakeResp(raise_exc=RuntimeError("404"), json_data={"data": [{"id": "Z"}]})
+
+    _install_fake_httpx(monkeypatch, _get)
+    assert _default_served_model_fn("http://h:8000") is None
+
+
+# (c) _default_kill_fn — pkill exit 0 == signalled one; guarded by shutil.which.
+
+
+def _fake_subprocess(run_impl):
+    """A namespace standing in for the `subprocess` module the seam references."""
+    return types.SimpleNamespace(run=run_impl)
+
+
+def test_default_kill_fn_returncode_0_is_true(monkeypatch):
+    calls = []
+
+    def _run(argv, **kw):
+        calls.append(argv)
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(vllm_mod.shutil, "which", lambda name: "/usr/bin/pkill")
+    monkeypatch.setattr(vllm_mod, "subprocess", _fake_subprocess(_run))
+    assert _default_kill_fn() is True
+    # It invoked pkill -f against the vLLM api_server pattern.
+    assert calls and calls[0][0] == "/usr/bin/pkill"
+    assert "-f" in calls[0]
+    assert any(vllm_mod._VLLM_PROC_PATTERN in str(a) for a in calls[0])
+
+
+def test_default_kill_fn_returncode_1_is_false(monkeypatch):
+    """pkill exit 1 == "no process matched" ⇒ False (nothing was signalled). This
+    is the bit a `returncode != 2`/truthy slip would silently break."""
+    monkeypatch.setattr(vllm_mod.shutil, "which", lambda name: "/usr/bin/pkill")
+    monkeypatch.setattr(
+        vllm_mod,
+        "subprocess",
+        _fake_subprocess(lambda argv, **kw: types.SimpleNamespace(returncode=1)),
+    )
+    assert _default_kill_fn() is False
+
+
+def test_default_kill_fn_no_pkill_is_false_without_running(monkeypatch):
+    """If pkill isn't on PATH the function must short-circuit to False and NEVER
+    reach subprocess.run (guards the which() gate)."""
+    ran = {"n": 0}
+
+    def _run(argv, **kw):  # pragma: no cover — must not be reached
+        ran["n"] += 1
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(vllm_mod.shutil, "which", lambda name: None)
+    monkeypatch.setattr(vllm_mod, "subprocess", _fake_subprocess(_run))
+    assert _default_kill_fn() is False
+    assert ran["n"] == 0
+
+
+def test_default_kill_fn_oserror_is_false(monkeypatch):
+    """subprocess.run blowing up with an OSError ⇒ False, never raises — best-effort
+    SIGTERM, the contract the docstring promises."""
+
+    def _run(argv, **kw):
+        raise OSError("exec format error")
+
+    monkeypatch.setattr(vllm_mod.shutil, "which", lambda name: "/usr/bin/pkill")
+    monkeypatch.setattr(vllm_mod, "subprocess", _fake_subprocess(_run))
+    assert _default_kill_fn() is False

@@ -156,6 +156,73 @@ def test_invariant_mark_failed_returns_none_when_already_failed():
     assert row["error"] == "first_error"
 
 
+# ── mark_awaiting_input contract ──────────────────────────────────────────
+#
+# ``mark_awaiting_input`` is the third transition carrying the same
+# load-bearing ``WHERE status NOT IN ('completed','failed','cancelled')`` guard,
+# yet it is used everywhere else only as happy-path setup and never asserted.
+# If that guard were dropped, a late or duplicate awaiting-input dispatch could
+# *un-finalize* a terminal node back to 'awaiting_input' — re-opening finished
+# work and corrupting run-completion accounting — and nothing would fail. These
+# tests pin the positive transition AND the terminal no-clobber guarantee.
+
+
+def test_invariant_mark_awaiting_input_succeeds_on_running_row():
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="upload", node_module="__input__upload", queue="cpu",
+    )
+    _set_status(job_id, "running")
+    row = node_queue.mark_awaiting_input(job_id)
+    assert row is not None
+    assert row["status"] == "awaiting_input"
+
+
+def test_invariant_mark_awaiting_input_returns_none_when_completed():
+    """A late awaiting-input dispatch must not re-open a completed node."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="cpu",
+    )
+    _set_status(job_id, "running")
+    node_queue.mark_completed(job_id, context_delta={"k": "v1"}, seconds=1.0)
+
+    rv = node_queue.mark_awaiting_input(job_id)
+    assert rv is None
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "completed"
+    assert row["context_delta"] == {"k": "v1"}  # terminal row NOT clobbered
+
+
+def test_invariant_mark_awaiting_input_returns_none_when_failed():
+    """A late awaiting-input dispatch must not re-open a failed node."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="cpu",
+    )
+    _set_status(job_id, "running")
+    node_queue.mark_failed(job_id, error="boom", seconds=0.5)
+
+    rv = node_queue.mark_awaiting_input(job_id)
+    assert rv is None
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "failed"
+    assert row["error"] == "boom"  # terminal row NOT clobbered
+
+
+def test_invariant_mark_awaiting_input_returns_none_when_cancelled():
+    """A late awaiting-input dispatch must not re-open a cancelled node."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="cpu",
+    )
+    _set_status(job_id, "cancelled")
+
+    rv = node_queue.mark_awaiting_input(job_id)
+    assert rv is None
+    assert node_queue.get_node_job(job_id)["status"] == "cancelled"
+
+
 # ── Pre-validation: bad context_delta raises before UPDATE ────────────────
 
 

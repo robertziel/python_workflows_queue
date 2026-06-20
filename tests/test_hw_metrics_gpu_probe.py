@@ -7,6 +7,7 @@ cover the parser shapes and the dispatcher's selection logic.
 
 from __future__ import annotations
 
+import json
 import subprocess
 
 from queue_workflows import hw_metrics as hm
@@ -52,6 +53,83 @@ def test_nvidia_smi_handles_unified_memory_na(monkeypatch):
     assert out == [
         {"id": 0, "use_pct": 35, "vram_used_mb": 0, "vram_total_mb": 0},
     ]
+
+
+# ── rocm-smi parser ──────────────────────────────────────────────────────
+#
+# The engine explicitly targets BOTH nvidia and rocm box families, but the AMD
+# parser had no direct coverage. A regression in the JSON key names, the
+# byte→MB math, the ``cardN`` regex, or the fail-to-``[]`` behaviour would
+# silently zero out all AMD GPU telemetry and — via ``total_vram_mb()``'s
+# ``max()`` — wreck capacity-aware claim gating on the live AMD fleet.
+
+
+_GB = 1024 ** 3
+
+
+def test_rocm_smi_parses_json_and_handles_failures(monkeypatch):
+    """Happy path: byte→MB math, ``system`` key skipped, sorted by card index.
+
+    ``VRAM Total Used Memory (B)`` is in BYTES; the probe must divide by
+    1024*1024 to publish MB consistent with the nvidia parser. The non-``cardN``
+    ``system`` key must be ignored (it carries driver metadata, not a GPU)."""
+    payload = json.dumps({
+        "card0": {
+            "GPU use (%)": "77",
+            "VRAM Total Used Memory (B)": str(3 * _GB),
+            "VRAM Total Memory (B)": str(8 * _GB),
+        },
+        "card1": {
+            "GPU use (%)": 0,
+            "VRAM Total Used Memory (B)": 0,
+            "VRAM Total Memory (B)": str(8 * _GB),
+        },
+        "system": {"driver": "x"},
+    }).encode()
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: payload)
+    assert hm._rocm_smi() == [
+        {"id": 0, "use_pct": 77, "vram_used_mb": 3072, "vram_total_mb": 8192},
+        {"id": 1, "use_pct": 0, "vram_used_mb": 0, "vram_total_mb": 8192},
+    ]
+
+
+def test_rocm_smi_empty_on_failure(monkeypatch):
+    """rocm-smi missing/erroring ⇒ ``[]`` (never raises into the sampler loop)."""
+    def boom(*a, **kw):
+        raise subprocess.CalledProcessError(1, "rocm-smi")
+    monkeypatch.setattr(subprocess, "check_output", boom)
+    assert hm._rocm_smi() == []
+
+
+def test_rocm_smi_empty_on_non_json(monkeypatch):
+    """Garbage output (e.g. a warning banner) ⇒ ``[]``, not a JSON crash."""
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: b"not json")
+    assert hm._rocm_smi() == []
+
+
+def test_rocm_smi_missing_use_key_defaults_to_zero(monkeypatch):
+    """A card dict missing ``GPU use (%)`` keeps the row with ``use_pct`` 0
+    rather than dropping the GPU — VRAM totals still feed capacity gating."""
+    payload = json.dumps({
+        "card0": {
+            "VRAM Total Used Memory (B)": str(2 * _GB),
+            "VRAM Total Memory (B)": str(8 * _GB),
+        },
+    }).encode()
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: payload)
+    assert hm._rocm_smi() == [
+        {"id": 0, "use_pct": 0, "vram_used_mb": 2048, "vram_total_mb": 8192},
+    ]
+
+
+def test_as_int_edge_cases():
+    """``_as_int`` underpins the rocm parser: ``None`` propagates (so the caller
+    can default), percent suffixes are stripped, garbage is ``None``, ints pass
+    through unchanged."""
+    assert hm._as_int(None) is None
+    assert hm._as_int("55%") == 55
+    assert hm._as_int("garbage") is None
+    assert hm._as_int(7) == 7
 
 
 # ── Vendor selection at probe init ───────────────────────────────────────

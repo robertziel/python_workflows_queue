@@ -199,6 +199,48 @@ def test_execute_node_noop_on_already_terminal_row():
     assert evts == []
 
 
+def test_execute_node_noop_on_already_completed_row_when_node_raises():
+    """The FAILED-path twin of the already-terminal no-op contract.
+
+    A node body that raises funnels through ``_finalise_failed``, which calls
+    ``mark_failed_in_txn`` (the load-bearing ``WHERE status NOT IN
+    ('completed','failed','cancelled')`` guard) and only writes the ``failed``
+    dispatch event when that returns a row. If a claim-race winner already
+    flipped the row ``completed``, ``mark_failed_in_txn`` returns ``None`` and
+    we MUST short-circuit to ``"skipped"`` — writing no ``failed`` event (which
+    would inject a spurious failed fan-out into the outbox) and leaving the
+    prior terminal ``context_delta`` untouched (no clobber). Drop the
+    ``if row is None: return "skipped"`` guard and this test goes red.
+    """
+    run_id = _make_run()
+
+    def run(**_kw):
+        raise RuntimeError("boom")
+
+    _install_fake_node("_ne_term_fail", run)
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="_ne_term_fail", queue="cpu",
+    )
+    # A claim-race winner already completed this row with real context.
+    with connection() as c, c.cursor() as cur:
+        cur.execute(
+            "UPDATE workflow_node_jobs SET status='completed', "
+            "context_delta='{\"keep\": true}'::jsonb WHERE id=%s",
+            (job_id,),
+        )
+
+    result = node_executor.execute_node(node_queue.get_node_job(job_id))
+    assert result == "skipped"
+
+    # No spurious 'failed' event leaked into the dispatch outbox.
+    assert _events(run_id) == []
+
+    # The prior terminal state is intact — not clobbered to 'failed'/{}.
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "completed"
+    assert row["context_delta"] == {"keep": True}
+
+
 def test_execute_node_passes_cancel_event_to_opting_in_node():
     run_id = _make_run()
     captured: dict = {}

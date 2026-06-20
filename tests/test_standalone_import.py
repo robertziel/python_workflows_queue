@@ -66,25 +66,39 @@ def test_all_registration_hooks_callable():
 
 
 def test_migrations_dir_ships_the_sql():
+    """The migration chain ships as package data and is well-formed.
+
+    Structural (not a hardcoded list — that goes stale the moment a migration is
+    added, see the 0014→0016 drift this replaced): the forward migrations number
+    CONTIGUOUSLY from 0001, each has a paired ``.down.sql`` (so ``db.downgrade``
+    can always reverse the chain), and nothing else is loose in the dir.
+    """
+    import re
     from queue_workflows import migrations
+
     d = migrations.dir()
-    names = sorted(p.name for p in d.glob("*.sql") if not p.name.endswith(".down.sql"))
-    assert names == [
-        "0001_queue_runs.sql",
-        "0002_node_jobs.sql",
-        "0003_input_submissions.sql",
-        "0004_dispatch_events.sql",
-        "0005_worker_heartbeats.sql",
-        "0006_pg_queue_lease.sql",
-        "0007_ingest_jobs.sql",
-        "0008_multitenant_ingest.sql",
-        "0009_worker_heartbeats_dead_flag.sql",
-        "0010_node_job_watchdog_retries.sql",
-        "0011_node_events.sql",
-        "0012_worker_controls.sql",
-        "0013_worker_controls_llm.sql",
-        "0014_worker_heartbeats_llm_servers.sql",
-    ]
+    forward = sorted(p.name for p in d.glob("*.sql") if not p.name.endswith(".down.sql"))
+    down = {p.name for p in d.glob("*.down.sql")}
+
+    assert forward, "no forward migrations ship in the package"
+
+    versions = []
+    for name in forward:
+        m = re.match(r"^(\d{4})_[A-Za-z0-9_]+\.sql$", name)
+        assert m, f"migration filename not NNNN_name.sql: {name!r}"
+        versions.append(int(m.group(1)))
+        # Every forward step must have a paired down migration.
+        paired = name[: -len(".sql")] + ".down.sql"
+        assert paired in down, f"{name} has no paired down migration {paired!r}"
+
+    # Contiguous chain starting at 1 (0001, 0002, …, no gaps, no dupes).
+    assert versions == list(range(1, len(versions) + 1)), (
+        f"migration versions are not a contiguous 1..N chain: {versions}"
+    )
+    # Every down migration belongs to a forward step (no orphan downs).
+    assert len(down) == len(forward), (
+        f"down-migration count {len(down)} != forward count {len(forward)}"
+    )
 
 
 # ── a real end-to-end round-trip against the engine schema ──────────────────

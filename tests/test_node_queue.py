@@ -446,3 +446,141 @@ def test_snapshot_splits_cpu_vs_gpu():
     assert len(snap["gpu"]["queued"]) == 1
     assert snap["counts"]["cpu_queued"] == 2
     assert snap["counts"]["gpu_queued"] == 1
+
+
+# ── gpu:true-without-model run-expansion guard ───────────────────────────────
+#
+# A ``gpu:true`` node that declares no ``model`` would enqueue with
+# ``required_model=NULL`` → routed to the no-model GPU lane with no warm-cache
+# affinity and no VRAM/capacity accounting, and a blank
+# ``worker_heartbeats.current_model``. ``dispatcher._assert_gpu_nodes_declare_model``
+# (dispatcher.py) turns that mis-declared schema into a LOUD failure at run
+# expansion. Crucially ``start_run`` must NOT let the ValueError propagate into
+# the NodePool tick (which would re-select the still-``queued`` run forever) — it
+# must fail the RUN (status='failed', operator-visible error) and return 0. These
+# tests pin the guard, its exempt-module bypass, and the run-failure path; deleting
+# the guard or re-raising leaves the legacy suite green.
+
+
+def test_start_run_fails_run_for_gpu_node_without_model(temp_workflow):
+    """A gpu:true node with no 'model' must fail the run loudly, enqueue nothing,
+    and return 0 (not raise) so the orchestrator tick doesn't spin forever."""
+    name = temp_workflow([
+        {"id": "g", "node": "gpu_thing", "depends_on": [], "gpu": True},
+    ])
+    run_id = _make_run(workflow_name=name)
+    # Returns 0 rather than raising into the tick.
+    assert dispatcher.start_run(run_id) == 0
+    run = run_store.get_run(run_id)
+    assert run["status"] == "failed"
+    err = run["error"] or ""
+    # The error names the offending module and the concrete failure mode so an
+    # operator can fix the schema from the message alone.
+    assert "required_model=NULL" in err
+    assert "gpu_thing" in err
+    # Nothing was enqueued — no model-blind GPU row leaked onto the queue.
+    assert node_queue.list_jobs_for_run(run_id) == []
+
+
+def test_start_run_allows_gpu_no_model_when_module_exempt(temp_workflow):
+    """A gpu:true/no-model node whose module is registered as a VLM-pool facade
+    (``vlm_pool_node_modules``) is intentionally model-blind — the guard must
+    bypass it and enqueue the row normally (queue='gpu', required_model NULL).
+    The autouse config-reset fixture prevents this from leaking to other tests."""
+    queue_workflows.configure(vlm_pool_node_modules={"gpu_thing"})
+    name = temp_workflow([
+        {"id": "g", "node": "gpu_thing", "depends_on": [], "gpu": True},
+    ])
+    run_id = _make_run(workflow_name=name)
+    assert dispatcher.start_run(run_id) == 1
+    run = run_store.get_run(run_id)
+    assert run["status"] != "failed"
+    jobs = node_queue.list_jobs_for_run(run_id)
+    assert len(jobs) == 1
+    assert jobs[0]["queue"] == "gpu"
+    assert jobs[0]["required_model"] is None
+
+
+def test_start_run_allows_gpu_node_with_model(temp_workflow):
+    """Sanity: the common, correct case — a gpu:true node WITH a declared model —
+    expands without tripping the guard and carries its required_model through."""
+    name = temp_workflow([
+        {"id": "g", "node": "gpu_thing", "depends_on": [], "gpu": True,
+         "model": "sdxl"},
+    ])
+    run_id = _make_run(workflow_name=name)
+    assert dispatcher.start_run(run_id) == 1
+    run = run_store.get_run(run_id)
+    assert run["status"] != "failed"
+    jobs = node_queue.list_jobs_for_run(run_id)
+    assert len(jobs) == 1
+    assert jobs[0]["queue"] == "gpu"
+    assert jobs[0]["required_model"] == "sdxl"
+
+
+# ── skip_if → skipped-row INSERT + skip cascade (driven against the DB) ──────
+#
+# ``skip_if`` is otherwise tested only as isolated pure logic
+# (``_should_skip_node`` returns a bool). These tests drive a real ``skip_if``
+# all the way through ``start_run``/``on_node_completed`` so that:
+#   * ``node_queue.insert_skipped_job`` actually writes a status='skipped' row
+#     (NOT a 'queued' one);
+#   * a skipped row counts as a satisfied predecessor and cascades to enable its
+#     dependents (``_find_ready_nodes`` treats 'skipped' like 'completed'); and
+#   * a branch with a skipped node still reaches a 'completed' run.
+# If ``_process_ready`` ever enqueued skip_if nodes instead of inserting skipped
+# markers, the pure-logic tests would still pass — these would not.
+
+
+def test_skip_if_inserts_skipped_row_and_cascades_to_completion(temp_workflow):
+    """b's skip_if is True ⇒ b gets a status='skipped' row (not 'queued'); c
+    (depending on b) still becomes queued because a skipped predecessor is a
+    satisfied one; and once c completes the whole run reaches 'completed' —
+    skipped counts as terminal."""
+    name = temp_workflow([
+        {"id": "a", "node": "smoke", "depends_on": []},
+        {"id": "b", "node": "smoke", "depends_on": ["a"],
+         "skip_if": {"$value": True}},
+        {"id": "c", "node": "smoke", "depends_on": ["b"]},
+    ])
+    run_id = _make_run(workflow_name=name)
+    dispatcher.start_run(run_id)
+    jobs = {j["node_id"]: j for j in node_queue.list_jobs_for_run(run_id)}
+    node_queue.claim_next_cpu_job(0)
+    node_queue.mark_completed(jobs[_nid("a")]["id"], context_delta={}, seconds=0.1)
+    dispatcher.on_node_completed(run_id, _nid("a"))
+
+    jobs = {j["node_id"]: j for j in node_queue.list_jobs_for_run(run_id)}
+    # b was SKIPPED (a real status='skipped' marker row), not queued.
+    assert jobs[_nid("b")]["status"] == "skipped"
+    # c was enabled by the skipped predecessor and is queued for a worker.
+    assert jobs[_nid("c")]["status"] == "queued"
+
+    # Drive c to completion; the all-terminal check (completed ∪ skipped) fires.
+    node_queue.claim_next_cpu_job(0)
+    node_queue.mark_completed(jobs[_nid("c")]["id"], context_delta={}, seconds=0.1)
+    dispatcher.on_node_completed(run_id, _nid("c"))
+    assert run_store.get_run(run_id)["status"] == "completed"
+
+
+def test_skip_if_false_ref_enqueues_node_not_skipped(temp_workflow):
+    """Negative variant: b's skip_if is a $from ref that resolves FALSE against an
+    upstream node's context_delta ⇒ b must be ENQUEUED ('queued'), never skipped.
+    Catches an inverted skip evaluation (a true/false flip would skip b here)."""
+    name = temp_workflow([
+        {"id": "a", "node": "smoke", "depends_on": []},
+        {"id": "b", "node": "smoke", "depends_on": ["a"],
+         "skip_if": {"$from": f"{_nid('a')}.do_skip"}},
+    ])
+    run_id = _make_run(workflow_name=name)
+    dispatcher.start_run(run_id)
+    jobs = {j["node_id"]: j for j in node_queue.list_jobs_for_run(run_id)}
+    node_queue.claim_next_cpu_job(0)
+    # a's context_delta carries do_skip=False, which b's skip_if reads.
+    node_queue.mark_completed(
+        jobs[_nid("a")]["id"], context_delta={"do_skip": False}, seconds=0.1,
+    )
+    dispatcher.on_node_completed(run_id, _nid("a"))
+
+    jobs = {j["node_id"]: j for j in node_queue.list_jobs_for_run(run_id)}
+    assert jobs[_nid("b")]["status"] == "queued"

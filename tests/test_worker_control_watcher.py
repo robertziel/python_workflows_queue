@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import threading
 import time
+import types
 
 from queue_workflows import claim_worker, node_queue, worker_control
 from queue_workflows.db import connection
@@ -200,3 +201,49 @@ def test_park_gate_resumes_when_enabled(monkeypatch):
     # Turn it back ON — the NOTIFY (or the 0.2 s safety poll) wakes the gate.
     worker_control.enable_worker("parkhost2", "cpu")
     assert done.wait(timeout=5.0), "park gate did not resume after enable"
+
+
+# ── robustness: the two swallow-and-survive branches ───────────────────────────
+
+
+def test_hard_stop_exits_even_when_requeue_raises():
+    """The HARD-stop handler must STILL ``os._exit(79)`` when the pre-exit re-queue
+    raises. A wedged OFF worker holds VRAM; the only reliable release is process
+    death, and the lease-reclaim sweep is the safety net for any in-flight row the
+    re-queue couldn't release. If the exception propagated instead, the worker would
+    stay alive ON the OFF order — a black hole. Regression guard on the swallowed
+    ``except`` branch in ``_apply_hard_stop`` (worker_control.py:354-357), which
+    every happy-path test bypasses."""
+    def _boom() -> int:
+        raise RuntimeError("db down")
+
+    fake = types.SimpleNamespace(
+        host="hx", queue="cpu", requeue_inflight_for_control=_boom,
+    )
+    worker_control.disable_worker("hx", "cpu")  # OFF, hard
+
+    exits: list[int] = []
+    w = worker_control.WorkerControlWatcher(
+        worker=fake, on_exit=lambda code: exits.append(code),
+    )
+    assert w.check_once() is True
+    assert exits == [worker_control.EXIT_CONTROL_HARD_STOP]
+
+
+def test_check_once_swallows_db_error_returns_false(monkeypatch):
+    """A DB blip while reading the control row must be swallowed: ``check_once``
+    returns ``False`` (no stop, no raise) so the long-lived watcher thread survives
+    a PG bounce and re-checks on the next tick. If the error propagated it would
+    crash the watcher and silently disable the operator ON/OFF control plane.
+    Regression guard on ``check_once``'s ``except`` branch (worker_control.py:411-415)."""
+    def _boom(*a, **k):
+        raise RuntimeError("pg bounce")
+
+    monkeypatch.setattr(worker_control, "get_worker_control", _boom)
+
+    exits: list[int] = []
+    w = worker_control.WorkerControlWatcher(
+        worker=_worker("blip"), on_exit=lambda code: exits.append(code),
+    )
+    assert w.check_once() is False
+    assert exits == []

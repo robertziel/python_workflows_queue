@@ -197,6 +197,75 @@ def test_set_worker_control_fires_notify():
     assert payloads == ["host-c:gpu"]
 
 
+# ── caller-transaction (conn=) atomicity ──────────────────────────────────────
+
+
+def test_set_worker_control_with_conn_rides_caller_txn():
+    """Passing ``conn=`` must run the upsert (and the wake NOTIFY the row trigger
+    fires) on the CALLER's transaction, so the control row commits/rolls back
+    atomically with the caller's own work — the same atomicity contract
+    ``enqueue_ingest_job(conn=)`` honours. A regression that committed on a
+    separate pooled connection would leave the row (and a fired NOTIFY) visible
+    even when the caller rolls back."""
+    # Commit case: the row is visible WITHIN the caller's txn before commit, and
+    # survives after the with-block autocommits on clean exit.
+    with connection() as conn:
+        worker_control.set_worker_control(
+            "htx", "cpu", desired_state="off", conn=conn,
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT desired_state FROM worker_controls "
+                "WHERE host_label='htx' AND queue='cpu'"
+            )
+            seen = cur.fetchone()
+        # uncommitted, but the same txn sees its own write.
+        assert seen is not None and seen["desired_state"] == "off"
+    # committed with the caller — a fresh connection now sees it.
+    assert worker_control.get_worker_control("htx", "cpu") is not None
+
+    # Rollback case: the caller's txn aborts ⇒ the control row must NOT exist.
+    with pytest.raises(RuntimeError):
+        with connection() as conn:
+            worker_control.set_worker_control(
+                "hrb", "cpu", desired_state="off", conn=conn,
+            )
+            raise RuntimeError("boom")
+    assert worker_control.get_worker_control("hrb", "cpu") is None
+
+
+def test_set_llm_config_with_conn_rides_caller_txn():
+    """Mirror of the above for the soft LLM-config accessor: ``set_llm_config(conn=)``
+    must also write the row on the caller's transaction so the config change + its
+    dedicated wake NOTIFY commit (or roll back) with the caller's work."""
+    # Commit case: same-txn read sees the write; survives the autocommit.
+    with connection() as conn:
+        worker_control.set_llm_config(
+            "ltx", "gpu", server_type="vllm", parallelism=4, conn=conn,
+        )
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT llm_server_type, llm_parallelism FROM worker_controls "
+                "WHERE host_label='ltx' AND queue='gpu'"
+            )
+            seen = cur.fetchone()
+        assert seen is not None
+        assert seen["llm_server_type"] == "vllm" and seen["llm_parallelism"] == 4
+    cfg = worker_control.llm_config_for("ltx", "gpu")
+    assert cfg.server_type == "vllm" and cfg.parallelism == 4
+
+    # Rollback case: aborting the caller's txn leaves no row ⇒ defaults stand.
+    with pytest.raises(RuntimeError):
+        with connection() as conn:
+            worker_control.set_llm_config(
+                "lrb", "gpu", server_type="vllm", conn=conn,
+            )
+            raise RuntimeError("boom")
+    assert worker_control.get_worker_control("lrb", "gpu") is None
+    # llm_config_for falls back to the all-defaults config (no row).
+    assert worker_control.llm_config_for("lrb", "gpu") == worker_control.LLMConfig()
+
+
 # ── node_queue.requeue_running_for_worker (resume-style, scoped) ───────────────
 
 

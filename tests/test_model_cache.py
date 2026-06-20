@@ -157,12 +157,49 @@ def _warm_cache() -> ModelCache:
 
 
 def test_reaps_idle_model():
-    cache = _warm_cache()
+    """Reaping an idle model must ALSO publish ``current_model=NULL`` — not
+    just drop the in-process handle. The published value is what the
+    dispatcher's warm-model affinity routes on (``worker_heartbeats``); if the
+    reap dropped the handle but left the heartbeat advertising the old model,
+    affinity would keep steering same-model jobs at a now-empty GPU worker.
+
+    So this asserts the documented side effect (model_cache.py reap →
+    ``self._publish(None)``) with a SPY, not a no-op — deleting that publish
+    line must fail this test.
+    """
+    published: list = []
+    cache = ModelCache(
+        publish_current_model=lambda m: published.append(m), idle_ttl_s=600.0,
+    )
+    cache._current_model = "smoke_model"
+    cache._current_handle = object()
     cache._active = 0
     cache._last_used = time.monotonic() - 9999
+
     assert cache.reap_idle_once() is True
     assert cache.current_handle is None
     assert cache.current_model is None
+    # The lone publish during the reap is the NULL advertise — nothing else.
+    assert published == [None]
+
+
+def test_reap_no_op_does_not_publish():
+    """A reap tick that decides NOT to unload (recently used) must publish
+    nothing — affinity routing must keep pointing at the still-warm model.
+    Guards against a stray ``_publish(None)`` on the no-unload path that would
+    flap the heartbeat and lose warm-model affinity for a live model."""
+    published: list = []
+    cache = ModelCache(
+        publish_current_model=lambda m: published.append(m), idle_ttl_s=600.0,
+    )
+    cache._current_model = "smoke_model"
+    cache._current_handle = object()
+    cache._active = 0
+    cache._last_used = time.monotonic()  # just used — under TTL
+
+    assert cache.reap_idle_once() is False
+    assert published == []
+    assert cache.current_model == "smoke_model"
 
 
 def test_keeps_model_while_a_task_is_running():

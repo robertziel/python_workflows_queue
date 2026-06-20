@@ -287,3 +287,98 @@ def test_ingest_snapshot_reports_depth_and_workers():
     assert snap["queues"]["hydro"]["workers"] == 1
     assert snap["queues"]["hydraulic"]["running"] == 1
     assert snap["queues"]["hydraulic"]["workers"] == 0
+
+
+# ── ingest_executor terminal/idempotency contract (rank 9) ───────────────────
+
+
+def test_execute_ingest_job_failed_when_task_raises_and_skipped_when_terminal():
+    """``execute_ingest_job`` is the ingest twin of ``execute_node``'s
+    terminal+idempotency contract, and its failure/skip branches are the part
+    that the happy-path tests never reach:
+
+      * a task that RAISES must be caught, the row marked ``failed`` with the
+        exception text preserved, and the call must return ``"failed"`` —
+        deleting the ``except`` handler would otherwise leak the exception and
+        leave the row stuck ``running``;
+      * an UNKNOWN ``task_name`` (no registered callable) raises inside
+        ``_run_task`` and must funnel through the same fail path;
+      * if the row was already finalized out-of-band (a raced/duplicate claim),
+        ``mark_ingest_completed`` returns ``None`` and the executor must return
+        ``"skipped"`` WITHOUT clobbering the already-stored result.
+    """
+    from queue_workflows import ingest_executor
+
+    # FAILED: a registered task that raises.
+    def boom_task(reason):
+        raise RuntimeError("kaboom")
+
+    queue_workflows.register_ingest_task("boom_task", boom_task)
+    jid = node_queue.enqueue_ingest_job(task_name="boom_task", queue="fetch")
+    job = node_queue.claim_next_ingest_job("fetch", host="h")
+    assert ingest_executor.execute_ingest_job(job) == "failed"
+    failed_row = node_queue.get_ingest_job(jid)
+    assert failed_row["status"] == "failed"
+    assert "kaboom" in (failed_row["error"] or "")
+    assert "RuntimeError" in (failed_row["error"] or "")
+
+    # FAILED: an unknown task_name (raises ValueError inside _run_task).
+    jid2 = node_queue.enqueue_ingest_job(task_name="run_fetch_all", queue="fetch")
+    job2 = node_queue.claim_next_ingest_job("fetch", host="h")
+    assert job2["id"] == jid2
+    job2["task_name"] = "not_registered"  # simulate a stale/unmapped row
+    assert ingest_executor.execute_ingest_job(job2) == "failed"
+    unknown_row = node_queue.get_ingest_job(jid2)
+    assert unknown_row["status"] == "failed"
+    assert "unknown ingest task_name" in (unknown_row["error"] or "")
+
+    # SKIPPED: row finalized out-of-band before the executor's terminal write.
+    queue_workflows.register_ingest_task("ok_task", lambda reason: {"ok": True})
+    jid3 = node_queue.enqueue_ingest_job(task_name="ok_task", queue="load")
+    job3 = node_queue.claim_next_ingest_job("load", host="h")
+    node_queue.mark_ingest_completed(jid3, result={"first": 1}, seconds=0.0)
+    assert ingest_executor.execute_ingest_job(job3) == "skipped"
+    # the pre-existing result must NOT be clobbered by the skipped completion.
+    assert node_queue.get_ingest_job(jid3)["result"] == {"first": 1}
+
+
+# ── ingest terminal twins: clobber / cross-terminal / JSON-prevalidation (14) ─
+
+
+def test_mark_ingest_terminals_no_clobber_cross_terminal_and_json_prevalidated():
+    """The ingest terminal twins must carry the SAME load-bearing guarantees as
+    their node twins (``mark_completed``/``mark_failed``), not merely "the 2nd
+    same-status call returns None":
+
+      * NO-CLOBBER: a 2nd ``mark_ingest_completed`` returns ``None`` AND leaves
+        the first call's stored ``result`` intact (a stray duplicate delivery
+        can't overwrite a finalized payload);
+      * CROSS-TERMINAL: ``mark_ingest_completed`` on an already-``failed`` row
+        returns ``None`` and leaves ``status='failed'`` + the error intact —
+        proving the ``WHERE status NOT IN (...)`` shape, not just a
+        ``status='running'`` guard;
+      * JSON-PREVALIDATION: a non-JSON ``result`` raises BEFORE the UPDATE, so
+        the row is never mutated (it stays ``running``).
+    """
+    # NO-CLOBBER — second completed call must not overwrite the result.
+    jid = node_queue.enqueue_ingest_job(task_name="run_fetch_all", queue="fetch")
+    node_queue.claim_next_ingest_job("fetch", host="h")
+    assert node_queue.mark_ingest_completed(jid, result={"dispatched": 7}) is not None
+    assert node_queue.mark_ingest_completed(jid, result={"x": 99}) is None
+    assert node_queue.get_ingest_job(jid)["result"] == {"dispatched": 7}
+
+    # CROSS-TERMINAL — completed-on-failed returns None, error untouched.
+    jid2 = node_queue.enqueue_ingest_job(task_name="run_load_all", queue="load")
+    node_queue.claim_next_ingest_job("load", host="h")
+    assert node_queue.mark_ingest_failed(jid2, error="boom") is not None
+    assert node_queue.mark_ingest_completed(jid2, result={"ok": 1}) is None
+    cross = node_queue.get_ingest_job(jid2)
+    assert cross["status"] == "failed"
+    assert cross["error"] == "boom"
+
+    # JSON-PREVALIDATION — bad payload raises before any mutation.
+    jid3 = node_queue.enqueue_ingest_job(task_name="run_fetch_all", queue="fetch")
+    node_queue.claim_next_ingest_job("fetch", host="h")
+    with pytest.raises((TypeError, ValueError)):
+        node_queue.mark_ingest_completed(jid3, result={"k": {1, 2, 3}})
+    assert node_queue.get_ingest_job(jid3)["status"] == "running"

@@ -18,6 +18,7 @@ Each test gets a FRESH random namespace, so tests never see each other's jobs
 
 from __future__ import annotations
 
+import inspect
 import os
 import time
 import uuid
@@ -237,6 +238,17 @@ def test_fail_with_event_atomic(backend):
     evs = [e for e in backend.events() if e["job_id"] == job["id"]]
     assert len(evs) == 1 and evs[0]["event_type"] == "failed"
     assert evs[0]["detail"].get("code") == 75
+    # second delivery on the now-terminal row: no transition, and crucially NO
+    # duplicate failed event (the failure-path twin of the complete idempotency —
+    # an adapter that special-cased fail, e.g. a separate Redis Lua branch, could
+    # otherwise append a duplicate event undetected).
+    assert backend.fail_with_event(job["id"], "failed", error="y") is None
+    evs2 = [e for e in backend.events() if e["job_id"] == job["id"]]
+    assert len(evs2) == 1
+    # …and a stray complete on a failed row can't resurrect it or emit an event.
+    assert backend.complete_with_event(job["id"], "completed") is None
+    evs3 = [e for e in backend.events() if e["job_id"] == job["id"]]
+    assert len(evs3) == 1 and evs3[0]["event_type"] == "failed"
 
 
 def test_events_are_ordered_and_filterable_by_seq(backend):
@@ -301,6 +313,34 @@ def test_wake_on_enqueue(backend):
     assert got == "cpu"
 
 
+def test_wake_notify_timeout_and_queue_filtering(backend):
+    """Three documented wake behaviours every worker loop depends on, beyond the
+    positive enqueue→wake path:
+
+      (a) ``wait(timeout)`` returns ``None`` on timeout — the dropped-NOTIFY
+          safety poll (a regression that blocked forever would wedge the loop);
+      (b) out-of-band ``notify(queue)`` wakes a listener (manual wake must work,
+          not silently no-op);
+      (c) the listener must NOT return for a queue it didn't subscribe to (a
+          wrong-queue payload would spuriously wake an idle worker).
+    """
+    # (a) timeout → None
+    with backend.subscribe("cpu") as sub:
+        assert sub.wait(0.3) is None
+
+    # (b) out-of-band notify wakes the subscribed queue
+    with backend.subscribe("cpu") as sub:
+        time.sleep(0.2)  # let pub/sub establish (no backlog)
+        backend.notify("cpu")
+        assert sub.wait(5.0) == "cpu"
+
+    # (c) a notify for a DIFFERENT queue must be filtered out → None
+    with backend.subscribe("cpu") as sub:
+        time.sleep(0.2)
+        backend.notify("gpu")
+        assert sub.wait(0.5) is None
+
+
 # ── heartbeats + operator ON/OFF control ────────────────────────────────────────
 
 
@@ -339,5 +379,106 @@ def test_namespace_isolation(backend):
         # and the reverse: other's job is invisible here
         ojid = other.enqueue("cpu", {})
         assert backend.get(ojid) is None
+
+        # The event log, heartbeats and operator-control rows are EQUALLY
+        # namespace-scoped — a regression that dropped the namespace filter on
+        # events()/workers()/desired_state() would let one tenant read another's
+        # outbox stream, see its workers, or flip its worker OFF. Prove each is
+        # blind across the namespace boundary.
+        job = backend.claim("cpu", "w", lease_s=30)
+        backend.complete_with_event(job["id"], "completed", result={"r": 1})
+        assert backend.events()  # this namespace sees its own event…
+        assert other.events() == []  # …the neighbour sees none
+
+        backend.heartbeat("hostA", "gpu", current_model="m1")
+        assert any(w.get("host") == "hostA" for w in backend.workers("gpu"))
+        assert other.workers("gpu") == []
+
+        backend.set_control("hostA", "gpu", desired_state="off", requested_by="ops")
+        assert backend.desired_state("hostA", "gpu") == "off"
+        assert other.desired_state("hostA", "gpu") == "on"  # absent in neighbour ⇒ ON
     finally:
         other.close()
+
+
+# ── anti-leakage honesty invariant (backend-agnostic — no live server) ──────────
+#
+# base.py's docstring names TWO honesty invariants pinned by this suite: namespace
+# binding (above) and *non-leakage* — "no method takes or returns a driver handle
+# (psycopg cursor, redis pipeline, pymongo session)". Only the first was asserted;
+# a backend that grew a ``conn=``/``cursor=``/``session=`` parameter, returned a
+# psycopg cursor / redis pipeline / pymongo session, or exposed a handle accessor
+# would have passed every test. This guards the architecture's central decoupling
+# claim by introspecting the SPI signatures statically (no server needed).
+
+_DRIVER_PARAM_NAMES = {
+    "conn", "cursor", "session", "pipeline", "tx", "txn", "client", "collection",
+}
+_DRIVER_TYPE_TOKENS = {
+    "Cursor", "Connection", "Pipeline", "ClientSession", "Collection", "Pool",
+}
+_HANDLE_ACCESSORS = {"cursor", "pipeline", "session", "get_connection"}
+
+
+def _concrete_backends():
+    """PostgresBackend always; redis/mongo only if their driver imports."""
+    from queue_workflows.backends.postgres import PostgresBackend
+
+    classes = [PostgresBackend]
+    try:  # redis-py may be absent in a pg-only install
+        from queue_workflows.backends.redis import RedisBackend
+
+        classes.append(RedisBackend)
+    except Exception:
+        pass
+    try:  # pymongo may be absent
+        from queue_workflows.backends.mongodb import MongoBackend
+
+        classes.append(MongoBackend)
+    except Exception:
+        pass
+    return classes
+
+
+def test_no_spi_method_leaks_a_driver_object():
+    from queue_workflows.backends.base import StorageBackend
+
+    spi = set(StorageBackend.__abstractmethods__)
+    assert spi, "expected an abstract SPI to introspect"
+    allowed_public = spi | {"name", "url", "namespace"}
+
+    for cls in _concrete_backends():
+        for name in spi:
+            sig = inspect.signature(getattr(cls, name))
+            for pname, p in sig.parameters.items():
+                # (a) no parameter named after a driver handle
+                assert pname not in _DRIVER_PARAM_NAMES, (
+                    f"{cls.__name__}.{name} exposes driver-handle param '{pname}'"
+                )
+                # (b) no parameter ANNOTATION referencing a driver type
+                ann = "" if p.annotation is inspect.Parameter.empty else str(p.annotation)
+                for tok in _DRIVER_TYPE_TOKENS:
+                    assert tok not in ann, (
+                        f"{cls.__name__}.{name}(param '{pname}') leaks driver type "
+                        f"'{tok}' in its annotation"
+                    )
+            # (b) …and no driver type in the RETURN annotation
+            ret = (
+                ""
+                if sig.return_annotation is inspect.Signature.empty
+                else str(sig.return_annotation)
+            )
+            for tok in _DRIVER_TYPE_TOKENS:
+                assert tok not in ret, (
+                    f"{cls.__name__}.{name} leaks driver type '{tok}' in its "
+                    f"return annotation"
+                )
+
+        # (c) no PUBLIC method beyond the SPI (+ name/url/namespace) exposing a
+        # handle accessor like cursor()/pipeline()/session()/get_connection()
+        for name in dir(cls):
+            if name.startswith("_") or name in allowed_public:
+                continue
+            assert name not in _HANDLE_ACCESSORS, (
+                f"{cls.__name__}.{name} exposes a driver-handle accessor"
+            )

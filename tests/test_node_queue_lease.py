@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import threading
+
 import psycopg
 
 from queue_workflows import db, node_queue
@@ -578,3 +580,128 @@ def test_notify_does_not_fire_on_terminal_transition():
 
     payloads = _listen_and_capture(_complete, timeout=1.0)
     assert payloads == []
+
+
+# ── Exactly-once under live contention (FOR UPDATE SKIP LOCKED) ──────────────
+#
+# Every other test in this module drives the legacy direct-to-PG claim path
+# (``node_queue.claim_next_*``) SEQUENTIALLY. That path — not the StorageBackend
+# SPI exercised by ``tests/test_backend_contract.py`` — is what the real
+# orchestrator/workers run. The core liveness contract is concurrency-1-per-row:
+# a regression dropping ``FOR UPDATE SKIP LOCKED`` (or weakening the claim
+# subselect into a TOCTOU read-then-write) would let two workers claim the same
+# ``running`` row and double-run a node, with NO sequential test failing. These
+# two tests pound the live claim with 8 threads and assert every row is won by
+# exactly one claimer.
+
+
+def _drain_with_threads(claim_fn, *, n_threads: int = 8) -> list[str]:
+    """Run ``claim_fn()`` from ``n_threads`` workers until the queue is empty,
+    collecting every claimed row id (with duplicates, if any) under a lock.
+
+    ``claim_fn`` must take no args and return a claimed-row dict or ``None``.
+    Each call is its own pooled connection + transaction, so the threads race
+    the *real* ``SELECT … FOR UPDATE SKIP LOCKED`` exactly as separate worker
+    processes would.
+    """
+    claimed: list[str] = []
+    lock = threading.Lock()
+    start = threading.Event()
+
+    def worker() -> None:
+        start.wait()
+        while True:
+            row_ = claim_fn()
+            if row_ is None:
+                return
+            with lock:
+                claimed.append(row_["id"])
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    start.set()  # release all workers at once to maximise the race window
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "a claim thread hung"
+    return claimed
+
+
+def test_concurrent_cpu_claims_each_row_won_exactly_once():
+    """40 queued CPU node-jobs, 8 racing claimers: every id is claimed once and
+    only once. A duplicate id in the result ⇒ SKIP-LOCKED exactly-once
+    regressed and two workers double-ran a node."""
+    run_id = make_run(status="running")
+    ids = [
+        node_queue.enqueue_node_job(
+            run_id=run_id, node_id=f"n{i}", node_module="x", queue="cpu",
+        )
+        for i in range(40)
+    ]
+
+    claimed = _drain_with_threads(
+        lambda: node_queue.claim_next_cpu_job(
+            0, host=f"w{threading.get_ident()}", lease_s=30,
+        )
+    )
+
+    assert sorted(claimed) == sorted(ids), "not every row was claimed exactly once"
+    assert len(claimed) == len(set(claimed)), "a row was claimed twice (double-run)"
+
+
+def test_concurrent_gpu_claims_each_row_won_exactly_once():
+    """Same exactly-once contention contract on the GPU lane. The rows carry no
+    ``required_model`` so the capability gate is a no-op and only the
+    SKIP-LOCKED claim itself decides the winner."""
+    run_id = make_run(status="running")
+    ids = [
+        node_queue.enqueue_node_job(
+            run_id=run_id, node_id=f"g{i}", node_module="x", queue="gpu",
+        )
+        for i in range(40)
+    ]
+
+    claimed = _drain_with_threads(
+        lambda: node_queue.claim_next_gpu_job(
+            0, current_model=None, host=f"w{threading.get_ident()}", lease_s=30,
+        )
+    )
+
+    assert sorted(claimed) == sorted(ids), "not every row was claimed exactly once"
+    assert len(claimed) == len(set(claimed)), "a row was claimed twice (double-run)"
+
+
+# ── Warm affinity vs the integer priority band (precedence is PINNED) ─────────
+
+
+def test_warm_affinity_outranks_integer_priority_band():
+    """The GPU claim ORDER BY is ``is_priority DESC, AFFINITY DESC, priority
+    ASC, host_dir`` — warm-model affinity sorts ABOVE the integer priority band,
+    so a warm-model job in a WORSE (higher-number) band is claimed before a cold
+    job in a BETTER band. This pins the shipped precedence: a future edit that
+    reorders ``AFFINITY`` below ``priority ASC`` (e.g. to match the
+    ``claim_next_gpu_job`` docstring's "within their priority band" wording,
+    which states the OPPOSITE of the SQL) would flip claim order under load and
+    THIS test would fail.
+
+    Existing affinity tests all use EQUAL priority, so none of them constrains
+    this precedence — that is the regression gap this test closes.
+    """
+    run_id = make_run()
+    cold = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="cold", node_module="x", queue="gpu",
+        required_model="sdxl", priority=10,   # better (lower) band
+    )
+    warm = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="warm", node_module="x", queue="gpu",
+        required_model="flux", priority=200,  # worse (higher) band, but warm
+    )
+
+    claimed = node_queue.claim_next_gpu_job(
+        0, current_model="flux", host="host-a", known_models=["flux", "sdxl"],
+    )
+    assert claimed is not None
+    assert claimed["id"] == warm, "warm affinity must outrank the integer band"
+    # And the cold better-band job is still waiting — it was not skipped, just
+    # out-ranked.
+    assert node_queue.get_node_job(cold)["status"] == "queued"

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `db.reset_for_tests()` now keys its `*_test` safety guard on the parsed
+  database **name** instead of a suffix of the whole DSN. A socket DSN
+  (`…/<db>_test?host=/var/run/postgresql`) is no longer wrongly refused because
+  its URL ends in the `?host=` query string, and a non-test DB whose URL merely
+  *ends* in `_test` (e.g. an `?options=db_test` query) is no longer wrongly
+  accepted by a schema-dropping helper.
+
 ## [0.5.0] — 2026-06-16
 
 ### Added

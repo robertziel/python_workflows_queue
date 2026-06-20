@@ -276,3 +276,102 @@ def test_claim_gate_unknown_vram_falls_back_to_claim_any(monkeypatch, _registry)
     w = _gpu_worker_with_vram(monkeypatch, None)
     claimed = w._claim()
     assert claimed is not None and claimed["id"] == job_id
+
+
+def test_claim_gate_cold_worker_known_vram_falls_back_to_claim_any(monkeypatch):
+    """A COLD worker (registry not yet populated) on a KNOWN-small box must
+    still claim a model-job — claim-any-capable — so it never wedges the queue.
+
+    The gate distinguishes a *too-small* machine (registry populated, nothing
+    fits ⇒ ``has_models`` True ⇒ claim nothing) from a *cold* worker (registry
+    empty ⇒ ``has_models`` False ⇒ fall back to claim-any). Both produce
+    ``fits == []`` for different reasons; only ``has_models`` tells them apart.
+    Every other claim-gate test runs under the ``_registry`` fixture, so
+    ``has_models`` is always True there — this is the ONLY case exercising the
+    empty-registry leg. Simplifying the guard to ``if vram is not None and not
+    fits: return None`` (dropping the ``has_models`` term) would make this cold
+    worker return None forever and wedge the gpu queue; this test catches that.
+    """
+    # Deliberately do NOT use the _registry fixture: registry must be EMPTY so
+    # known_ids()==[] ⇒ has_models is False. Save/restore to stay a good citizen.
+    saved = dict(model_registry.MODELS)
+    model_registry.clear_for_tests()
+    try:
+        assert model_registry.known_ids() == []  # precondition: cold/empty
+        _run, job_id = _queued_gpu_job("huge")
+        # Known SMALL VRAM (16 GB) — a real int, not None. Were the gate only
+        # `vram is not None and not fits`, this would return None.
+        w = _gpu_worker_with_vram(monkeypatch, 16384)
+        claimed = w._claim()
+        assert claimed is not None
+        assert claimed["id"] == job_id
+        assert node_queue.get_node_job(job_id)["status"] == "running"
+    finally:
+        model_registry.clear_for_tests()
+        for spec in saved.values():
+            model_registry.register(spec)
+
+
+# ── NodePool wiring: _sweep_unassignable_jobs (interval gate + event emit) ──
+
+
+def test_node_pool_unassignable_sweep_emits_event_and_is_gated(monkeypatch):
+    """The NodePool layer that drives ``flag_unassignable_gpu_jobs`` must emit
+    exactly one ``unassignable`` node event per newly-flagged row AND honour its
+    interval gate.
+
+    ``flag_unassignable_gpu_jobs`` is tested directly above, but the wiring in
+    ``NodePool._sweep_unassignable_jobs`` — call the flag fn, log, and emit one
+    ``record_node_event(event_type='unassignable', queue='gpu', ...)`` per row,
+    interval-gated — has no coverage. A regression dropping the event emit, or
+    breaking the interval gate (re-running the flag fn every tick), would go
+    unnoticed. We monkeypatch the flag fn (so no DB rows are needed) and spy the
+    event writer.
+    """
+    from queue_workflows import node_pool
+
+    fake_row = {
+        "id": "j1", "run_id": "r1", "node_id": "n1",
+        "required_model": "huge", "unassignable_reason": "no machine fits 'huge'",
+    }
+    flag_calls = {"n": 0}
+
+    def _fake_flag(*args, **kwargs):
+        flag_calls["n"] += 1
+        return [fake_row]
+
+    events: list[dict] = []
+
+    def _spy_event(**kwargs):
+        events.append(kwargs)
+        return 1
+
+    monkeypatch.setattr(node_queue, "flag_unassignable_gpu_jobs", _fake_flag)
+    monkeypatch.setattr(node_queue, "record_node_event", _spy_event)
+
+    pool = node_pool.NodePool(cpu_workers=0, gpu_workers=0, register_builtins=None)
+
+    # First sweep: interval 0 ⇒ always runs. One flagged row ⇒ exactly one event.
+    pool._unassignable_interval_s = 0.0
+    pool._sweep_unassignable_jobs()
+
+    assert flag_calls["n"] == 1
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["event_type"] == "unassignable"
+    assert ev["queue"] == "gpu"
+    assert ev["run_id"] == "r1"
+    assert ev["node_id"] == "n1"
+    assert ev["model"] == "huge"
+
+    # Now gate hard: interval 60 s, with last_run just stamped by the call above.
+    # Two more sweeps must both be suppressed (the flag fn is NOT re-run).
+    pool._unassignable_interval_s = 60.0
+    flag_calls["n"] = 0
+    events.clear()
+    pool._sweep_unassignable_jobs()
+    pool._sweep_unassignable_jobs()
+
+    assert flag_calls["n"] <= 1  # interval gate suppresses the repeat sweeps
+    # Gated sweeps do no work ⇒ no events leak through.
+    assert events == []

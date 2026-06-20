@@ -53,6 +53,19 @@ def _lease_expiry(job_id: str):
     return node_queue.get_node_job(job_id)["lease_expires_at"]
 
 
+def _node_events(job_id: str) -> list[dict]:
+    """The append-only forensic event log (migration 0011) for one node-job,
+    oldest first. Returned as plain dicts (``detail`` already decoded by psycopg's
+    jsonb adapter) so tests can assert on event_type / attempt / detail directly."""
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT event_type, attempt, detail, error "
+            "FROM workflow_node_events WHERE job_id=%s ORDER BY id",
+            (job_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
 # ── budget table ───────────────────────────────────────────────────────────
 
 
@@ -229,6 +242,20 @@ def test_stall_no_beat_but_gpu_busy_does_not_trip():
     wd.stop()
     assert exits == [], "a busy GPU must never be killed by the stall watchdog"
     assert node_queue.get_node_job(job_id)["status"] == "running"
+    # The no-kill is correct, but the OPERATOR-facing "why did this look stuck
+    # but wasn't" signal must also be emitted (claim_worker._confirm_wedged →
+    # stall_suspected). It's the highest-value invisible signal: if the emit
+    # were dropped the job would still survive and this test would pass without
+    # it — so assert the forensic row carries the busy gpu_sampler value, and
+    # that NO real trip event was recorded.
+    suspected = [e for e in _node_events(job_id) if e["event_type"] == "stall_suspected"]
+    assert suspected, "a confirmed-not-wedged window must record a stall_suspected event"
+    assert any(e["detail"].get("max_sm_pct") == 90 for e in suspected), (
+        "stall_suspected detail must carry the busy gpu sm%% (90) that spared the job"
+    )
+    assert not [e for e in _node_events(job_id) if e["event_type"] == "stall_trip"], (
+        "a busy GPU must never produce a stall_trip event"
+    )
 
 
 def test_stall_no_beat_but_ram_moving_does_not_trip():
@@ -259,6 +286,18 @@ def test_stall_no_beat_but_ram_moving_does_not_trip():
     wd.stop()
     assert exits == [], "RAM moving > delta (loading/preparing) must not trip"
     assert node_queue.get_node_job(job_id)["status"] == "running"
+    # Same operator-facing forensic contract as the busy-GPU case: a suspected-
+    # but-not-wedged window (here: GPU idle but RAM climbing ⇒ loading) must
+    # still record stall_suspected so the "looked stuck, was loading" story is
+    # in-app. GPU was idle here, so the captured max sm%% is 0.
+    suspected = [e for e in _node_events(job_id) if e["event_type"] == "stall_suspected"]
+    assert suspected, "a moving-RAM (loading) window must record a stall_suspected event"
+    assert any(e["detail"].get("max_sm_pct") == 0 for e in suspected), (
+        "stall_suspected detail must carry the idle gpu sm%% (0) seen while RAM moved"
+    )
+    assert not [e for e in _node_events(job_id) if e["event_type"] == "stall_trip"], (
+        "a loading (RAM-moving) node must never produce a stall_trip event"
+    )
 
 
 def test_stall_no_beat_and_gpu_idle_and_ram_static_trips():
@@ -1528,12 +1567,18 @@ def test_run_forever_awaits_schema_before_listening(monkeypatch):
 
     worker = claim_worker.ClaimWorker(queue="cpu", host="h")
 
-    def fake_await():
-        order.append("await_schema")
-        worker.stop()
-
-    monkeypatch.setattr(worker, "await_schema", fake_await)
-    monkeypatch.setattr(worker, "run_once", lambda: order.append("run_once") or False)
+    # The schema gate runs first; do NOT stop here — stopping during await_schema
+    # would short-circuit ``db.listen_with_reconnect`` (which checks the stop flag
+    # BEFORE issuing LISTEN), so LISTEN would never fire. Instead stop on the first
+    # drain, AFTER the LISTEN has been issued, so run_forever issues LISTEN exactly
+    # once and then tears down. (This is what the old test got wrong once LISTEN was
+    # refactored into listen_with_reconnect.)
+    monkeypatch.setattr(worker, "await_schema", lambda: order.append("await_schema"))
+    monkeypatch.setattr(worker, "_park_until_enabled", lambda: True)
+    monkeypatch.setattr(
+        worker, "run_once",
+        lambda: (worker.stop(), order.append("run_once"), False)[-1],
+    )
 
     import psycopg
 
@@ -1549,6 +1594,8 @@ def test_run_forever_awaits_schema_before_listening(monkeypatch):
     assert order[0] == "await_schema"
     assert "listen" in order
     assert order.index("await_schema") < order.index("listen")
+    # LISTEN happens before the queue is drained (run_once).
+    assert order.index("listen") < order.index("run_once")
 
 
 def test_run_forever_gpu_starts_and_stops_llm_backend_factory(monkeypatch):
@@ -2167,3 +2214,200 @@ def test_cpu_heartbeat_concurrency_stays_one(_heartbeat_enabled):
     row = _heartbeat_row("host-hb2", "cpu")
     assert row is not None
     assert row["concurrency"] == 1
+
+
+# ── watchdog-trip forensic node-events (migration 0011), from the WATCHDOG side ─
+# Every watchdog trip emits TWO forensic node-events in one logical trip: the
+# cause event (stall_trip / gpu_health_trip / budget_trip) recorded by
+# _watchdog_trip BEFORE the requeue-vs-fail decision, then the OUTCOME event
+# (requeued under cap, or failed at cap) ridden in by _requeue_job_and_exit /
+# _fail_job_and_exit. test_node_events.py covers only the node_queue layer + the
+# execute_node twin; nothing asserts these from the live watchdog path. Without
+# these tests a deleted/mislabeled _trip_event_type, a dropped 'requeued' emit,
+# or a wrong attempt would pass every existing test.
+
+
+def test_watchdog_trip_records_forensic_and_requeued_node_events():
+    """A StallWatchdog trip under the cap appends BOTH a 'stall_trip' cause event
+    (attempt == the pre-requeue watchdog_retries, 0) and a 'requeued' outcome
+    event (attempt == bumped retries 1, detail.retry == '1', detail.cap == the
+    configured cap) — and NO 'failed' event, because the run stays alive."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="gpu",
+        required_model="qwen_edit", priority=100,
+    )
+    node_queue.claim_next_gpu_job(0, host="h")
+
+    exits: list[int] = []
+    wd = _wedged_stall_watchdog(job_id, on_exit=lambda c: exits.append(c))
+    wd.start()
+    wd.beat()
+    deadline = time.time() + 3.0
+    while time.time() < deadline and not exits:
+        time.sleep(0.02)
+    wd.stop()
+    assert exits and exits[0] == 76
+
+    events = _node_events(job_id)
+    types = [e["event_type"] for e in events]
+    assert "stall_trip" in types, "the cause event must be recorded from the trip site"
+    assert "requeued" in types, "the under-cap outcome event must be recorded"
+    assert "failed" not in types, "an under-cap trip must NOT record a 'failed' event"
+
+    trip = next(e for e in events if e["event_type"] == "stall_trip")
+    assert trip["attempt"] == 0, "the cause event ties to the attempt that wedged (0)"
+
+    requeued = next(e for e in events if e["event_type"] == "requeued")
+    assert requeued["attempt"] == 1, "the requeued event carries the bumped attempt"
+    cap = claim_worker._watchdog_max_retries()
+    assert requeued["detail"].get("retry") == 1
+    assert requeued["detail"].get("cap") == cap, (
+        "the requeued event must record the retry cap so an operator sees N/cap"
+    )
+
+
+def test_gpu_health_trip_records_gpu_health_trip_node_event():
+    """A GpuHealthWatchdog trip labels its cause event 'gpu_health_trip' (not the
+    stall/budget label) — guards _trip_event_type's gpu branch."""
+    job_id = _gpu_health_job()
+    exits: list[int] = []
+    wd = claim_worker.GpuHealthWatchdog(
+        job_id=job_id, interval_s=0.05, idle_pct=5, ram_delta_mb=5120, poll_s=0.01,
+        gpu_sampler=lambda: 0, ram_sampler=lambda: 2048,
+        on_exit=lambda c: exits.append(c),
+    )
+    wd.start()
+    wd.beat()
+    _drain(exits)
+    wd.stop()
+    assert exits and exits[0] == 78
+
+    types = [e["event_type"] for e in _node_events(job_id)]
+    assert "gpu_health_trip" in types, "a health trip must record a 'gpu_health_trip' cause"
+    assert "requeued" in types, "under the cap it also records the requeued outcome"
+    assert "stall_trip" not in types and "budget_trip" not in types, (
+        "the health trip must not be mislabeled as stall/budget"
+    )
+
+
+def test_budget_watchdog_trip_records_budget_trip_node_event():
+    """A wall-clock Watchdog trip labels its cause event 'budget_trip' — guards
+    the _trip_event_type default (neither 'stall' nor 'gpu' in the label)."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="cpu", priority=100,
+    )
+    node_queue.claim_next_cpu_job(0, host="h")
+
+    exits: list[int] = []
+    wd = claim_worker.Watchdog(
+        job_id=job_id, budget_s=0.05,
+        on_exit=lambda code: exits.append(code), poll_s=0.01,
+    )
+    wd.start()
+    deadline = time.time() + 3.0
+    while time.time() < deadline and not exits:
+        time.sleep(0.02)
+    wd.stop()
+    assert exits and exits[0] == 75
+
+    types = [e["event_type"] for e in _node_events(job_id)]
+    assert "budget_trip" in types, "a wall-clock trip must record a 'budget_trip' cause"
+    assert "requeued" in types
+    assert "stall_trip" not in types and "gpu_health_trip" not in types
+
+
+def test_watchdog_trip_at_cap_records_cause_and_failed_node_events():
+    """At the cap the trip path FAILS the run, so the forensic log carries the
+    cause event AND a 'failed' event (NOT 'requeued'); the failed event ties to
+    the final attempt (== the cap, 3)."""
+    run_id, job_id = _running_gpu_job_with_retries(3)  # == default cap
+    exits: list[int] = []
+    wd = claim_worker.GpuHealthWatchdog(
+        job_id=job_id, interval_s=0.05, idle_pct=5, ram_delta_mb=5120, poll_s=0.01,
+        gpu_sampler=lambda: 0, ram_sampler=lambda: 2048,
+        on_exit=lambda c: exits.append(c),
+    )
+    wd.start()
+    wd.beat()
+    _drain(exits)
+    wd.stop()
+    assert exits and exits[0] == 78
+
+    events = _node_events(job_id)
+    types = [e["event_type"] for e in events]
+    assert "gpu_health_trip" in types, "the cause event is recorded even at the cap"
+    assert "failed" in types, "at the cap the outcome event must be 'failed'"
+    assert "requeued" not in types, "at the cap there is no retry, so no 'requeued'"
+
+    failed = next(e for e in events if e["event_type"] == "failed")
+    assert failed["attempt"] == 3, "the failed event ties to the final (capped) attempt"
+
+
+# ── flaky-probe robustness: a missing RAM reading must NOT save a wedged worker ─
+# Source documents (claim_worker.py: _evaluate_window_locked / _confirm_wedged)
+# that a None RAM reading is treated as "no movement", so a flaky cgroup probe
+# can't keep a GPU-idle + wedged worker alive forever. Every other gpu-health /
+# stall trip test feeds a concrete integer ram_sampler, so the None branch is
+# untested: a refactor that defaulted ram_moved=True on None would never kill an
+# idle worker whose RAM file is unreadable.
+
+
+def test_gpu_health_trips_when_gpu_idle_and_ram_probe_unreadable():
+    """GPU idle AND the RAM probe returns None (unreadable cgroup file) ⇒ a None
+    reading is 'no movement', so the worker is still confirmed wedged and the
+    health watchdog trips (exit 78 + under-cap re-queue). A None must NOT be
+    read as RAM-moving (which would spare a genuinely hung worker)."""
+    job_id = _gpu_health_job()
+    exits: list[int] = []
+    wd = claim_worker.GpuHealthWatchdog(
+        job_id=job_id, interval_s=0.05, idle_pct=5, ram_delta_mb=5120, poll_s=0.01,
+        gpu_sampler=lambda: 0,
+        ram_sampler=lambda: None,        # probe unreadable every read
+        on_exit=lambda c: exits.append(c),
+    )
+    wd.start()
+    wd.beat()
+    _drain(exits)
+    wd.stop()
+    assert exits and exits[0] == 78, (
+        "idle GPU + no RAM signal must still be treated as wedged (trip 78)"
+    )
+    assert node_queue.get_node_job(job_id)["status"] == "queued", (
+        "under the cap the unreadable-RAM trip RE-QUEUES the node"
+    )
+
+
+def test_stall_confirm_wedged_true_when_gpu_idle_and_ram_probe_unreadable():
+    """The StallWatchdog twin: GPU idle + ram_sampler returns None ⇒ ram_moved is
+    False (ram_anchor None), so _confirm_wedged returns True and the no-beat
+    timeout TRIPS (exit 76). A flaky RAM probe can't keep a stalled worker alive."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="n", node_module="x", queue="gpu",
+        required_model="qwen_edit",
+    )
+    node_queue.claim_next_gpu_job(0, host="h")
+
+    exits: list[int] = []
+    wd = claim_worker.StallWatchdog(
+        job_id=job_id, stall_timeout_s=0.05, on_exit=lambda c: exits.append(c),
+        poll_s=0.01, confirm_samples=2, confirm_poll_s=0.0,
+        idle_pct=5, ram_delta_mb=5120,
+        gpu_sampler=lambda: 0,
+        ram_sampler=lambda: None,        # probe unreadable
+    )
+    # Direct predicate check: idle GPU + None RAM ⇒ confirmed wedged.
+    assert wd._confirm_wedged() is True, (
+        "GPU idle + unreadable RAM (None) must confirm as wedged, not spared"
+    )
+    # And end-to-end the no-beat timeout trips through to a hard exit.
+    wd.start()
+    wd.beat()
+    deadline = time.time() + 3.0
+    while time.time() < deadline and not exits:
+        time.sleep(0.02)
+    wd.stop()
+    assert exits and exits[0] == 76
+    assert node_queue.get_node_job(job_id)["status"] == "queued"

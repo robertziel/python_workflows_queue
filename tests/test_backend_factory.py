@@ -429,3 +429,53 @@ def test_default_build_vllm_without_hooks_uses_builtin_defaults():
     # The default kill_fn is the module's pkill helper, NOT None.
     from queue_workflows.llm_backends import vllm as vllm_mod
     assert backend._kill_fn is vllm_mod._default_kill_fn
+
+
+# ── STORAGE-backend name gate (queue_workflows.backends) ───────────────────────
+#
+# A DIFFERENT factory than the LLM one above: the pluggable *storage* backend
+# (db_backend="pg"|"redis"|"mongodb"). configure(db_backend=X) routes through
+# ``canonical_backend_name`` to fail fast at configure() time and to collapse
+# aliases (postgres/postgresql → pg, mongo → mongodb). The ValueError raise + the
+# normalization are otherwise uncovered: a regression that silently accepted an
+# unknown name — or stopped folding "mongo" — would surface much later as a
+# confusing lazy-import/connection error instead of a crisp configure() failure.
+
+
+def test_canonical_backend_name_normalizes_aliases_and_rejects_unknown():
+    """``canonical_backend_name`` folds every alias to a canonical provider name,
+    is case/whitespace-insensitive, and raises a *helpful* ValueError (naming both
+    the offending value and the valid set) for anything unknown."""
+    import queue_workflows
+    from queue_workflows.backends import (
+        canonical_backend_name,
+        is_known_backend,
+        known_backends,
+    )
+    from queue_workflows.config import get_config
+
+    # Aliases collapse to the three canonical providers.
+    assert canonical_backend_name("postgres") == "pg"
+    assert canonical_backend_name("postgresql") == "pg"
+    assert canonical_backend_name("PG") == "pg"            # case-insensitive
+    assert canonical_backend_name("  pg  ") == "pg"        # whitespace-trimmed
+    assert canonical_backend_name("mongo") == "mongodb"
+    assert canonical_backend_name("redis") == "redis"
+
+    # The canonical set is exactly the three providers.
+    assert known_backends() == frozenset({"pg", "redis", "mongodb"})
+    assert is_known_backend("mongo") is True              # an alias still "known"
+    assert is_known_backend("sqlite") is False
+
+    # The fail-fast raise names the bad value AND points at the valid names.
+    with pytest.raises(ValueError) as ei:
+        canonical_backend_name("sqlite")
+    msg = str(ei.value)
+    assert "sqlite" in msg and "pg" in msg
+
+    # Drive the REAL gate: configure() rejects an unknown backend up front …
+    with pytest.raises(ValueError):
+        queue_workflows.configure(db_backend="nope")
+    # … and stores the canonical form for a forgiving alias (conftest resets cfg).
+    queue_workflows.configure(db_backend="postgres")
+    assert get_config().db_backend == "pg"

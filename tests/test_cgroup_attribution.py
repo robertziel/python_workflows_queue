@@ -136,7 +136,96 @@ def test_missing_scope_dir_does_not_crash(tmp_path):
     assert out["cpu_percent"] is None
 
 
+class _RaisingContainers:
+    """A docker client whose ``containers.list`` blows up — models a daemon
+    hiccup or a socket that vanished mid-run."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    @property
+    def containers(self):  # accessed as ``client.containers.list``
+        outer = self
+
+        class _C:
+            def list(self, filters=None, ignore_removed=True):
+                raise outer._exc
+
+        return _C()
+
+    def ping(self):
+        return True
+
+
+def test_docker_list_exception_is_swallowed_not_propagated(tmp_path):
+    """A ``containers.list`` failure (daemon hiccup / socket gone mid-run) must
+    be caught and surface as *no attribution this tick* — never propagate, or
+    it would crash the single hw_metrics sampler thread and kill ALL host
+    telemetry. Drives the real ``_our_container_ids`` except-clause (not a
+    stubbed ``_get_docker``)."""
+    _write_scope(tmp_path, "abc123", usage_usec=0, mem_bytes=64 * 1024 * 1024)
+    a = _make(tmp_path)
+    a._docker = _RaisingContainers(RuntimeError("daemon gone"))
+
+    # The real fallback path: list() raises -> _our_container_ids() is None.
+    assert a._our_container_ids() is None
+    # ...and sample() degrades to None rather than raising.
+    assert a.sample() is None
+
+
+def test_get_docker_returns_none_and_logs_once_on_ping_failure(tmp_path, monkeypatch):
+    """``from_env()`` succeeds but ``ping()`` raises (socket file present but
+    daemon dead): ``_get_docker`` must return None, leave ``_docker`` None, and
+    set the log-once flag so the warning isn't spammed every tick."""
+    import sys
+    import types
+
+    pinged = {"n": 0}
+
+    class _DeadClient:
+        def ping(self):
+            pinged["n"] += 1
+            raise OSError("connection refused")
+
+    fake_docker = types.ModuleType("docker")
+    fake_docker.from_env = lambda: _DeadClient()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "docker", fake_docker)
+
+    a = _make(tmp_path)
+    a._docker = None
+    assert a._docker_unavailable_logged is False
+
+    assert a._get_docker() is None
+    assert a._docker is None
+    assert a._docker_unavailable_logged is True
+    assert pinged["n"] == 1
+
+    # Second call: flag already set, so no re-log and (since _docker stays None)
+    # it retries from_env/ping but must still return None without raising.
+    assert a._get_docker() is None
+    assert a._docker_unavailable_logged is True
+
+
+def test_get_docker_returns_none_on_import_error(tmp_path, monkeypatch):
+    """When the docker SDK isn't installed, ``import docker`` raises
+    ImportError inside ``_get_docker`` — it must be caught, return None, and
+    flip the log-once flag (so a pg-only/SDK-less deploy degrades gracefully)."""
+    import sys
+
+    # A None entry in sys.modules makes ``import docker`` raise ImportError.
+    monkeypatch.setitem(sys.modules, "docker", None)
+
+    a = _make(tmp_path)
+    a._docker = None
+    assert a._docker_unavailable_logged is False
+
+    assert a._get_docker() is None
+    assert a._docker_unavailable_logged is True
+
+
 def test_returns_none_when_docker_socket_unavailable(tmp_path, monkeypatch):
+    """Top-level contract: when no docker client is obtainable, ``sample()``
+    returns None so the caller emits only system-wide totals."""
     a = _make(tmp_path)
     a._docker_unavailable_logged = True
     a._docker = None

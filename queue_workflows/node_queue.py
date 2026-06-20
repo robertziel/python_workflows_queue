@@ -327,8 +327,10 @@ def claim_next_gpu_job(
       its registry yet) it falls back to claim-any so a cold worker can't wedge
       the queue.
     * **Warm-model affinity tiebreak** — rows whose ``required_model`` matches
-      the worker's ``current_model`` (``IS NOT DISTINCT FROM``) sort first
-      within their priority band so consecutive same-model jobs don't reload.
+      the worker's ``current_model`` (``IS NOT DISTINCT FROM``) sort ahead of
+      the integer ``priority`` band (only the operator "run next" ``is_priority``
+      flag outranks affinity), so consecutive same-model jobs don't reload — a
+      warm-model job preempts a colder one even from a worse priority band.
       ``host_priority`` then breaks the creation-order tie exactly as on CPU.
     * **Model-presence lane filter** (``require_model``) — splits the GPU queue
       into two disjoint claim sets so a two-lane GPU worker (inline warm-model

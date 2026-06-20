@@ -177,3 +177,46 @@ def test_run_forever_enqueues_on_each_tick_then_stops():
     assert "tick" in reasons
     tick_rows = [r for r in rows if r["reason"] == "tick"]
     assert tick_rows[0]["task_name"] == "run_fetch_all"
+
+
+def test_run_forever_stop_during_wait_fires_no_tick():
+    """A stop() observed DURING the bounded sleep wait must short-circuit BEFORE
+    enqueue_due(due, reason='tick') runs — shutting down mid-wait must not emit a
+    half-due ingest row. This pins the ``if self._stop.is_set(): break`` guard at
+    scheduler.py:175-176: without it, a worker stopped while waiting for a
+    far-future fire would spuriously enqueue a 'tick' on the way out. Only the
+    post-enqueue stop path is otherwise covered, so a regression dropping this
+    guard would slip through silently."""
+    # Single far-future entry; clock starts before its minute so wait_s > 0 and
+    # the loop enters the bounded-sleep wait (never reaching enqueue_due/tick).
+    far = scheduler.ScheduleEntry("ingest-fetch-hourly", 37, "run_fetch_all", "fetch")
+    state = {"now": datetime(2026, 5, 24, 10, 5, 0, tzinfo=timezone.utc)}
+
+    def fake_now():
+        return state["now"]
+
+    calls: list[str] = []
+
+    def fake_sleep(seconds):
+        # Stop lands DURING the wait; crucially, do NOT advance the clock — so
+        # wait_s stays > 0 and only the stop flag ends the wait loop.
+        tick.stop()
+
+    tick = scheduler.Ticker(schedule=[far], now_fn=fake_now, sleep_fn=fake_sleep)
+
+    import queue_workflows.scheduler as sched_mod
+    orig = scheduler.enqueue_due
+
+    def recording_enqueue(due, *, reason="tick"):
+        calls.append(reason)
+        return orig(due, reason=reason)
+
+    sched_mod.enqueue_due = recording_enqueue
+    try:
+        tick.run_forever()
+    finally:
+        sched_mod.enqueue_due = orig
+
+    # The only enqueue_due call was the on-boot kick — never a 'tick'.
+    assert calls == ["boot"]
+    assert [r for r in _ingest_rows() if r["reason"] == "tick"] == []

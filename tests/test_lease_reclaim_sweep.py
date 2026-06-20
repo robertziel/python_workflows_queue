@@ -314,6 +314,38 @@ def test_reclaim_all_leaves_live_workers_running_row():
     assert row["claimed_by"] == "host-x"
 
 
+def test_reclaim_all_requeues_gpu_job_when_only_cpu_heartbeat_is_fresh():
+    """The dead-worker scope is per-QUEUE, not per-host. A fresh heartbeat on a
+    DIFFERENT queue of the same host must NOT shield an orphaned job.
+
+    ``reclaim_all_running_for_resume`` skips a running row only when its claiming
+    host has a fresh heartbeat ON THE JOB'S OWN QUEUE
+    (``h.host_label = j.claimed_by AND h.queue = j.queue``). A host can run a
+    live cpu worker while its gpu worker has died: the gpu job is genuinely
+    orphaned and must be reclaimed. Without the ``AND h.queue = j.queue`` term
+    the live cpu heartbeat would wrongly protect the dead gpu worker's job,
+    leaving it stuck ``running`` until its lease lapses (here, never — fresh
+    600 s lease). Pairs with ``test_reclaim_all_leaves_live_workers_running_row``
+    (same-queue heartbeat ⇒ correctly left alone)."""
+    run_id = _make_run()
+    job_id = node_queue.enqueue_node_job(
+        run_id=run_id, node_id="a", node_module="x", queue="gpu",
+        required_model="qwen_edit", priority=100,
+    )
+    force_lease(job_id, expires_in_s=600)  # claimed_by='host-x', fresh gpu lease
+    node_queue.upsert_worker_heartbeat(
+        host_label="host-x", queue="cpu", concurrency=1,
+    )  # only the CPU worker on host-x is alive; its GPU worker is gone
+
+    rows = node_queue.reclaim_all_running_for_resume()
+    assert any(r["id"] == job_id for r in rows), (
+        "a gpu job must be reclaimed when only a cpu heartbeat is fresh"
+    )
+    row = node_queue.get_node_job(job_id)
+    assert row["status"] == "queued"
+    assert row["claimed_by"] is None
+
+
 def test_reclaim_all_noop_when_nothing_running():
     assert node_queue.reclaim_all_running_for_resume() == []
 

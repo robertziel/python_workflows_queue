@@ -446,10 +446,18 @@ def downgrade(
 
 def reset_for_tests() -> None:
     """TEST-ONLY: drop + recreate the public schema, then re-bootstrap the
-    engine chain. Refuses to run if the DB name doesn't end in ``_test``."""
-    if not db_url().rstrip("/").endswith("_test"):
+    engine chain. Refuses to run if the DB *name* doesn't end in ``_test``."""
+    import urllib.parse
+
+    # Match on the parsed db NAME, not a suffix of the whole URL: a socket DSN
+    # carries the host in a ``?host=/var/run/postgresql`` query string, so the
+    # raw URL ends in the query, not ``_test`` — a whole-URL suffix check would
+    # wrongly refuse a legitimate ``*_test`` DB (and, worse, could be fooled by
+    # a non-test DB whose URL happened to end in ``_test``).
+    db_name = urllib.parse.urlparse(db_url()).path.lstrip("/")
+    if not db_name.endswith("_test"):
         raise RuntimeError(
-            f"reset_for_tests() refused; DB url does not end in _test: {db_url()!r}"
+            f"reset_for_tests() refused; DB name does not end in _test: {db_name!r}"
         )
     with connection() as conn:
         with conn.cursor() as cur:
