@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`ingest_store` — the `db_backend` seam for the ingest queue.** A new
+  backend-agnostic facade lets the flat ingest-family queue run on a non-Postgres
+  `StorageBackend`: `db_backend="pg"` (default) delegates to the existing
+  `node_queue.*ingest*` path against `ingest_jobs` (**byte-identical**), while
+  `"redis"`/`"mongodb"` map the ingest job onto the StorageBackend SPI
+  (`payload={task_name, reason, args}`, priority negated for the SPI's
+  `priority DESC` claim order). Mirrors `node_queue`'s ingest surface plus
+  `renew_ingest_lease`. Additive — no existing module is wired through it yet;
+  routing the live scheduler / claim worker / reclaim sweep through the seam (so
+  the ingest **worker process** runs on redis) is a follow-up.
+
 ### Fixed
 - `db.reset_for_tests()` now keys its `*_test` safety guard on the parsed
   database **name** instead of a suffix of the whole DSN. A socket DSN
