@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`gpu_pool` — shared GPU fleet (a namespace-scoped pool of self-contained GPU
+  tasks).** A new module lets pooled GPU workers across apps claim + execute work
+  from one shared store while each app keeps its own Postgres for run/DAG state.
+  The pool store is a `StorageBackend` resolved **independently** of
+  `config.db_backend` (`configure(gpu_pool_backend=…, gpu_pool_url_env=…,
+  gpu_pool_namespace=…)`); an app keeps `db_backend="pg"` for its DAG. A `PoolTask`
+  carries `{model, handler, inputs, output_dir, params}` (inputs/output_dir
+  reference shared NFS — workers never touch an app DB). Submitter API:
+  `submit_pool_task` / `await_pool_result`; worker API: `register_pool_handler` +
+  `run_pool_worker_once` (`claim` → run `fn(*, inputs, output_dir, params)` →
+  atomic-outbox terminal) + `reclaim_expired_pool_leases`. Capability routing is by
+  **queue name** (a worker's ordered queue set = warm-model-first affinity +
+  box-class separation like `gpu:box-a`/`gpu:box-b`); coarser than the DAG GPU
+  claim (no within-queue affinity sort, no VRAM capacity-fit) — the operator
+  hand-partitions via the queue names. Additive; not yet wired into any app.
 - **`ingest_store` — the `db_backend` seam for the ingest queue.** A new
   backend-agnostic facade lets the flat ingest-family queue run on a non-Postgres
   `StorageBackend`: `db_backend="pg"` (default) delegates to the existing

@@ -74,6 +74,9 @@ def configure(
     cancel_orphan_queued_jobs: bool | None = None,
     vlm_pool_node_modules: frozenset[str] | None = None,
     gpu_self_load_node_modules: frozenset[str] | None = None,
+    gpu_pool_backend: str | None = None,
+    gpu_pool_url_env: str | None = None,
+    gpu_pool_namespace: str | None = None,
 ) -> EngineConfig:
     """Set engine configuration values. Only the passed keyword args are
     mutated; the rest keep their (ai_leads-byte-compatible) defaults. Returns
@@ -122,6 +125,14 @@ def configure(
             cfg.vlm_pool_node_modules = frozenset(vlm_pool_node_modules)
         if gpu_self_load_node_modules is not None:
             cfg.gpu_self_load_node_modules = frozenset(gpu_self_load_node_modules)
+        if gpu_pool_backend is not None:
+            from queue_workflows.backends import canonical_backend_name
+
+            cfg.gpu_pool_backend = canonical_backend_name(gpu_pool_backend)
+        if gpu_pool_url_env is not None:
+            cfg.gpu_pool_url_env = str(gpu_pool_url_env)
+        if gpu_pool_namespace is not None:
+            cfg.gpu_pool_namespace = str(gpu_pool_namespace)
     return cfg
 
 
@@ -254,3 +265,17 @@ def set_ingest_schedule(schedule: list) -> None:
     cfg = get_config()
     with cfg._lock:
         cfg.ingest_schedule = list(schedule)
+
+
+# ── shared GPU pool (pivot B) ──
+
+
+def register_pool_handler(name: str, callable_: Callable[..., dict]) -> None:
+    """Register a GPU-pool handler under ``name`` (deployed on a GPU box). A
+    pooled worker resolves a claimed task's ``handler`` to it and runs
+    ``fn(*, inputs, output_dir, params) -> dict``. The op CODE lives here on the
+    box; the DATA lives on shared NFS (``inputs``/``output_dir`` are paths the
+    handler interprets). A submit-only app needn't register any."""
+    cfg = get_config()
+    with cfg._lock:
+        cfg.gpu_pool_handlers[name] = callable_

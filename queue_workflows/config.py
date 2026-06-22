@@ -122,6 +122,23 @@ class EngineConfig:
     #: SPI rows via a ``namespace`` column.
     db_namespace: str = ""
 
+    # ── shared GPU pool (pivot B) ──────────────────────────────────────────────
+    #: The shared GPU pool is a StorageBackend queue addressed INDEPENDENTLY of
+    #: ``db_backend`` — an app keeps ``db_backend="pg"`` for its own run/DAG state
+    #: while pooled GPU workers across apps claim self-contained GPU tasks from one
+    #: shared (redis) store. These select that pool store; the pool DSN is env
+    #: (deployment topology), like the redis/mongo DSNs.
+    gpu_pool_backend: str = "redis"
+    gpu_pool_url_env: str = "QUEUE_WORKFLOWS_GPU_POOL_URL"
+    #: Logical tenant namespace for the shared pool (every app + GPU box that
+    #: should share a fleet uses the SAME value); keys are scoped by it.
+    gpu_pool_namespace: str = "gpu_pool"
+    #: ``handler -> Callable`` the POOLED WORKER runs. Keyed by the task's
+    #: ``handler`` name; ``fn(*, inputs, output_dir, params) -> dict``. The op CODE
+    #: is deployed on the GPU box (this map); the DATA lives on shared NFS. Empty
+    #: on a submitter that only enqueues (it needn't know how to run them).
+    gpu_pool_handlers: dict[str, Callable] = field(default_factory=dict)
+
     # ── node-module resolver (overrides node_module_package when set) ──────────
     #: ``Callable[[str], module]`` — resolve a stored ``node_module`` string to
     #: an imported module exposing ``run(...)``. Default builds from
