@@ -15,9 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"redis"`/`"mongodb"` map the ingest job onto the StorageBackend SPI
   (`payload={task_name, reason, args}`, priority negated for the SPI's
   `priority DESC` claim order). Mirrors `node_queue`'s ingest surface plus
-  `renew_ingest_lease`. Additive — no existing module is wired through it yet;
-  routing the live scheduler / claim worker / reclaim sweep through the seam (so
-  the ingest **worker process** runs on redis) is a follow-up.
+  `renew_ingest_lease`.
+- **Live ingest work path wired through the seam.** The scheduler
+  (`enqueue_due`), the claim worker's ingest claim + lease-renew + watchdog-fail,
+  the ingest executor's terminal marks, and the orchestrator's ingest
+  lease-reclaim now route through `ingest_store`, so with `db_backend="redis"` a
+  worker's `run_once()` claims → executes → finalizes an ingest job entirely on
+  redis (verified PG-free). The `pg` path is byte-identical (seam delegates to
+  `node_queue`); the DAG node-job path is untouched. Still PG-coupled (next
+  slice): the long-lived `run_forever` daemon bootstrap — `await_schema`, the
+  operator park gate, the `LISTEN` wake loop, and `worker_heartbeats` — so a
+  standalone redis-only worker process cannot yet boot without Postgres.
 
 ### Fixed
 - `db.reset_for_tests()` now keys its `*_test` safety guard on the parsed

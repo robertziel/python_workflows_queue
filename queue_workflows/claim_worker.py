@@ -61,7 +61,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
-from queue_workflows import node_executor, node_queue, worker_control
+from queue_workflows import ingest_store, node_executor, node_queue, worker_control
 from queue_workflows.config import get_config
 from queue_workflows.db import connection, db_url
 
@@ -259,6 +259,14 @@ class LeaseRenewer:
 
     def _renew_once(self) -> bool:
         try:
+            # Ingest leases go through the db_backend seam so a redis-backed
+            # ingest job renews on redis; the seam's pg path is the identical
+            # ``ingest_jobs`` UPDATE this used to run inline. DAG node-job leases
+            # (``workflow_node_jobs``) stay on the direct-PG path, unchanged.
+            if self._table == "ingest_jobs":
+                return ingest_store.renew_ingest_lease(
+                    self._job_id, self._claimed_by, lease_s=self._lease_s,
+                )
             with connection() as conn, conn.cursor() as cur:
                 cur.execute(
                     f"UPDATE {self._table} "
@@ -366,8 +374,9 @@ def _fail_job_and_exit(
     try:
         if table == "ingest_jobs":
             # Ingest job: no parent run, no dispatch-event outbox — just mark
-            # the row failed so a reclaim/operator sees it.
-            node_queue.mark_ingest_failed(job_id, error=error)
+            # the row failed so a reclaim/operator sees it. Routed through the
+            # db_backend seam so a redis-backed ingest job is failed on redis.
+            ingest_store.mark_ingest_failed(job_id, error=error)
         else:
             # DAG node-job: mark failed + write the dispatch-event row in ONE
             # txn so the run fails through to downstream nodes even though we're
@@ -1423,7 +1432,7 @@ class ClaimWorker:
         the VLM pool disabled (PAR clamps to >= 1, but no no-model jobs exist)
         this is a pure narrowing — diffusion behaviour is byte-identical."""
         if self._is_ingest:
-            return node_queue.claim_next_ingest_job(
+            return ingest_store.claim_next_ingest_job(
                 self.queue, host=self.host, lease_s=self.lease_s,
             )
         if self.queue == "gpu":

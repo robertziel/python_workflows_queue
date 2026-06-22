@@ -31,7 +31,13 @@ import os
 import threading
 from typing import Callable
 
-from queue_workflows import dispatcher, input_listener, node_queue, run_store
+from queue_workflows import (
+    dispatcher,
+    ingest_store,
+    input_listener,
+    node_queue,
+    run_store,
+)
 from queue_workflows.db import connection
 
 log = logging.getLogger(__name__)
@@ -570,7 +576,7 @@ class NodePool:
             return
         self._ingest_reclaim_last_run = now
 
-        reclaimed = node_queue.reclaim_expired_ingest_leases()
+        reclaimed = ingest_store.reclaim_expired_ingest_leases()
         for row in reclaimed:
             log.warning(
                 "[node-pool] reclaimed expired-lease ingest job %s "
