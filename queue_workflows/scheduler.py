@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
-from queue_workflows import node_queue
+from queue_workflows import ingest_store
 
 log = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ def enqueue_due(due: list[ScheduleEntry], *, reason: str = "tick") -> list[str]:
     inserted row ids."""
     ids: list[str] = []
     for e in due:
-        jid = node_queue.enqueue_ingest_job(
+        jid = ingest_store.enqueue_ingest_job(
             task_name=e.task_name, queue=e.queue, reason=reason,
         )
         ids.append(jid)

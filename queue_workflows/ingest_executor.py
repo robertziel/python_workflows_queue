@@ -19,7 +19,7 @@ import logging
 import time
 import traceback
 
-from queue_workflows import node_queue
+from queue_workflows import ingest_store
 
 log = logging.getLogger(__name__)
 
@@ -80,12 +80,12 @@ def execute_ingest_job(job: dict) -> str:
     except Exception as exc:
         err = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
         log.error("[ingest-executor] %s %s", job_id, err)
-        row = node_queue.mark_ingest_failed(
+        row = ingest_store.mark_ingest_failed(
             job_id, error=err, seconds=time.time() - t0,
         )
         return "failed" if row is not None else "skipped"
 
-    row = node_queue.mark_ingest_completed(
+    row = ingest_store.mark_ingest_completed(
         job_id, result=result, seconds=time.time() - t0,
     )
     if row is None:
