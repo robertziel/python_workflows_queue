@@ -60,10 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   standalone redis-only worker process cannot yet boot without Postgres.
 
 ### Changed
-- **Repo split into two distributions: `queue-workflows-client` (per-project data
-  plane) + `queue-workflows-conductor` (control plane).** The client keeps the
-  `queue_workflows` import package (so consumers' `import queue_workflows` is
-  unchanged) and all worker/orchestrator/dispatch/queue/model/llm/gpu_pool
+- **Repo split into two distributions: `queue_workflows` (the client / per-project
+  data plane, distribution name unchanged) + `queue-workflows-conductor` (control
+  plane).** The client keeps both its `queue_workflows` import package AND its
+  `queue_workflows` distribution name — consumers install it by path (editable /
+  PYTHONPATH mount / a wheel built from this tree that globs `queue_workflows-*.whl`),
+  so renaming the distribution would break them for no benefit. The client retains
+  all worker/orchestrator/dispatch/queue/model/llm/gpu_pool
   modules — including `worker_control` and `hw_metrics`, which the worker imports
   (the claim worker enforces ON/OFF; the worker/orchestrator emit hw_metrics).
   The conductor is a new `queue_workflows_conductor` package under `conductor/`

@@ -3,7 +3,12 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "queue-workflows-client"
+# The CLIENT distribution keeps its established name `queue_workflows` — consumers
+# install it by PATH (editable / PYTHONPATH mount / wheel built from this tree),
+# not by index name, and one consumer's wheel build globs `queue_workflows-*.whl`,
+# so renaming the dist would break it for zero benefit. The split is still real:
+# the conductor ships as the separate `queue-workflows-conductor` distribution.
+name = "queue_workflows"
 version = "0.5.0"
 description = "queue-workflows CLIENT (per-project data plane): Postgres-as-queue engine — SKIP LOCKED claim, lease reclaim, DAG dispatch, GPU warm-model cache. The conductor (control plane) ships as the separate queue-workflows-conductor distribution."
 readme = "README.md"

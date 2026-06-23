@@ -24,7 +24,7 @@ classifiers = [
 # worker_control). The edge points one way — conductor -> client — so the client
 # (worker/orchestrator) never imports the conductor.
 dependencies = [
-    "queue-workflows-client",
+    "queue_workflows",
 ]
 
 [project.scripts]

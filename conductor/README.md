@@ -3,7 +3,7 @@
 The **conductor** (control-plane) distribution for `queue-workflows` — deployed
 **apart from** the per-project client.
 
-It depends on `queue-workflows-client` and consumes its primitives
+It depends on the client distribution (`queue_workflows`) and consumes its primitives
 (`node_queue.fleet_snapshot`, `worker_control`). The dependency edge points one
 way — **conductor → client** — so the client (worker / orchestrator) never
 imports the conductor.
