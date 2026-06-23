@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "queue-workflows-conductor"
+version = "0.1.0"
+description = "Conductor (control plane) for queue-workflows — read-only fleet view + operator control surface, deployed apart from the per-project client."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Robert Zieliński", email = "hello@robertz.co" }]
+keywords = ["postgres", "queue", "workflow", "fleet", "control-plane", "conductor"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+    "Topic :: System :: Distributed Computing",
+]
+
+# The conductor is a CONSUMER of the client's primitives (node_queue.fleet_snapshot,
+# worker_control). The edge points one way — conductor -> client — so the client
+# (worker/orchestrator) never imports the conductor.
+dependencies = [
+    "queue-workflows-client",
+]
+
+[project.scripts]
+queue-conductor = "queue_workflows_conductor.conductor:cli"  # read-only fleet capacity view
+
+[tool.hatch.build.targets.wheel]
+packages = ["queue_workflows_conductor"]

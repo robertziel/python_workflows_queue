@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "queue_workflows"
+name = "queue-workflows-client"
 version = "0.5.0"
-description = "Postgres-as-queue workflow engine (SKIP LOCKED claim, lease reclaim, DAG dispatch, GPU warm-model cache)."
+description = "queue-workflows CLIENT (per-project data plane): Postgres-as-queue engine — SKIP LOCKED claim, lease reclaim, DAG dispatch, GPU warm-model cache. The conductor (control plane) ships as the separate queue-workflows-conductor distribution."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -35,7 +35,7 @@ queue-claim-worker   = "queue_workflows.claim_worker:main"   # generic CLIs (use
 queue-scheduler      = "queue_workflows.scheduler:main"
 queue-orchestrator   = "queue_workflows.orchestrator:main"
 queue-worker-control = "queue_workflows.worker_control:main"  # turn a (host,queue) worker ON/OFF
-queue-conductor      = "queue_workflows.conductor:cli"        # read-only fleet capacity view (worker_heartbeats)
+# queue-conductor moved to the separate queue-workflows-conductor distribution (conductor/pyproject.toml)
 
 [tool.hatch.build.targets.wheel]
 packages = ["queue_workflows"]
@@ -45,3 +45,8 @@ packages = ["queue_workflows"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Two distributions live in this repo: the client (queue_workflows, at root) and
+# the conductor (queue_workflows_conductor, under conductor/). Put both import
+# roots on the path so the shared test suite can exercise either package without
+# a separate install step.
+pythonpath = [".", "conductor"]

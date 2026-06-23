@@ -1,22 +1,27 @@
-"""``queue-conductor`` — the operator-facing READ side of the GO-half conductor.
+"""``queue-conductor`` — the operator-facing READ side of the conductor.
+
+This module lives in the **separate** ``queue-workflows-conductor`` distribution,
+which **depends on** ``queue-workflows-client`` (the per-project data plane) and
+imports its primitives — never the other way round. The client (worker /
+orchestrator) must not import the conductor, so the dependency edge points one
+way: conductor → client.
 
 A single-DB fleet capacity view: it renders :func:`queue_workflows.node_queue.fleet_snapshot`
 (the observed ``worker_heartbeats`` rows — capacity, ``current_model``, fresh /
-dead) for whatever database the engine's ``db_url_env`` points at, exactly like
-every other console script (``queue-orchestrator`` / ``queue-claim-worker`` /
+dead) for whatever database the client's ``db_url_env`` points at, exactly like
+every client console script (``queue-orchestrator`` / ``queue-claim-worker`` /
 ``queue-worker-control``). The operator supplies the DSN via env; there are **no
 stored fleet credentials** and **no networked service** here.
 
 Scope, on purpose:
 
-  * READ-ONLY. Worker ON/OFF control already lives in ``queue-worker-control``
-    (``worker_control.set_worker_control``) — this module does not duplicate it.
+  * READ-ONLY. Worker ON/OFF control lives in the client's ``queue-worker-control``
+    (``queue_workflows.worker_control.set_worker_control``) — not duplicated here.
   * SINGLE-DB. It is the building block of the plan's Phase-1 "Option A" (an
     operator runs the view per app DB). The **networked, multi-DB daemon + web
     UI** that would aggregate ~35 app DBs — and the inference proxy — are a
-    separate, human-gated build (they touch production credentials / shared
-    infra and aren't testable against one local Postgres). See
-    ``worklog/conductor-client-split.md``.
+    separate, human-gated build that will accrete into THIS conductor package.
+    See ``worklog/conductor-client-split.md``.
 
 Usage::
 
@@ -33,7 +38,7 @@ from typing import Any
 
 from queue_workflows import node_queue
 
-log = logging.getLogger("queue_workflows.conductor")
+log = logging.getLogger("queue_workflows_conductor.conductor")
 
 
 def render_fleet(rows: list[dict[str, Any]], *, as_json: bool = False) -> str:
@@ -108,10 +113,11 @@ def main(argv: list[str] | None = None) -> int:
 
 def cli(argv: list[str] | None = None) -> int:
     """Console entry point (``queue-conductor``): run :func:`main`, then release
-    the connection pool so this short-lived process exits promptly and cleanly —
-    otherwise the pool's background threads are only reaped at interpreter
-    shutdown, printing noisy ``couldn't stop thread`` warnings. Programmatic /
-    in-process callers use :func:`main` directly so their pool isn't torn down."""
+    the client's connection pool so this short-lived process exits promptly and
+    cleanly — otherwise the pool's background threads are only reaped at
+    interpreter shutdown, printing noisy ``couldn't stop thread`` warnings.
+    Programmatic / in-process callers use :func:`main` so their pool isn't torn
+    down."""
     from queue_workflows import db
 
     try:

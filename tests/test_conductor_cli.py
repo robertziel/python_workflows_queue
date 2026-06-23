@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import json
 
-from queue_workflows import conductor, node_queue
+from queue_workflows import node_queue
+from queue_workflows_conductor import conductor
 
 
 # ── pure formatter (no DB) ────────────────────────────────────────────────────

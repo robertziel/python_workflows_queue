@@ -60,6 +60,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   standalone redis-only worker process cannot yet boot without Postgres.
 
 ### Changed
+- **Repo split into two distributions: `queue-workflows-client` (per-project data
+  plane) + `queue-workflows-conductor` (control plane).** The client keeps the
+  `queue_workflows` import package (so consumers' `import queue_workflows` is
+  unchanged) and all worker/orchestrator/dispatch/queue/model/llm/gpu_pool
+  modules — including `worker_control` and `hw_metrics`, which the worker imports
+  (the claim worker enforces ON/OFF; the worker/orchestrator emit hw_metrics).
+  The conductor is a new `queue_workflows_conductor` package under `conductor/`
+  that **depends on** the client and consumes its primitives — the dependency
+  edge points one way (conductor → client), so the client never imports the
+  conductor. The `queue-conductor` console script moved to the conductor
+  distribution; the client owns the migration chain. Consumer repos fetch the
+  client; the conductor deploys apart.
 - **Default per-box CPU-worker count is now the box's available cores** (was a
   hardcoded `5`). `node_pool.cpu_worker_count()` defaults to a new cgroup-aware
   `_available_cpus()` — cgroup-v2 `cpu.max` quota → cgroup-v1 CFS quota → CPU
