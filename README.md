@@ -1,6 +1,8 @@
 <div align="center">
 
-# ⚙️⚡ queue_workflows
+# 🦜 broker_parrot
+
+_Python package: **`queue_workflows`** (import name unchanged) · built on Postgres._
 
 ### Turn your local GPUs into one self-healing inference fleet.
 
@@ -10,7 +12,7 @@ Orchestrate model jobs across the machines you already own — keep each model w
 
 ⭐⭐⭐
 
-[![Release](https://img.shields.io/github/v/release/robertziel/python_workflows_queue?sort=semver&label=release)](https://github.com/robertziel/python_workflows_queue/releases)
+[![Release](https://img.shields.io/github/v/release/robertziel/broker_parrot?sort=semver&label=release)](https://github.com/robertziel/broker_parrot/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](#installation)
 [![Postgres](https://img.shields.io/badge/postgres-14%2B-336791.svg)](#installation)
@@ -107,18 +109,18 @@ Requires **Python 3.10+** and **Postgres 14+**. The only hard runtime dependency
 Not on PyPI yet — install straight from GitHub:
 
 ```bash
-pip install "queue_workflows @ git+https://github.com/robertziel/python_workflows_queue"
+pip install "queue_workflows @ git+https://github.com/robertziel/broker_parrot"
 ```
 
 Optional extras:
 
 ```bash
 # hw_metrics CPU/RAM probe (GPU probe shells out, no extra dep)
-pip install "queue_workflows[metrics] @ git+https://github.com/robertziel/python_workflows_queue"
+pip install "queue_workflows[metrics] @ git+https://github.com/robertziel/broker_parrot"
 
 # alternative storage backends
-pip install "queue_workflows[redis]   @ git+https://github.com/robertziel/python_workflows_queue"
-pip install "queue_workflows[mongodb] @ git+https://github.com/robertziel/python_workflows_queue"   # needs a replica set
+pip install "queue_workflows[redis]   @ git+https://github.com/robertziel/broker_parrot"
+pip install "queue_workflows[mongodb] @ git+https://github.com/robertziel/broker_parrot"   # needs a replica set
 ```
 
 ---
@@ -579,7 +581,7 @@ be.complete_with_event(job["id"], "completed", result={"ok": True})   # go termi
 ```
 
 ```bash
-pip install "queue_workflows[redis] @ git+https://github.com/robertziel/python_workflows_queue"   # or [mongodb] (mongo needs a replica set)
+pip install "queue_workflows[redis] @ git+https://github.com/robertziel/broker_parrot"   # or [mongodb] (mongo needs a replica set)
 ```
 
 The port is deliberately **non‑leaky**: no method takes or returns a driver handle (psycopg cursor / redis pipeline / pymongo session), and each backend is **bound to one namespace** so two tenants on one server stay isolated.
@@ -702,4 +704,4 @@ PRs and issues are **welcome** — bug reports, backend providers, docs, and rou
 
 **MIT** © Robert Zieliński — see [`LICENSE`](LICENSE). Use it, fork it, ship it.
 
-📓 [Changelog](CHANGELOG.md) · 📚 [Docs](docs/) · 🏷️ [Releases](https://github.com/robertziel/python_workflows_queue/releases)
+📓 [Changelog](CHANGELOG.md) · 📚 [Docs](docs/) · 🏷️ [Releases](https://github.com/robertziel/broker_parrot/releases)

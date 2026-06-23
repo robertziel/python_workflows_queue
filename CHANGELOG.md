@@ -60,6 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   standalone redis-only worker process cannot yet boot without Postgres.
 
 ### Changed
+- **Project rebranded to `broker_parrot`** (README, docs, GitHub repo). This is a
+  **display-only** rebrand: the Python **import package and distribution name stay
+  `queue_workflows`**, the console scripts stay `queue-*`, and the env vars are
+  unchanged — so every consumer keeps working with no edits. Only human-facing
+  branding and the GitHub URLs change.
 - **Repo split into two distributions: `queue_workflows` (the client / per-project
   data plane, distribution name unchanged) + `queue-workflows-conductor` (control
   plane).** The client keeps both its `queue_workflows` import package AND its
@@ -418,8 +423,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dispatch-event outbox, a GPU warm-model cache, periodic ingest work + a
   PG-native scheduler, and per-host hw-metrics telemetry. Migrations 0001–0007.
 
-[Unreleased]: https://github.com/robertziel/python_workflows_queue/compare/v0.4.0...HEAD
-[0.4.0]: https://github.com/robertziel/python_workflows_queue/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/robertziel/python_workflows_queue/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/robertziel/python_workflows_queue/releases/tag/v0.2.0
-[0.1.0]: https://github.com/robertziel/python_workflows_queue/commit/9ddaf4ae80d906e9d286403bab015e56ba9899ed
+[Unreleased]: https://github.com/robertziel/broker_parrot/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/robertziel/broker_parrot/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/robertziel/broker_parrot/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/robertziel/broker_parrot/releases/tag/v0.2.0
+[0.1.0]: https://github.com/robertziel/broker_parrot/commit/9ddaf4ae80d906e9d286403bab015e56ba9899ed
