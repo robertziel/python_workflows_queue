@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`node_queue.fleet_snapshot()` — read-only per-`(host, queue)` fleet capacity
+  view.** Returns the observed `worker_heartbeats` rows with their advertised
+  capability (`current_model`, `known_models`, `llm_servers_available`,
+  `vram_total_mb`/`fits_models`), each augmented with derived `fresh`
+  (`last_seen` within `stale_after_s`, default 30 s) and `flagged_dead`
+  (`last_flagged_dead_at` set) flags. The telemetry read model an operator
+  fleet view consumes — the per-worker counterpart to the count-only
+  `snapshot`/`ingest_snapshot`; surfaces stale and dead-flagged workers rather
+  than filtering them.
 - **`gpu_pool` — shared GPU fleet (a namespace-scoped pool of self-contained GPU
   tasks).** A new module lets pooled GPU workers across apps claim + execute work
   from one shared store while each app keeps its own Postgres for run/DAG state.
@@ -55,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that many `claim_worker` processes per box remains a deployment concern.
 
 ### Fixed
+- `register_pool_handler` is now exported in `queue_workflows.__all__`. The
+  shared-GPU-pool handler registrar is a public host hook but was missing from
+  `__all__`, so `from queue_workflows import *` skipped it and it read as
+  private.
 - `db.reset_for_tests()` now keys its `*_test` safety guard on the parsed
   database **name** instead of a suffix of the whole DSN. A socket DSN
   (`…/<db>_test?host=/var/run/postgresql`) is no longer wrongly refused because

@@ -50,6 +50,7 @@ __all__ = [
     "set_llm_servers_available",
     "register_ingest_task",
     "set_ingest_schedule",
+    "register_pool_handler",
     "get_config",
     "EngineConfig",
     "__version__",

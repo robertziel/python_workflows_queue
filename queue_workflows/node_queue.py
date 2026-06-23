@@ -1686,3 +1686,39 @@ def ingest_snapshot() -> dict[str, Any]:
             "workers": workers.get(q, 0),
         }
     return {"queues": queues}
+
+
+def fleet_snapshot(*, stale_after_s: float = 30.0) -> list[dict[str, Any]]:
+    """Read-only per-``(host_label, queue)`` fleet capacity view — the observed
+    ``worker_heartbeats`` rows, the telemetry read model a fleet view / operator
+    control plane consumes.
+
+    Unlike :func:`snapshot` / :func:`ingest_snapshot` (which only *count*
+    heartbeats or join them internally for claim decisions), this returns the
+    per-worker rows with their advertised capability (``current_model``,
+    ``known_models``, ``llm_servers_available`` [0014], ``vram_total_mb`` /
+    ``fits_models`` [0015]). It deliberately surfaces **stale and dead-flagged**
+    workers too — that's the point of an observability read — so it returns ALL
+    rows ordered by ``(queue, host_label)``, each augmented with two derived
+    flags rather than filtering:
+
+      * ``fresh``        — ``last_seen`` within ``stale_after_s`` (default 30 s,
+                           matching the claim worker's 10 s refresh × 3);
+      * ``flagged_dead`` — the orchestrator's stale-worker detector stamped
+                           ``last_flagged_dead_at`` (migration 0009) and no fresh
+                           heartbeat has cleared it.
+
+    Pure read; no host coupling. Returns ``[]`` on an empty fleet.
+    """
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT *,
+                   (last_seen > now() - (%s * interval '1 second')) AS fresh,
+                   (last_flagged_dead_at IS NOT NULL)               AS flagged_dead
+            FROM worker_heartbeats
+            ORDER BY queue, host_label
+            """,
+            (float(stale_after_s),),
+        )
+        return [dict(row) for row in cur.fetchall()]
