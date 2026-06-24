@@ -185,6 +185,7 @@ def test_get_worker_control_table_absent_returns_none(monkeypatch):
 # ── NOTIFY trigger ─────────────────────────────────────────────────────────────
 
 
+@pytest.mark.pg_only
 def test_set_worker_control_fires_notify():
     """The migration-0012 trigger NOTIFYs ``worker_control`` with ``host:queue``
     on write, so a plain INSERT/UPDATE (Python or Rails) wakes the worker."""

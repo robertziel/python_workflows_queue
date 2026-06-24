@@ -346,6 +346,7 @@ def test_module_functions_delegate_to_default_singleton():
 # ── real-listener smoke (gate cleared) ─────────────────────────────────────────
 
 
+@pytest.mark.pg_only
 def test_real_listener_invalidates_on_notify(monkeypatch):
     """End-to-end: with the gate CLEARED, start() spawns the LISTEN daemon; a
     set_llm_config fires the 0013 NOTIFY on worker_llm_config_changed; the daemon

@@ -83,7 +83,8 @@ def test_duplicate_node_id_rejected_by_unique_index():
     node_queue.enqueue_node_job(
         run_id=run_id, node_id="n1", node_module="x", queue="cpu",
     )
-    with pytest.raises(pge.UniqueViolation):
+    from tests._helpers import INTEGRITY_ERRORS
+    with pytest.raises(INTEGRITY_ERRORS):
         node_queue.enqueue_node_job(
             run_id=run_id, node_id="n1", node_module="x", queue="cpu",
         )

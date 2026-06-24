@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS worker_heartbeats (
     concurrency   INTEGER NOT NULL,
     current_model TEXT,
     known_models  TEXT NOT NULL DEFAULT '[]',
-    last_seen     TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
     PRIMARY KEY (host_label, queue)
 );
 

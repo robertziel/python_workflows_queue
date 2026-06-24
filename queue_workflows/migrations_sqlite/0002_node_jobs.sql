@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS workflow_node_jobs (
     error              TEXT,
     vm_rss_mb_peak     INTEGER,
     seconds            REAL,
-    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
     started_at         TEXT,
     finished_at        TEXT,
     UNIQUE (run_id, node_id),

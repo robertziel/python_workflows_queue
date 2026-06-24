@@ -1562,6 +1562,7 @@ def test_await_schema_waits_for_required_version(monkeypatch):
     assert seen["min_version"] == 8
 
 
+@pytest.mark.pg_only
 def test_run_forever_awaits_schema_before_listening(monkeypatch):
     order: list[str] = []
 

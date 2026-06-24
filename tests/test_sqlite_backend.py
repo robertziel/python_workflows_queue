@@ -46,6 +46,18 @@ def sqlite_ready(sqlite_engine):
     return sqlite_engine
 
 
+def test_translator_literal_awareness_unit():
+    # Direct unit cover of the string-literal-aware translator: a real %s
+    # placeholder converts to ?, but a '%s' INSIDE a string literal (strftime)
+    # must survive untouched; a named param converts; now() -> strftime.
+    from queue_workflows.db import _translate_sql_for_sqlite as T
+    out = T("SELECT strftime('%s', created_at) AS e, %s AS a, %(b)s AS b, now() AS n")
+    assert "strftime('%s', created_at)" in out      # literal preserved
+    assert "? AS a" in out                          # positional placeholder -> ?
+    assert ":b AS b" in out                         # named placeholder -> :name
+    assert "now()" not in out                       # now() rewritten away
+
+
 def test_dialect_selected_for_sqlite(sqlite_engine):
     assert dialect.is_sqlite() is True
     assert dialect.get_dialect().name == "sqlite"

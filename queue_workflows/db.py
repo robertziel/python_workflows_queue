@@ -177,6 +177,10 @@ _TS_COLS = frozenset({
     "lease_expires_at", "last_seen", "last_flagged_dead_at", "claimed_at",
     "applied_at", "unassignable_at", "processed_at",
 })
+# SQLite has no boolean type (0/1 INTEGER); restore python ``bool`` parity with
+# psycopg for the engine's known boolean columns + derived boolean flags
+# (fleet_snapshot's fresh/flagged_dead).
+_BOOL_COLS = frozenset({"is_priority", "is_primary", "fresh", "flagged_dead"})
 
 
 def _parse_ts(value: Any) -> Any:
@@ -212,6 +216,8 @@ def _sqlite_row_to_dict(cursor: sqlite3.Cursor, row: tuple) -> dict[str, Any]:
                     pass
             elif name in _TS_COLS:
                 val = _parse_ts(val)
+        elif name in _BOOL_COLS and isinstance(val, int):
+            val = bool(val)
         out[name] = val
     return out
 
@@ -243,9 +249,13 @@ def _register_sqlite_adapters() -> None:
 
 # Module-level shared connection per process + RLock (SQLite serializes writers;
 # this serializes threads within the process; cross-process safety is WAL +
-# busy_timeout on the file).
+# busy_timeout on the file). ``_sqlite_depth`` makes ``connection()`` RE-ENTRANT:
+# the engine nests connection() calls (e.g. the dispatch drain holds one while a
+# callback opens its own) — on one shared SQLite connection that must share a
+# single transaction, not BEGIN twice. BEGIN/COMMIT happen only at depth 0.
 _sqlite_conn: sqlite3.Connection | None = None
 _sqlite_lock = threading.RLock()
+_sqlite_depth = 0
 
 
 def _get_sqlite_conn() -> sqlite3.Connection:
@@ -326,24 +336,38 @@ _MI_SECS_RE = re.compile(rf"now\(\)\s*([+-])\s*make_interval\(\s*secs\s*=>\s*({_
 _MI_DAYS_RE = re.compile(rf"now\(\)\s*([+-])\s*make_interval\(\s*days\s*=>\s*({_EXPR})\s*\)")
 
 
+def _interval_sub(unit: str):
+    """Build a sign-SAFE ``datetime('now', modifier)`` for ``now() ± make_interval
+    (<unit> => X)``. The effective offset folds the SQL operator into the value
+    (``+`` → X, ``-`` → -X); ``printf('%+d …')`` then emits the correct leading
+    sign for any X (incl. negative — test helpers stamp an already-expired lease
+    via ``now() + make_interval(secs => <negative>)``). Uses ``printf`` (not a
+    CASE) so the placeholder is referenced exactly ONCE — a CASE would duplicate
+    it and break positional ``%s`` param counts."""
+    def _sub(m):
+        op, x = m.group(1), m.group(2)
+        eff = f"({x})" if op == "+" else f"(-({x}))"
+        # strftime (not datetime) so the offset timestamp keeps millisecond
+        # precision — a whole-second lease_expires_at would tie across renewals
+        # within the same second.
+        return f"strftime('%Y-%m-%d %H:%M:%f', 'now', printf('%+d {unit}', {eff}))"
+    return _sub
+
+
 def _rewrite_intervals(chunk: str) -> str:
-    chunk = _MI_SECS_RE.sub(
-        lambda m: f"datetime('now', ('{m.group(1)}' || ({m.group(2)}) || ' seconds'))",
-        chunk,
-    )
-    chunk = _MI_DAYS_RE.sub(
-        lambda m: f"datetime('now', ('{m.group(1)}' || ({m.group(2)}) || ' days'))",
-        chunk,
-    )
+    chunk = _MI_SECS_RE.sub(_interval_sub("seconds"), chunk)
+    chunk = _MI_DAYS_RE.sub(_interval_sub("days"), chunk)
     return chunk
 
 
 def _rewrite_chunk(chunk: str) -> str:
     chunk = _FORUPDATE_RE.sub("", chunk)
     chunk = _rewrite_intervals(chunk)
-    # Parenthesized so it is valid in EVERY context, incl. a column
-    # ``DEFAULT (datetime('now'))`` (SQLite rejects a bare function DEFAULT).
-    chunk = _NOW_RE.sub("(datetime('now'))", chunk)
+    # Millisecond-precision UTC timestamp (psycopg's now() has sub-second
+    # precision; whole-second datetime('now') would tie FIFO-ordered rows created
+    # in the same second). Parenthesized → valid even in a column DEFAULT. The
+    # ``%Y/%m/%f`` live inside a string literal, so the paramstyle step ignores them.
+    chunk = _NOW_RE.sub("(strftime('%Y-%m-%d %H:%M:%f', 'now'))", chunk)
     chunk = _CAST_RE.sub("", chunk)
     chunk = _LEAST_RE.sub("MIN(", chunk)
     chunk = _GREATEST_RE.sub("MAX(", chunk)
@@ -354,7 +378,21 @@ def _rewrite_chunk(chunk: str) -> str:
     return chunk
 
 
+# ``now() ± interval 'N seconds'`` spans a string literal, so it must be fused
+# BEFORE the literal splitter runs (the make_interval forms have no literal and
+# are handled per-chunk). Engine SQL uses make_interval; this also covers any
+# consumer / test helper that wrote the ``interval 'literal'`` form.
+_PRE_INT_LIT_RE = re.compile(r"now\(\)\s*([+-])\s*interval\s*'(\d+)\s+seconds?'")
+
+
+def _pre_split_intervals(sql: str) -> str:
+    return _PRE_INT_LIT_RE.sub(
+        lambda m: f"datetime('now', '{m.group(1)}{m.group(2)} seconds')", sql,
+    )
+
+
 def _translate_sql_for_sqlite(sql: str) -> str:
+    sql = _pre_split_intervals(sql)
     return "".join(
         seg if is_lit else _rewrite_chunk(seg)
         for is_lit, seg in _split_sql_literals(sql)
@@ -422,18 +460,28 @@ class _SqliteConn:
 @contextmanager
 def _sqlite_connection() -> Iterator[_SqliteConn]:
     """SQLite analogue of the pooled ``connection()``: a per-process shared conn
-    under an RLock, BEGIN on entry, commit on clean exit / rollback on error."""
+    under a re-entrant RLock. BEGIN on the OUTERMOST entry, commit on its clean
+    exit / rollback on error; nested calls join the same transaction (no second
+    BEGIN) — matching 'one SQLite connection == one transaction'."""
+    global _sqlite_depth
     with _sqlite_lock:
         raw = _get_sqlite_conn()
-        raw.execute("BEGIN")
+        outer = _sqlite_depth == 0
+        if outer:
+            raw.execute("BEGIN")
+        _sqlite_depth += 1
         wrapper = _SqliteConn(raw)
         try:
             yield wrapper
         except BaseException:
-            raw.rollback()
+            if outer:
+                raw.rollback()
             raise
         else:
-            raw.commit()
+            if outer:
+                raw.commit()
+        finally:
+            _sqlite_depth -= 1
 
 
 @contextmanager
@@ -455,6 +503,26 @@ def cursor() -> Iterator[psycopg.Cursor]:
     with connection() as conn:
         with conn.cursor() as cur:
             yield cur
+
+
+class _SqlitePollConn:
+    """A LISTEN-shaped fake for SQLite (no NOTIFY): ``execute('LISTEN …')`` is a
+    no-op and ``notifies(timeout=…)`` just waits ``timeout`` (responsive to the
+    stop event) and yields nothing — so a wake loop_body falls back to polling at
+    its safety-poll cadence."""
+
+    def __init__(self, stop_event: Any) -> None:
+        self._stop = stop_event
+
+    def execute(self, *args: object, **kwargs: object) -> "_SqlitePollConn":
+        return self
+
+    def notifies(self, *, timeout: float = 1.0, stop_after: int | None = None):
+        try:
+            self._stop.wait(max(0.0, float(timeout)))
+        except Exception:  # noqa: BLE001 — defensive; never break the wake loop
+            pass
+        return ()
 
 
 _LISTEN_RECONNECT_BASE_S = 1.0
@@ -500,6 +568,14 @@ def listen_with_reconnect(
                    connections so the reconnect path can be exercised
                    without a live PG.
     """
+    # SQLite has no LISTEN/NOTIFY: the engine wakes by POLLING. Run loop_body
+    # against a poll-only fake connection whose notifies() just waits the safety-
+    # poll timeout (so loop_body does its periodic claim/check each cycle). No
+    # psycopg connect, no reconnect loop. (Only when no test connect_fn is given.)
+    if connect_fn is None and _engine_is_sqlite():
+        loop_body(_SqlitePollConn(stop_event))
+        return
+
     if connect_fn is None:
         def connect_fn():
             return psycopg.connect(db_url(), autocommit=True)

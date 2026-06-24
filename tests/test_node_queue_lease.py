@@ -22,6 +22,8 @@ from datetime import datetime, timedelta, timezone
 
 import threading
 
+import pytest
+
 import psycopg
 
 from queue_workflows import db, node_queue
@@ -436,6 +438,7 @@ def test_requeue_for_retry_writes_no_dispatch_event():
         assert cur.fetchone()["n"] == 0
 
 
+@pytest.mark.pg_only
 def test_requeue_for_retry_fires_node_job_ready_notify():
     # The running→queued flip fires the migration-0006 NOTIFY (carrying the
     # queue) so an idle worker re-claims it at once — same as reclaim.
@@ -498,7 +501,7 @@ def test_clear_current_model_nulls_the_busy_signal_and_ages_last_seen():
         )
         r = cur.fetchone()
     assert r["current_model"] is None
-    assert r["stale"] is True, "last_seen aged past the gauge window"
+    assert r["stale"], "last_seen aged past the gauge window"  # bool on pg, 0/1 on sqlite
 
 
 def test_clear_current_model_keeps_last_seen_when_mark_stale_false():
@@ -544,6 +547,7 @@ def _listen_and_capture(action, *, channel="node_job_ready", timeout=3.0):
     return payloads
 
 
+@pytest.mark.pg_only
 def test_notify_fires_on_queued_insert_with_queue_payload():
     run_id = make_run()
 
@@ -557,6 +561,7 @@ def test_notify_fires_on_queued_insert_with_queue_payload():
     assert payloads == ["gpu"]
 
 
+@pytest.mark.pg_only
 def test_notify_fires_on_reclaim_requeue():
     run_id = make_run()
     job_id = node_queue.enqueue_node_job(
@@ -568,6 +573,7 @@ def test_notify_fires_on_reclaim_requeue():
     assert "cpu" in payloads
 
 
+@pytest.mark.pg_only
 def test_notify_does_not_fire_on_terminal_transition():
     run_id = make_run()
     job_id = node_queue.enqueue_node_job(

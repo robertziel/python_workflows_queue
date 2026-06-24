@@ -61,9 +61,15 @@ class Dialect:
 
     # ── ordering / numeric helpers ────────────────────────────────────────
     def epoch(self, col: str) -> str:
-        """Seconds-since-epoch of a timestamp column, as a number (for the
-        ``host_priority``-directed creation-order tiebreak)."""
+        """Seconds-since-epoch of a timestamp column, as a number."""
         return f"EXTRACT(EPOCH FROM {col})"
+
+    def creation_order(self, alias: str) -> str:
+        """A monotonic-with-creation numeric expression for the ``host_priority``
+        -directed FIFO tiebreak. pg uses the (sub-second) creation epoch; SQLite
+        uses the implicit ``rowid`` (strictly increasing with INSERT, so it never
+        ties — unlike a whole-/milli-second timestamp for rapid inserts)."""
+        return f"EXTRACT(EPOCH FROM {alias}.created_at)"
 
     def least(self, *exprs: str) -> str:
         """Scalar minimum of N expressions (``LEAST`` on pg)."""
@@ -102,6 +108,14 @@ class Dialect:
         list directly."""
         return list(values)
 
+    # ── RETURNING ─────────────────────────────────────────────────────────
+    def qualify_returning(self, alias: str, cols: tuple[str, ...]) -> str:
+        """Render a ``RETURNING`` column list for target-table columns. pg keeps
+        the ``alias.`` qualifier (needed to disambiguate when an ``UPDATE … FROM``
+        join brings in a same-named column); SQLite RETURNING cannot alias-qualify
+        (and only sees the target table), so it drops the qualifier."""
+        return ", ".join(f"{alias}.{c}" for c in cols)
+
     # ── schema introspection ──────────────────────────────────────────────
     def table_exists(self, table_param: str) -> str:
         """SQL returning a non-null value iff a table named by ``table_param``
@@ -139,6 +153,11 @@ class SqliteDialect(Dialect):
         # The literal '%s' lives inside a string → the db.py translator skips it.
         return f"CAST(strftime('%s', {col}) AS REAL)"
 
+    def creation_order(self, alias: str) -> str:
+        # rowid is monotonic with INSERT and never ties (a whole-/milli-second
+        # timestamp ties for rapid inserts; rowid does not).
+        return f"{alias}.rowid"
+
     def least(self, *exprs: str) -> str:
         # SQLite overloads MIN/MAX as scalar funcs with N args.
         return f"MIN({', '.join(exprs)})"
@@ -171,6 +190,9 @@ class SqliteDialect(Dialect):
     def array_literal(self, values: list[str]) -> Any:
         import json
         return json.dumps(list(values))
+
+    def qualify_returning(self, alias: str, cols: tuple[str, ...]) -> str:
+        return ", ".join(cols)
 
     def table_exists(self, table_param: str) -> str:
         return (

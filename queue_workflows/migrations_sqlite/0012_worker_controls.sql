@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS worker_controls (
     desired_state TEXT NOT NULL DEFAULT 'on',
     stop_policy   TEXT NOT NULL DEFAULT 'hard',
     requested_by  TEXT,
-    updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
 
     PRIMARY KEY (host_label, queue),
     CHECK (desired_state IN ('on', 'off'))

@@ -161,6 +161,7 @@ def test_reclaim_leaves_fresh_lease_ingest_job_alone():
 # ── NOTIFY trigger ───────────────────────────────────────────────────────────
 
 
+@pytest.mark.pg_only
 def test_notify_fires_on_queued_insert_and_reclaim():
     with psycopg.connect(db.db_url(), autocommit=True) as listen_conn:
         listen_conn.execute("LISTEN ingest_job_ready")

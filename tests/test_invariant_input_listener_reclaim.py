@@ -103,10 +103,13 @@ def test_invariant_no_orphan_processing_after_recovery_window():
     listener = input_listener.InputListener()
     listener._poll_once()
 
+    from queue_workflows.dialect import get_dialect
+    _d = get_dialect()
     with connection() as c, c.cursor() as cur:
         cur.execute(
-            "SELECT id, status FROM workflow_input_submissions WHERE id = ANY(%s)",
-            (sub_ids,),
+            "SELECT id, status FROM workflow_input_submissions WHERE "
+            + _d.value_in_param_array("id", "%s"),
+            (_d.array_param(sub_ids),),
         )
         rows = list(cur.fetchall())
     bad = [r for r in rows if r["status"] == "processing"]

@@ -112,7 +112,8 @@ def test_invariant_event_insert_failure_rolls_back_terminal_mark():
 
     # The terminal mark lands first (status -> 'completed' inside this txn),
     # then the CHECK-violating kind aborts the whole transaction.
-    with pytest.raises(psycopg.errors.CheckViolation):
+    from tests._helpers import INTEGRITY_ERRORS
+    with pytest.raises(INTEGRITY_ERRORS):
         with connection() as conn, conn.cursor() as cur:
             marked = node_queue.mark_completed_in_txn(
                 cur, job_id, context_delta={"k": "v"}, seconds=1.0,
@@ -301,6 +302,7 @@ def test_drain_routes_awaiting_input_to_its_own_callback(dispatch_driver, monkey
     assert events[0]["processed_at"] is not None
 
 
+@pytest.mark.pg_only
 def test_drain_unknown_kind_never_silently_processed(dispatch_driver, monkeypatch):
     """An unrecognised ``kind`` must NOT be silently marked processed.
 

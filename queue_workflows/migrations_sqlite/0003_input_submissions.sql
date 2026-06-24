@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS workflow_input_submissions (
     status         TEXT NOT NULL DEFAULT 'pending',
     error          TEXT,
     claimed_at     TEXT,
-    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
     processed_at   TEXT,
     CONSTRAINT workflow_input_submissions_status_check
         CHECK (status IN ('pending', 'processing', 'processed', 'failed'))

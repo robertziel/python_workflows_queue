@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS ingest_jobs (
     seconds           REAL,
     claimed_by        TEXT,
     lease_expires_at  TEXT,
-    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
     started_at        TEXT,
     finished_at       TEXT,
 

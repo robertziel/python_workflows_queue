@@ -10,10 +10,17 @@ column).
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
+
+import psycopg
 
 from queue_workflows import run_store
 from queue_workflows.db import connection
+
+# DB constraint violations differ by backend (psycopg vs sqlite3); a test that
+# asserts "the DB rejected this" should catch the backend-appropriate type.
+INTEGRITY_ERRORS = (psycopg.errors.IntegrityError, sqlite3.IntegrityError)
 
 
 def make_run(run_id: str | None = None, *, status: str = "running",

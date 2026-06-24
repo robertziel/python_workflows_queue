@@ -25,8 +25,8 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     mode               TEXT NOT NULL DEFAULT 'step'
                             CHECK (mode IN ('step', 'node')),
     resume_count       INTEGER NOT NULL DEFAULT 0,
-    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
+    updated_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
     queued_at          TEXT,
     started_at         TEXT,
     finished_at        TEXT
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS workflow_run_files (
     kind        TEXT NOT NULL,
     size_bytes  INTEGER NOT NULL DEFAULT 0,
     is_primary  INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
     UNIQUE (run_id, rel_path)
 );
 

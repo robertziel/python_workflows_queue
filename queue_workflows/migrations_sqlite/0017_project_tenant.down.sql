@@ -12,7 +12,7 @@ CREATE TABLE worker_heartbeats_new (
     concurrency              INTEGER NOT NULL,
     current_model            TEXT,
     known_models             TEXT NOT NULL DEFAULT '[]',
-    last_seen                TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen                TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
     last_flagged_dead_at     TEXT,
     llm_servers_available    TEXT NOT NULL DEFAULT '["ollama"]',
     vram_total_mb            INTEGER,

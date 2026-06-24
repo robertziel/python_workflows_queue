@@ -129,9 +129,9 @@ def test_invalid_idle_ttl_rejected():
 def test_db_check_rejects_bad_server_type():
     """Defense in depth: even a raw INSERT bypassing set_llm_config hits the
     column CHECK constraint."""
-    import psycopg
+    from tests._helpers import INTEGRITY_ERRORS
 
-    with pytest.raises(psycopg.errors.CheckViolation):
+    with pytest.raises(INTEGRITY_ERRORS):
         with connection() as c, c.cursor() as cur:
             cur.execute(
                 "INSERT INTO worker_controls (host_label, queue, llm_server_type) "
@@ -196,6 +196,7 @@ def test_llm_config_for_column_absent_returns_default(monkeypatch):
 # ── NOTIFY: a SEPARATE channel from the hard-stop watcher's ────────────────────
 
 
+@pytest.mark.pg_only
 def test_set_llm_config_fires_llm_config_notify():
     """The 0013 trigger NOTIFYs ``worker_llm_config_changed`` with ``host|queue``
     so the backend factory refreshes instantly (10 s TTL is the fallback)."""
@@ -208,6 +209,7 @@ def test_set_llm_config_fires_llm_config_notify():
     assert payloads == ["host-c|gpu"]
 
 
+@pytest.mark.pg_only
 def test_llm_config_change_does_not_pollute_worker_control_channel():
     """A no-op LLM write must not wake the hard-stop watcher with a spurious
     ``worker_control`` NOTIFY that LOOKS like an ON/OFF change. (The existing

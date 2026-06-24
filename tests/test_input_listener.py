@@ -113,6 +113,7 @@ def test_poll_is_idempotent_on_already_processed_rows(monkeypatch):
     assert _status_of(sub_id) == "processed"
 
 
+@pytest.mark.pg_only
 def test_claim_pending_skip_locked_isolates_concurrent_pollers():
     """Two pollers claiming in parallel must not both pick up the same row.
     ``FOR UPDATE SKIP LOCKED`` is the guard — assert it by holding a row lock

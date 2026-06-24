@@ -21,6 +21,9 @@ import threading
 import psycopg
 import pytest
 
+pytestmark = pytest.mark.pg_only
+import pytest
+
 from queue_workflows.db import listen_with_reconnect
 
 

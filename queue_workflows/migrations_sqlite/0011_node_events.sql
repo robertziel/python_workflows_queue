@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS workflow_node_events (
     elapsed_s   REAL,
     error       TEXT,
     detail      TEXT NOT NULL DEFAULT '{}',
-    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
     CONSTRAINT workflow_node_events_type_check CHECK (event_type IN (
         'claimed', 'model_load_start', 'model_load_done', 'progress_beat',
         'stall_suspected', 'stall_trip', 'gpu_health_trip', 'budget_trip',

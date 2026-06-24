@@ -51,8 +51,12 @@ def _head_version() -> int:
 
 
 def _to_regclass(table: str):
+    """Return a non-None marker iff ``table`` exists — backend-aware (pg
+    ``to_regclass`` / sqlite ``sqlite_master``)."""
+    from queue_workflows.dialect import get_dialect
+    sql = "SELECT " + get_dialect().table_exists("%s") + " AS t"
     with db.connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT to_regclass(%s) AS t", (f"public.{table}",))
+        cur.execute(sql, (table,))
         return cur.fetchone()["t"]
 
 

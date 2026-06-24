@@ -299,7 +299,7 @@ def _host_dir_term() -> str:
     priority host takes the oldest (head) and an overflow host the newest (tail).
     See :func:`_host_dir`. ``EXTRACT(EPOCH …)`` on pg / ``strftime`` on sqlite."""
     from queue_workflows.dialect import get_dialect
-    return f"({get_dialect().epoch('c.created_at')} * %(host_dir)s) ASC"
+    return f"({get_dialect().creation_order('c')} * %(host_dir)s) ASC"
 
 
 def claim_next_cpu_job(
@@ -750,6 +750,8 @@ def reclaim_expired_leases() -> list[dict[str, Any]]:
 
     Returns the reclaimed rows' ``id`` / ``run_id`` / ``node_id`` so the
     caller can re-dispatch or log them."""
+    from queue_workflows.dialect import get_dialect
+    ret = get_dialect().qualify_returning("j", ("id", "run_id", "node_id"))
     with connection() as conn, conn.cursor() as cur:
         # Single UPDATE branches on the parent run's status. The
         # CASE-on-target keeps this atomic — no race window between an
@@ -781,7 +783,7 @@ def reclaim_expired_leases() -> list[dict[str, Any]]:
               AND j.lease_expires_at IS NOT NULL
               AND j.lease_expires_at < now()
             RETURNING j.id, j.run_id, j.node_id
-            """,
+            """.replace("j.id, j.run_id, j.node_id", ret),
         )
         return list(cur.fetchall())
 
@@ -894,9 +896,8 @@ def flag_stale_workers_holding_running_jobs(
         _stale_worker_after_s() if stale_after_s is None else max(1, int(stale_after_s))
     )
     proj = _project(project)
-    with connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
+    from queue_workflows.dialect import is_sqlite
+    stale_cte = """
             WITH stale AS (
                 SELECT wh.host_label, wh.queue, wh.project, wh.last_seen,
                        COUNT(j.id) AS running_jobs
@@ -913,7 +914,28 @@ def flag_stale_workers_holding_running_jobs(
                      OR wh.last_flagged_dead_at < now() - make_interval(secs => %(thr)s)
                    )
                  GROUP BY wh.host_label, wh.queue, wh.project, wh.last_seen
+            )"""
+    params = {"thr": threshold, "project": proj}
+    with connection() as conn, conn.cursor() as cur:
+        if is_sqlite():
+            # SQLite RETURNING can't return CTE columns → SELECT the stale set,
+            # flag each row, then return the SELECTed rows.
+            cur.execute(
+                stale_cte
+                + " SELECT host_label, queue, project, last_seen, running_jobs FROM stale",
+                params,
             )
+            rows = list(cur.fetchall())
+            for r in rows:
+                cur.execute(
+                    "UPDATE worker_heartbeats SET last_flagged_dead_at = now() "
+                    "WHERE host_label = %s AND queue = %s AND project = %s",
+                    (r["host_label"], r["queue"], r["project"]),
+                )
+            return rows
+        cur.execute(
+            stale_cte
+            + """
             UPDATE worker_heartbeats AS wh
                SET last_flagged_dead_at = now()
               FROM stale
@@ -923,7 +945,7 @@ def flag_stale_workers_holding_running_jobs(
             RETURNING wh.host_label, wh.queue, wh.project, stale.last_seen,
                       stale.running_jobs
             """,
-            {"thr": threshold, "project": proj},
+            params,
         )
         return list(cur.fetchall())
 

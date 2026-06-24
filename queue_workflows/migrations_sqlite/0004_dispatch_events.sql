@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS workflow_dispatch_events (
     processed_at TEXT,
     error        TEXT,
     attempts     INTEGER NOT NULL DEFAULT 0,
-    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
     CONSTRAINT workflow_dispatch_events_kind_check
         CHECK (kind IN ('completed', 'failed', 'awaiting_input'))
 );

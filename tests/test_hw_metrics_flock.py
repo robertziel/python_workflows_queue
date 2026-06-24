@@ -113,7 +113,13 @@ def test_starter_swallows_sampler_construction_error(monkeypatch):
 
 def _drive_run_forever(worker, monkeypatch):
     monkeypatch.setattr(worker, "await_schema", lambda: None)
-    monkeypatch.setattr(worker, "run_once", lambda: False)
+    # Stop the worker the first time its loop calls run_once. This works on BOTH
+    # the pg LISTEN path and the sqlite poll-wake path (which bypasses
+    # psycopg.connect, so a fake-LISTEN execute() side effect would never fire).
+    def _run_once_then_stop():
+        worker.stop()
+        return False
+    monkeypatch.setattr(worker, "run_once", _run_once_then_stop)
 
     import psycopg
 
@@ -172,7 +178,11 @@ def test_claim_worker_gpu_sampler_loss_is_non_fatal(monkeypatch):
     worker = claim_worker.ClaimWorker(queue="gpu", host="host-c")
     monkeypatch.setattr(worker, "await_schema", lambda: None)
     ran: list = []
-    monkeypatch.setattr(worker, "run_once", lambda: ran.append(1) and False)
+    def _run_once_then_stop():
+        ran.append(1)
+        worker.stop()
+        return False
+    monkeypatch.setattr(worker, "run_once", _run_once_then_stop)
 
     import psycopg
 
