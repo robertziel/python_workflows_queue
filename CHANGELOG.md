@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Multi-tenant broker — one shared queue across all projects (migration
+  0017).** A `project` tenant tag now rides every queue record
+  (`workflow_runs`, `workflow_node_jobs`, `ingest_jobs`, `worker_heartbeats`) so
+  ONE shared broker Postgres can hold ALL projects' jobs on the shared `cpu`/`gpu`
+  (+ ingest) queues — partitioned by *resource*, tagged by *project* — while each
+  per-project client enqueues + claims ONLY its own project's rows. New
+  `config.project` + `configure(project="…")` is the client's tenant identity
+  (the implicit tag for enqueue AND claim). **Exact-match-always** scoping with
+  default `""` keeps a single-Postgres-per-project deploy byte-compatible (every
+  row is `''`, the filter `project=''` matches them all — zero host wiring). The
+  `worker_heartbeats` PK becomes `(host_label, queue, project)` so two projects'
+  workers on one machine don't clobber each other's heartbeat. **Every** client
+  row-pickup path is scoped, not just the worker claim: the orchestrator's run
+  expansion, dispatch-event outbox drain, stuck-run reconcile, unassignable /
+  dead-worker / orphan sweeps, the input-listener resume, and the startup
+  resume/reclaim hooks (`reenqueue_running_for_resume`,
+  `reclaim_all_running_for_resume`), plus `requeue_running_for_worker`,
+  `vlm_pool_should_defer`, `clear_worker_current_model`. `snapshot` /
+  `ingest_snapshot` / `fleet_snapshot` take an optional `project` filter (`None`
+  = broker-wide). (Lease-reclaim + run-id-keyed paths stay broker-wide — the
+  project travels with the row.) See `docs/multitenant_broker.md`. The broker→client start/abort
+  signalling (`worker_controls` project-scoping) + a cross-project arbiter are
+  documented as the next phases.
 - **`node_queue.fleet_snapshot()` — read-only per-`(host, queue)` fleet capacity
   view.** Returns the observed `worker_heartbeats` rows with their advertised
   capability (`current_model`, `known_models`, `llm_servers_available`,

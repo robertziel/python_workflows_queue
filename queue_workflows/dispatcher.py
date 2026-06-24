@@ -375,6 +375,7 @@ def _process_ready(
                     run_id=run_id,
                     node_id=n["id"],
                     pipeline_name=n.get("pipeline_name"),
+                    project=run.get("project"),
                 )
             else:
                 _enqueue(run_id, n, run)
@@ -1287,6 +1288,7 @@ def _enqueue(run_id: str, node: dict[str, Any], run: dict[str, Any]) -> str:
             queue="cpu",
             inputs={"widget": node.get("widget"), "target": node.get("target")},
             priority=int(run.get("priority", 100)),
+            project=run.get("project"),
         )
 
     # Resolve $from refs in the node's inputs against the run's context *at
@@ -1312,4 +1314,5 @@ def _enqueue(run_id: str, node: dict[str, Any], run: dict[str, Any]) -> str:
         inputs=resolved,
         priority=int(run.get("priority", 100)),
         pipeline_name=node.get("pipeline_name"),
+        project=run.get("project"),
     )

@@ -113,18 +113,23 @@ def _job_to_ingest_row(job: dict[str, Any] | None) -> dict[str, Any] | None:
 def enqueue_ingest_job(
     *, task_name: str, queue: str, reason: str = "tick", priority: int = 100,
     args: dict[str, Any] | None = None, conn: Any = None,
+    project: str | None = None,
 ) -> str:
     """Insert a fresh ``queued`` ingest job; return its id.
 
     ``conn`` (a host psycopg connection for a caller-controlled transaction) is
     only meaningful for the pg path and is ignored by the SPI backends, which
-    have no equivalent cross-row transaction with a host's domain table."""
+    have no equivalent cross-row transaction with a host's domain table.
+
+    ``project`` (migration 0017) is the tenant tag on the pg path (``None`` ⇒
+    ``config.project``); ignored on the SPI path, whose tenancy is ``db_namespace``
+    (see docs/multitenant_broker.md)."""
     if not _use_spi():
         from queue_workflows import node_queue
 
         return node_queue.enqueue_ingest_job(
             task_name=task_name, queue=queue, reason=reason,
-            priority=priority, args=args, conn=conn,
+            priority=priority, args=args, conn=conn, project=project,
         )
     _validate(task_name, queue)
     job_id = str(uuid.uuid4())

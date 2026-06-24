@@ -294,16 +294,30 @@ class NodePool:
         the same row. Dispatcher callbacks open their own DB connections, so
         they don't deadlock against the locks the outer cursor holds.
         """
+        # Project-scoped (migration 0017): drain ONLY this orchestrator's
+        # project's events. The table has no project column, so correlate to the
+        # parent run's project (= config.project). Without this, on a shared
+        # broker project A's orchestrator would SKIP-LOCKED-claim project B's
+        # terminal events, run B's fan-out under A's load_workflow/resolver, and
+        # the poison path below would force-FAIL B's run. Default "" matches
+        # every run (single-tenant byte-compatible).
+        from queue_workflows.config import get_config
+        project = get_config().project or ""
         with connection() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, run_id, node_id, kind, attempts, error
-                  FROM workflow_dispatch_events
-                 WHERE processed_at IS NULL
-                 ORDER BY created_at ASC
+                SELECT e.id, e.run_id, e.node_id, e.kind, e.attempts, e.error
+                  FROM workflow_dispatch_events e
+                 WHERE e.processed_at IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM workflow_runs r
+                       WHERE r.id = e.run_id AND r.project = %(project)s
+                   )
+                 ORDER BY e.created_at ASC
                  FOR UPDATE SKIP LOCKED
                  LIMIT 50
                 """,
+                {"project": project},
             )
             events = list(cur.fetchall())
             for evt in events:
@@ -447,14 +461,12 @@ class NodePool:
                 return
 
     def _tick(self) -> None:
-        # 1) Expand new node-mode runs.
-        with connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT id FROM workflow_runs "
-                "WHERE mode = 'node' AND status = 'queued' "
-                "ORDER BY priority ASC, queued_at ASC NULLS LAST LIMIT 50"
-            )
-            ids = [r["id"] for r in cur.fetchall()]
+        # 1) Expand new node-mode runs — ONLY this orchestrator's project
+        #    (migration 0017): on a shared broker each project runs its own
+        #    orchestrator, and a project must not expand another's runs under its
+        #    own workflow definitions. Defaults to config.project (single-tenant
+        #    "" matches every run).
+        ids = run_store.list_queued_node_run_ids(limit=50)
         for run_id in ids:
             try:
                 n = dispatcher.start_run(run_id)
@@ -583,20 +595,11 @@ class NodePool:
             return
         self._stuck_run_last_run = now
 
-        with connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT r.id FROM workflow_runs r
-                WHERE r.mode = 'node'
-                  AND r.status IN ('queued', 'running')
-                  AND NOT EXISTS (
-                    SELECT 1 FROM workflow_node_jobs j
-                    WHERE j.run_id = r.id
-                      AND j.status IN ('queued', 'running', 'awaiting_input')
-                  )
-                """
-            )
-            ids = [r["id"] for r in cur.fetchall()]
+        # Project-scoped (migration 0017): reconcile ONLY this orchestrator's
+        # project's phantom runs — else A's orchestrator drives B's runs through
+        # reconcile_run under A's workflow definitions. The helper defaults to
+        # config.project (single-tenant "" matches all).
+        ids = run_store.list_stuck_node_run_ids()
         for run_id in ids:
             try:
                 action = dispatcher.reconcile_run(run_id)
@@ -686,11 +689,11 @@ class NodePool:
         flagged = node_queue.flag_stale_workers_holding_running_jobs()
         for row in flagged:
             log.error(
-                "[node-pool] DEAD WORKER: %s/%s heartbeat stale since %s but "
-                "still owns %s running job(s) — worker PROCESS is wedged (GPU "
-                "hang?); job(s) re-queued by lease-reclaim, but the container "
-                "must be bounced (host-supervisor should restart it)",
-                row.get("host_label"), row.get("queue"),
+                "[node-pool] DEAD WORKER: %s/%s [project=%s] heartbeat stale "
+                "since %s but still owns %s running job(s) — worker PROCESS is "
+                "wedged (GPU hang?); job(s) re-queued by lease-reclaim, but the "
+                "container must be bounced (host-supervisor should restart it)",
+                row.get("host_label"), row.get("queue"), row.get("project"),
                 row.get("last_seen"), row.get("running_jobs"),
             )
 

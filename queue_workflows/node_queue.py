@@ -55,6 +55,20 @@ def _as_json(value: Any) -> Any:
     return Jsonb(value or {})
 
 
+def _project(project: str | None) -> str:
+    """Resolve the tenant tag for an enqueue/claim (migration 0017).
+
+    ``None`` ⇒ this client's configured ``config.project`` (the common path: a
+    per-project client sets it once at startup and every enqueue/claim inherits
+    it). An explicit string overrides it (the dispatcher passes the parent run's
+    project; tests pin it). Default ``""`` is the single-tenant sentinel — see
+    :attr:`queue_workflows.config.EngineConfig.project`."""
+    if project is not None:
+        return project
+    from queue_workflows.config import get_config
+    return get_config().project or ""
+
+
 # ── Enqueue ──────────────────────────────────────────────────────────────
 
 
@@ -68,8 +82,13 @@ def enqueue_node_job(
     inputs: dict[str, Any] | None = None,
     priority: int = 100,
     pipeline_name: str | None = None,
+    project: str | None = None,
 ) -> str:
     """Insert a fresh ``queued`` node-job row. Returns the row id.
+
+    ``project`` (migration 0017) is the tenant tag stamped on the row; ``None``
+    ⇒ this client's ``config.project``. The dispatcher passes the parent run's
+    project so the node inherits it. See :func:`_project`.
 
     Invariants:
         - queue in {'cpu', 'gpu'}.
@@ -92,18 +111,18 @@ def enqueue_node_job(
             """
             INSERT INTO workflow_node_jobs
                 (id, run_id, pipeline_name, node_id, node_module,
-                 queue, required_model,
+                 queue, required_model, project,
                  status, priority, inputs, context_delta,
                  created_at)
             VALUES
                 (%s, %s, %s, %s, %s,
-                 %s, %s,
+                 %s, %s, %s,
                  'queued', %s, %s, '{}'::jsonb,
                  now())
             """,
             (
                 row_id, run_id, pipeline_name, node_id, node_module,
-                queue, required_model,
+                queue, required_model, _project(project),
                 priority, _as_json(inputs or {}),
             ),
         )
@@ -115,6 +134,7 @@ def insert_skipped_job(
     run_id: str,
     node_id: str,
     pipeline_name: str | None = None,
+    project: str | None = None,
 ) -> str:
     """Insert a status='skipped' marker row for a node whose
     ``skip_if`` evaluated to true at ready-check time. No worker
@@ -131,16 +151,16 @@ def insert_skipped_job(
             """
             INSERT INTO workflow_node_jobs
                 (id, run_id, pipeline_name, node_id, node_module,
-                 queue, required_model,
+                 queue, required_model, project,
                  status, priority, inputs, context_delta,
                  created_at, finished_at)
             VALUES
                 (%s, %s, %s, %s, '',
-                 'cpu', NULL,
+                 'cpu', NULL, %s,
                  'skipped', 100, '{}'::jsonb, '{}'::jsonb,
                  now(), now())
             """,
-            (row_id, run_id, pipeline_name, node_id),
+            (row_id, run_id, pipeline_name, node_id, _project(project)),
         )
     return row_id
 
@@ -247,6 +267,7 @@ WHERE j.id = (
     SELECT c.id FROM workflow_node_jobs c
     WHERE c.queue = %(queue)s
       AND c.status = 'queued'
+      AND c.project = %(project)s
       AND EXISTS (
           SELECT 1 FROM workflow_runs r
           WHERE r.id = c.run_id
@@ -278,6 +299,7 @@ def claim_next_cpu_job(
     host: str | None = None,
     lease_s: int = DEFAULT_LEASE_S,
     host_priority: int = 0,
+    project: str | None = None,
 ) -> dict[str, Any] | None:
     """Atomically grab the next queued CPU job (the CPU claim worker's
     claim).
@@ -296,6 +318,7 @@ def claim_next_cpu_job(
         "host": host,
         "lease_s": int(lease_s),
         "queue": "cpu",
+        "project": _project(project),
         "host_dir": _host_dir(host_priority),
     }
     with connection() as conn, conn.cursor() as cur:
@@ -313,6 +336,7 @@ def claim_next_gpu_job(
     known_models: Iterable[str] | None = None,
     require_model: bool | None = None,
     pool_modules: Iterable[str] | None = None,
+    project: str | None = None,
 ) -> dict[str, Any] | None:
     """Atomically grab the next queued GPU job (the GPU claim worker's
     claim).
@@ -392,6 +416,7 @@ def claim_next_gpu_job(
         "host": host,
         "lease_s": int(lease_s),
         "queue": "gpu",
+        "project": _project(project),
         "current_model": current_model,
         "host_dir": _host_dir(host_priority),
     }
@@ -406,6 +431,7 @@ def claim_next_gpu_job(
 
 def vlm_pool_should_defer(
     host_label: str, par: int, *, stale_s: int = STALE_WORKER_AFTER_S,
+    project: str | None = None,
 ) -> bool:
     """FILL-BEFORE-SPILL gate for the no-model GPU (VLM) pool lane.
 
@@ -452,9 +478,11 @@ def vlm_pool_should_defer(
                    WHERE queue = 'gpu'
                      AND status = 'running'
                      AND required_model IS NULL
+                     AND project = %(project)s
                    GROUP BY claimed_by
               ) j ON j.claimed_by = r.host_label
              WHERE r.queue = 'gpu'
+               AND r.project = %(project)s
                AND r.last_seen > now() - make_interval(secs => %(stale_s)s)
                -- ranked STRICTLY above M = (host_label, par)
                AND (
@@ -469,6 +497,7 @@ def vlm_pool_should_defer(
         "host": host_label,
         "par": int(par),
         "stale_s": max(1, int(stale_s)),
+        "project": _project(project),
     }
     with connection() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
@@ -510,6 +539,7 @@ def _ingest_tasks() -> frozenset[str]:
 def enqueue_ingest_job(
     *, task_name: str, queue: str, reason: str = "tick", priority: int = 100,
     args: dict[str, Any] | None = None, conn: Any = None,
+    project: str | None = None,
 ) -> str:
     """Insert a fresh ``queued`` ingest-job row. Returns the row id.
 
@@ -541,10 +571,13 @@ def enqueue_ingest_job(
     row_id = str(uuid.uuid4())
     sql = """
         INSERT INTO ingest_jobs
-            (id, task_name, queue, reason, args, status, priority, created_at)
-        VALUES (%s, %s, %s, %s, %s, 'queued', %s, now())
+            (id, task_name, queue, reason, args, project, status, priority, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, 'queued', %s, now())
     """
-    params = (row_id, task_name, queue, reason, _as_json(args or {}), priority)
+    params = (
+        row_id, task_name, queue, reason, _as_json(args or {}),
+        _project(project), priority,
+    )
     if conn is not None:
         with conn.cursor() as cur:
             cur.execute(sql, params)
@@ -562,14 +595,16 @@ def get_ingest_job(job_id: str) -> dict[str, Any] | None:
 
 def claim_next_ingest_job(
     queue: str, *, host: str | None = None, lease_s: int = DEFAULT_LEASE_S,
+    project: str | None = None,
 ) -> dict[str, Any] | None:
     """Atomically grab the next queued ingest job on ``queue``.
 
     Mirrors :func:`claim_next_cpu_job` — a single ``SELECT … FOR UPDATE
     SKIP LOCKED`` claim stamping the lease — but WITHOUT the run-cancel join
     (an ingest job has no parent run). Ordered ``priority ASC`` then FIFO
-    on creation. Returns the claimed row, or ``None`` when the queue had
-    nothing claimable.
+    on creation. Project-scoped (migration 0017): only rows whose ``project``
+    matches this client's (``None`` ⇒ ``config.project``). Returns the claimed
+    row, or ``None`` when the queue had nothing claimable.
     """
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -583,13 +618,17 @@ def claim_next_ingest_job(
                 SELECT c.id FROM ingest_jobs c
                 WHERE c.queue = %(queue)s
                   AND c.status = 'queued'
+                  AND c.project = %(project)s
                 ORDER BY c.priority ASC, c.created_at ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )
             RETURNING *
             """,
-            {"host": host, "lease_s": int(lease_s), "queue": queue},
+            {
+                "host": host, "lease_s": int(lease_s), "queue": queue,
+                "project": _project(project),
+            },
         )
         return cur.fetchone()
 
@@ -785,7 +824,7 @@ def requeue_job_for_retry(job_id: str) -> dict[str, Any] | None:
 
 
 def flag_stale_workers_holding_running_jobs(
-    *, stale_after_s: int | None = None,
+    *, stale_after_s: int | None = None, project: str | None = None,
 ) -> list[dict[str, Any]]:
     """Detect + flag workers that have gone SILENT while still owning a
     ``running`` job — the GPU-hardware-hang recovery the lease-reclaim alone
@@ -835,41 +874,55 @@ def flag_stale_workers_holding_running_jobs(
     threshold = (
         _stale_worker_after_s() if stale_after_s is None else max(1, int(stale_after_s))
     )
+    proj = _project(project)
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
             WITH stale AS (
-                SELECT wh.host_label, wh.queue, wh.last_seen,
+                SELECT wh.host_label, wh.queue, wh.project, wh.last_seen,
                        COUNT(j.id) AS running_jobs
                   FROM worker_heartbeats wh
                   JOIN workflow_node_jobs j
                     ON j.claimed_by = wh.host_label
                    AND j.queue = wh.queue
+                   AND j.project = wh.project
                    AND j.status = 'running'
-                 WHERE wh.last_seen < now() - make_interval(secs => %(thr)s)
+                 WHERE wh.project = %(project)s
+                   AND wh.last_seen < now() - make_interval(secs => %(thr)s)
                    AND (
                         wh.last_flagged_dead_at IS NULL
                      OR wh.last_flagged_dead_at < now() - make_interval(secs => %(thr)s)
                    )
-                 GROUP BY wh.host_label, wh.queue, wh.last_seen
+                 GROUP BY wh.host_label, wh.queue, wh.project, wh.last_seen
             )
             UPDATE worker_heartbeats wh
                SET last_flagged_dead_at = now()
               FROM stale
              WHERE wh.host_label = stale.host_label
                AND wh.queue = stale.queue
-            RETURNING wh.host_label, wh.queue, stale.last_seen,
+               AND wh.project = stale.project
+            RETURNING wh.host_label, wh.queue, wh.project, stale.last_seen,
                       stale.running_jobs
             """,
-            {"thr": threshold},
+            {"thr": threshold, "project": proj},
         )
         return list(cur.fetchall())
 
 
-def reclaim_all_running_for_resume() -> list[dict[str, Any]]:
+def reclaim_all_running_for_resume(
+    *, project: str | None = None,
+) -> list[dict[str, Any]]:
     """Re-queue ``running`` node jobs whose CLAIMING WORKER is gone — the
     orchestrator-boot recovery hook, not the lease-expiry path
     (:func:`reclaim_expired_leases`).
+
+    Project-scoped (migration 0017): only THIS orchestrator's project's jobs
+    (``None`` ⇒ ``config.project``). The outer ``UPDATE`` filters
+    ``j.project = %(project)s`` — NOT just the heartbeat sub-join — so on a
+    shared broker project A's restart can't clear project B's ``claimed_by``
+    (which would trip B's live worker's ``JobStatusWatcher`` and kill B's render,
+    e.g. a GIL-stalled long CUDA job whose heartbeat froze >30 s while still
+    rendering). Default ``""`` matches every job (single-tenant byte-compatible).
 
     Scoped to jobs whose ``claimed_by`` host has **no fresh heartbeat** on the
     job's queue (last beat older than ``STALE_WORKER_AFTER_S``, or no row at
@@ -906,23 +959,35 @@ def reclaim_all_running_for_resume() -> list[dict[str, Any]]:
                 lease_expires_at = NULL,
                 priority = LEAST(j.priority, 10)
             WHERE j.status = 'running'
+              AND j.project = %(project)s
               AND NOT EXISTS (
                 SELECT 1 FROM worker_heartbeats h
                 WHERE h.host_label = j.claimed_by
                   AND h.queue = j.queue
+                  AND h.project = j.project
                   AND h.last_seen > now() - make_interval(secs => %(stale_s)s)
               )
             RETURNING id, run_id, node_id
             """,
-            {"stale_s": float(STALE_WORKER_AFTER_S)},
+            {"stale_s": float(STALE_WORKER_AFTER_S), "project": _project(project)},
         )
         return list(cur.fetchall())
 
 
-def requeue_running_for_worker(host_label: str, queue: str) -> int:
+def requeue_running_for_worker(
+    host_label: str, queue: str, *, project: str | None = None,
+) -> int:
     """Re-queue every ``running`` row a SPECIFIC worker still owns — the
-    per-``(host_label, queue)``-scoped twin of
+    per-``(host_label, queue, project)``-scoped twin of
     :func:`reclaim_all_running_for_resume`.
+
+    Project-scoped (migration 0017): ``project`` defaults to this worker's
+    ``config.project``. On a shared broker ``host_label`` is no longer globally
+    unique (two projects' workers can share a machine + queue), so without the
+    project term an operator hard-stop of project A's worker on ``spark2/gpu``
+    would also yank project B's running job there. The hard-stop runs inside the
+    worker's own ``WorkerControlWatcher``, so the default ``config.project`` is
+    exactly that worker's tenant.
 
     Used when an operator turns a machine's cpu/gpu (or ingest) worker OFF via the
     ``worker_controls`` hard-stop: the in-flight job is released back to the queue
@@ -960,8 +1025,9 @@ def requeue_running_for_worker(host_label: str, queue: str) -> int:
             WHERE status = 'running'
               AND claimed_by = %s
               AND queue = %s
+              AND project = %s
             """,
-            (host_label, queue),
+            (host_label, queue, _project(project)),
         )
         return cur.rowcount or 0
 
@@ -985,9 +1051,15 @@ def upsert_worker_heartbeat(
     vram_total_mb: int | None = None,
     fits_models: Iterable[str] | None = None,
     update_current_model: bool = True,
+    project: str | None = None,
 ) -> None:
-    """Upsert this worker's ``(host_label, queue)`` capacity row, refreshing
-    ``last_seen`` to ``now()``.
+    """Upsert this worker's ``(host_label, queue, project)`` capacity row,
+    refreshing ``last_seen`` to ``now()``.
+
+    ``project`` (migration 0017) is the worker's tenant tag; ``None`` ⇒
+    ``config.project``. It's part of the worker identity so two projects' clients
+    on the SAME machine + queue (one shared broker) don't clobber each other's
+    heartbeat (the PK is ``(host_label, queue, project)``).
 
     Any queue family may upsert (migration 0008 dropped the cpu/gpu-only
     CHECK), so ingest workers heartbeat too. The GPU heartbeat passes
@@ -1030,11 +1102,11 @@ def upsert_worker_heartbeat(
         cur.execute(
             f"""
             INSERT INTO worker_heartbeats
-                (host_label, queue, concurrency, last_seen,
+                (host_label, queue, project, concurrency, last_seen,
                  current_model, known_models, llm_servers_available,
                  vram_total_mb, fits_models)
-            VALUES (%s, %s, %s, now(), %s, %s, %s, %s, %s)
-            ON CONFLICT (host_label, queue) DO UPDATE
+            VALUES (%s, %s, %s, %s, now(), %s, %s, %s, %s, %s)
+            ON CONFLICT (host_label, queue, project) DO UPDATE
                 SET concurrency   = EXCLUDED.concurrency,
                     {model_set}
                     known_models  = EXCLUDED.known_models,
@@ -1044,13 +1116,14 @@ def upsert_worker_heartbeat(
                     last_seen     = EXCLUDED.last_seen,
                     last_flagged_dead_at = NULL
             """,
-            (host_label, queue, int(concurrency), current_model, known, llm_servers,
-             vram, fits),
+            (host_label, queue, _project(project), int(concurrency), current_model,
+             known, llm_servers, vram, fits),
         )
 
 
 def clear_worker_current_model(
     host_label: str, queue: str, *, mark_stale: bool = True,
+    project: str | None = None,
 ) -> dict[str, Any] | None:
     """Clear a worker's ``current_model`` (its GPU busy signal) and, by default,
     age its ``last_seen`` out of the live window — the "don't leave a busy ghost"
@@ -1082,10 +1155,10 @@ def clear_worker_current_model(
                 last_seen = CASE WHEN %s > 0
                                  THEN now() - make_interval(secs => %s)
                                  ELSE last_seen END
-            WHERE host_label = %s AND queue = %s
+            WHERE host_label = %s AND queue = %s AND project = %s
             RETURNING *
             """,
-            (stale_secs, stale_secs, host_label, queue),
+            (stale_secs, stale_secs, host_label, queue, _project(project)),
         )
         return cur.fetchone()
 
@@ -1412,7 +1485,9 @@ def prune_node_events(older_than_days: int = 30) -> int:
         return cur.rowcount or 0
 
 
-def flag_unassignable_gpu_jobs(*, stale_s: int | None = None) -> list[dict[str, Any]]:
+def flag_unassignable_gpu_jobs(
+    *, stale_s: int | None = None, project: str | None = None,
+) -> list[dict[str, Any]]:
     """Capacity-aware fleet sweep (migration 0015): red-flag queued GPU model-jobs
     that **no live machine can hold**, and clear the flag when they become
     assignable again. Returns the rows NEWLY flagged this call (the NULL→now
@@ -1440,20 +1515,27 @@ def flag_unassignable_gpu_jobs(*, stale_s: int | None = None) -> list[dict[str, 
     30 s = 3× the 10 s heartbeat).
     """
     window = int(stale_s) if stale_s is not None else _stale_worker_after_s()
+    proj = _project(project)
     with connection() as conn, conn.cursor() as cur:
         # CLEAR first: un-flag any flagged job that is now fittable, or that has
         # left the queued state (claimed / cancelled / terminal) — so a red flag
-        # never outlives the condition that set it.
+        # never outlives the condition that set it. Project-scoped (migration
+        # 0017): a per-project orchestrator only judges its OWN project's jobs
+        # against its OWN project's fleet — another project's worker fitting the
+        # model must NOT mask this project's stuck job (exact-match claim means
+        # that worker can never take it).
         cur.execute(
             """
             WITH live_gpu AS (
                 SELECT fits_models FROM worker_heartbeats
                 WHERE queue = 'gpu'
+                  AND project = %(project)s
                   AND last_seen > now() - make_interval(secs => %(window)s)
             )
             UPDATE workflow_node_jobs j
             SET unassignable_at = NULL, unassignable_reason = NULL
             WHERE j.unassignable_at IS NOT NULL
+              AND j.project = %(project)s
               AND (
                     j.status <> 'queued'
                  OR EXISTS (
@@ -1462,7 +1544,7 @@ def flag_unassignable_gpu_jobs(*, stale_s: int | None = None) -> list[dict[str, 
                     )
               )
             """,
-            {"window": window},
+            {"window": window, "project": proj},
         )
         # FLAG: queued gpu model-jobs that no fresh GPU worker can hold. Guarded
         # on at least one fresh GPU heartbeat existing (liveness vs capacity).
@@ -1471,6 +1553,7 @@ def flag_unassignable_gpu_jobs(*, stale_s: int | None = None) -> list[dict[str, 
             WITH live_gpu AS (
                 SELECT fits_models, vram_total_mb FROM worker_heartbeats
                 WHERE queue = 'gpu'
+                  AND project = %(project)s
                   AND last_seen > now() - make_interval(secs => %(window)s)
             ),
             fleet AS (
@@ -1486,6 +1569,7 @@ def flag_unassignable_gpu_jobs(*, stale_s: int | None = None) -> list[dict[str, 
                     || COALESCE((SELECT max_vram FROM fleet)::text, 'unknown')
                     || 'MB)'
             WHERE j.queue = 'gpu'
+              AND j.project = %(project)s
               AND j.status = 'queued'
               AND j.required_model IS NOT NULL
               AND j.unassignable_at IS NULL
@@ -1497,7 +1581,7 @@ def flag_unassignable_gpu_jobs(*, stale_s: int | None = None) -> list[dict[str, 
             RETURNING j.id, j.run_id, j.node_id, j.required_model,
                       j.unassignable_reason
             """,
-            {"window": window},
+            {"window": window, "project": proj},
         )
         return list(cur.fetchall())
 
@@ -1559,7 +1643,7 @@ def delete_non_terminal_jobs_for_run(run_id: str) -> list[str]:
         return [r["node_id"] for r in cur.fetchall()]
 
 
-def cancel_orphaned_queued_jobs() -> int:
+def cancel_orphaned_queued_jobs(*, project: str | None = None) -> int:
     """Flip every ``queued`` job whose parent run is already terminal
     (``cancelled`` / ``failed``) to ``cancelled``. Returns the number of rows
     touched.
@@ -1571,6 +1655,12 @@ def cancel_orphaned_queued_jobs() -> int:
     stall. This sweep is the cleanup. Only ``status='queued'`` rows are touched
     so we don't race the cancel-watcher's cooperative ``running`` cancel.
 
+    Project-scoped (migration 0017): only this orchestrator's project's jobs
+    (``None`` ⇒ ``config.project``). The flip is correctness-neutral (the parent
+    run is already terminal, so the job could never run), but a per-project
+    orchestrator must not write another tenant's rows — kept consistent with the
+    other sweeps. Default ``""`` matches all (single-tenant byte-compatible).
+
     Idempotent: a second call after the first returns 0.
     """
     with connection() as conn, conn.cursor() as cur:
@@ -1580,9 +1670,11 @@ def cancel_orphaned_queued_jobs() -> int:
                SET status = 'cancelled', finished_at = now()
               FROM workflow_runs r
              WHERE j.run_id = r.id
+               AND j.project = %s
                AND j.status = 'queued'
                AND r.status IN ('cancelled', 'failed')
-            """
+            """,
+            (_project(project),),
         )
         return cur.rowcount or 0
 
@@ -1609,18 +1701,25 @@ def set_resolved_inputs(job_id: str, resolved_inputs: dict[str, Any]) -> None:
 # ── Snapshot for Rails ───────────────────────────────────────────────────
 
 
-def snapshot() -> dict[str, Any]:
+def snapshot(*, project: str | None = None) -> dict[str, Any]:
     """Return counts and running/queued rows per queue, for the
     queue-indicator UI. Keeps the payload small — at most 50 rows per
     section.
-    """
+
+    ``project`` (migration 0017) filters to one tenant; ``None`` (default) is
+    the broker-wide view across all projects — byte-compatible with the pre-0017
+    single-tenant deploy (every row is ``''``). Each returned row carries its
+    ``project`` (``SELECT *``) so a multi-tenant caller can group client-side."""
+    pred = "" if project is None else " WHERE project = %(project)s"
+    pf = {} if project is None else {"project": project}
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             SELECT queue, status, COUNT(*) AS n
-            FROM workflow_node_jobs
+            FROM workflow_node_jobs{pred}
             GROUP BY queue, status
-            """
+            """,
+            pf,
         )
         counts: dict[tuple[str, str], int] = {}
         for row in cur.fetchall():
@@ -1629,9 +1728,10 @@ def snapshot() -> dict[str, Any]:
         def _top(queue: str, status: str, limit: int = 50) -> list[dict[str, Any]]:
             cur.execute(
                 "SELECT * FROM workflow_node_jobs "
-                "WHERE queue = %s AND status = %s "
-                "ORDER BY created_at ASC LIMIT %s",
-                (queue, status, limit),
+                "WHERE queue = %(queue)s AND status = %(status)s"
+                + (" AND project = %(project)s" if project is not None else "")
+                + " ORDER BY created_at ASC LIMIT %(limit)s",
+                {"queue": queue, "status": status, "limit": limit, **pf},
             )
             return list(cur.fetchall())
 
@@ -1650,7 +1750,7 @@ def snapshot() -> dict[str, Any]:
         }
 
 
-def ingest_snapshot() -> dict[str, Any]:
+def ingest_snapshot(*, project: str | None = None) -> dict[str, Any]:
     """Per-queue depth + live-worker counts for the INGEST path — the
     ``ingest_jobs`` twin of :func:`snapshot` (which covers only the cpu/gpu DAG
     queues). ``queues[q]`` carries the status counts plus ``workers`` = the
@@ -1658,20 +1758,29 @@ def ingest_snapshot() -> dict[str, Any]:
     matching the claim worker's 10 s refresh). A host maps queued+running →
     "messages" and ``workers`` → "consumers" for its queue-indicator UI.
 
-    NB: ``worker_heartbeats`` is keyed ``(host_label, queue)``, so ``workers``
-    counts live worker *hosts* per queue, not processes — enough to drive the
-    "no consumer → starvation" warning."""
+    NB: ``worker_heartbeats`` is keyed ``(host_label, queue, project)``, so
+    ``workers`` counts live worker *hosts* per queue, not processes — enough to
+    drive the "no consumer → starvation" warning.
+
+    ``project`` (migration 0017) filters to one tenant; ``None`` (default) is the
+    broker-wide view (byte-compatible with single-tenant)."""
+    jpred = "" if project is None else " WHERE project = %(project)s"
+    hpred = "" if project is None else " AND project = %(project)s"
+    pf = {} if project is None else {"project": project}
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT queue, status, COUNT(*) AS n FROM ingest_jobs "
-            "GROUP BY queue, status"
+            f"SELECT queue, status, COUNT(*) AS n FROM ingest_jobs{jpred} "
+            "GROUP BY queue, status",
+            pf,
         )
         counts: dict[str, dict[str, int]] = {}
         for row in cur.fetchall():
             counts.setdefault(row["queue"], {})[row["status"]] = int(row["n"])
         cur.execute(
             "SELECT queue, COUNT(*) AS n FROM worker_heartbeats "
-            "WHERE last_seen > now() - interval '30 seconds' GROUP BY queue"
+            "WHERE last_seen > now() - interval '30 seconds'" + hpred
+            + " GROUP BY queue",
+            pf,
         )
         workers = {row["queue"]: int(row["n"]) for row in cur.fetchall()}
 
@@ -1688,7 +1797,9 @@ def ingest_snapshot() -> dict[str, Any]:
     return {"queues": queues}
 
 
-def fleet_snapshot(*, stale_after_s: float = 30.0) -> list[dict[str, Any]]:
+def fleet_snapshot(
+    *, stale_after_s: float = 30.0, project: str | None = None,
+) -> list[dict[str, Any]]:
     """Read-only per-``(host_label, queue)`` fleet capacity view — the observed
     ``worker_heartbeats`` rows, the telemetry read model a fleet view / operator
     control plane consumes.
@@ -1708,17 +1819,23 @@ def fleet_snapshot(*, stale_after_s: float = 30.0) -> list[dict[str, Any]]:
                            ``last_flagged_dead_at`` (migration 0009) and no fresh
                            heartbeat has cleared it.
 
+    ``project`` (migration 0017) filters to one tenant's workers; ``None``
+    (default) returns the whole fleet across all projects (each row carries its
+    ``project`` via ``SELECT *``).
+
     Pure read; no host coupling. Returns ``[]`` on an empty fleet.
     """
+    pred = "" if project is None else " WHERE project = %(project)s"
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             SELECT *,
-                   (last_seen > now() - (%s * interval '1 second')) AS fresh,
+                   (last_seen > now() - (%(stale)s * interval '1 second')) AS fresh,
                    (last_flagged_dead_at IS NOT NULL)               AS flagged_dead
-            FROM worker_heartbeats
+            FROM worker_heartbeats{pred}
             ORDER BY queue, host_label
             """,
-            (float(stale_after_s),),
+            {"stale": float(stale_after_s),
+             **({} if project is None else {"project": project})},
         )
         return [dict(row) for row in cur.fetchall()]

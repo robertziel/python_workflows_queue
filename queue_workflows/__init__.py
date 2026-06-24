@@ -68,6 +68,7 @@ def configure(
     host_label_env: str | None = None,
     host_priority_env: str | None = None,
     container_prefix: str | None = None,
+    project: str | None = None,
     ingest_queues: frozenset[str] | None = None,
     ingest_default_budget_s: int | None = None,
     db_backend: str | None = None,
@@ -100,6 +101,8 @@ def configure(
             cfg.host_priority_env = host_priority_env
         if container_prefix is not None:
             cfg.container_prefix = container_prefix
+        if project is not None:
+            cfg.project = str(project)
         if ingest_queues is not None:
             iq = frozenset(ingest_queues)
             reserved = iq & {"cpu", "gpu"}

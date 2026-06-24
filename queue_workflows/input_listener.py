@@ -79,6 +79,14 @@ class InputListener(threading.Thread):
         Without the reclaim half, a listener that died after the commit but
         before ``_mark_processed`` would leave the row stranded forever.
         """
+        # Project-scoped (migration 0017): a per-project orchestrator resumes
+        # ONLY its own project's input submissions. The table has no project
+        # column, so correlate to the parent run's project (= config.project).
+        # Without this, on a shared broker project A's listener would claim
+        # project B's submission and resume B's run under A's pipeline/resolver.
+        # Default "" (single-tenant) matches every run, so behaviour is unchanged.
+        from queue_workflows.config import get_config
+        project = get_config().project or ""
         with _db_connection() as conn, conn.cursor() as cur:
             cur.execute(
                 """
@@ -86,18 +94,22 @@ class InputListener(threading.Thread):
                    SET status = 'processing',
                        claimed_at = now()
                  WHERE id IN (
-                     SELECT id FROM workflow_input_submissions
-                      WHERE status = 'pending'
-                         OR (status = 'processing'
-                             AND claimed_at IS NOT NULL
-                             AND claimed_at < now() - make_interval(secs => %s))
-                      ORDER BY created_at ASC
+                     SELECT s.id FROM workflow_input_submissions s
+                      WHERE (s.status = 'pending'
+                          OR (s.status = 'processing'
+                              AND s.claimed_at IS NOT NULL
+                              AND s.claimed_at < now() - make_interval(secs => %(reclaim)s)))
+                        AND EXISTS (
+                            SELECT 1 FROM workflow_runs r
+                            WHERE r.id = s.run_id AND r.project = %(project)s
+                        )
+                      ORDER BY s.created_at ASC
                       FOR UPDATE SKIP LOCKED
                       LIMIT 50
                  )
              RETURNING id, run_id, node_id, value
                 """,
-                (float(INPUT_CLAIM_RECLAIM_S),),
+                {"reclaim": float(INPUT_CLAIM_RECLAIM_S), "project": project},
             )
             rows = cur.fetchall()
             conn.commit()

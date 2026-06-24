@@ -40,6 +40,62 @@ def get_run(run_id: str) -> dict[str, Any] | None:
         return cur.fetchone()
 
 
+def list_queued_node_run_ids(
+    *, project: str | None = None, limit: int = 50,
+) -> list[str]:
+    """IDs of queued ``mode='node'`` runs for THIS client's project — the
+    dispatch loop's work-list (``NodePool._tick``).
+
+    Project-scoped (migration 0017): a per-project orchestrator expands ONLY its
+    own project's runs. Without this filter, on a shared broker project A's
+    orchestrator would pick up project B's queued runs and expand them under A's
+    workflow definitions (cross-tenant corruption, or a requeue-spam loop when
+    A's ``load_workflow`` can't resolve B's workflow name). ``project`` ``None``
+    ⇒ ``config.project`` (default ``""`` — single-tenant, byte-compatible: every
+    run is ``''`` so the filter matches all)."""
+    if project is None:
+        from queue_workflows.config import get_config
+        project = get_config().project or ""
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM workflow_runs "
+            "WHERE mode = 'node' AND status = 'queued' AND project = %s "
+            "ORDER BY priority ASC, queued_at ASC NULLS LAST LIMIT %s",
+            (project, int(limit)),
+        )
+        return [r["id"] for r in cur.fetchall()]
+
+
+def list_stuck_node_run_ids(*, project: str | None = None) -> list[str]:
+    """IDs of ``mode='node'`` runs that are queued/running but have NO live
+    node-job — the phantom runs the stuck-run reconciler drives
+    (``NodePool._sweep_stuck_runs`` → ``dispatcher.reconcile_run``).
+
+    Project-scoped (migration 0017): a per-project orchestrator reconciles ONLY
+    its own project's phantom runs — else it would drive another project's run
+    through ``reconcile_run`` under its own workflow definitions. ``project``
+    ``None`` ⇒ ``config.project`` (default ``""`` — single-tenant, matches all)."""
+    if project is None:
+        from queue_workflows.config import get_config
+        project = get_config().project or ""
+    with connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT r.id FROM workflow_runs r
+            WHERE r.mode = 'node'
+              AND r.status IN ('queued', 'running')
+              AND r.project = %s
+              AND NOT EXISTS (
+                SELECT 1 FROM workflow_node_jobs j
+                WHERE j.run_id = r.id
+                  AND j.status IN ('queued', 'running', 'awaiting_input')
+              )
+            """,
+            (project,),
+        )
+        return [r["id"] for r in cur.fetchall()]
+
+
 # Whitelist of columns update_run() accepts. Typos surface at call time
 # instead of silently dropping. Mirrors ai_leads' queries._UPDATABLE for the
 # columns the engine touches (parcel_id stays writable so a host that keeps
@@ -92,23 +148,32 @@ def insert_run(
     priority: int = 100,
     mode: str = "node",
     context: dict[str, Any] | None = None,
+    project: str | None = None,
 ) -> dict[str, Any]:
     """Insert a fresh ``workflow_runs`` row. ``mode`` defaults to ``node``
-    (the only live mode post-Phase-5). Returns the inserted row dict."""
+    (the only live mode post-Phase-5). Returns the inserted row dict.
+
+    ``project`` (migration 0017) is the run's tenant tag; ``None`` ⇒ this
+    client's ``config.project`` (default ``""`` — single-tenant). The dispatcher
+    propagates it onto every node-job the run expands into, so a per-project
+    client's workers claim only their own project's nodes."""
+    if project is None:
+        from queue_workflows.config import get_config
+        project = get_config().project or ""
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO workflow_runs
                 (id, parcel_id, workflow_name, status, priority,
-                 out_dir, mode, context, queued_at, created_at, updated_at)
+                 out_dir, mode, context, project, queued_at, created_at, updated_at)
             VALUES
                 (%s, %s, %s, %s, %s,
-                 %s, %s, %s, %s, now(), now())
+                 %s, %s, %s, %s, %s, now(), now())
             RETURNING *
             """,
             (
                 run_id, parcel_id, workflow_name, status, priority,
-                out_dir, mode, _as_json(context or {}),
+                out_dir, mode, _as_json(context or {}), project,
                 _now() if status == "queued" else None,
             ),
         )
@@ -123,10 +188,16 @@ def delete_run(run_id: str) -> None:
         cur.execute("DELETE FROM workflow_runs WHERE id = %s", (run_id,))
 
 
-def reenqueue_running_for_resume() -> int:
+def reenqueue_running_for_resume(*, project: str | None = None) -> int:
     """Startup hook: orphan ``running`` rows ALWAYS flip back to ``queued`` at
     priority=10 for resume — never auto-failed. Returns the number of rows
     touched.
+
+    Project-scoped (migration 0017): resumes ONLY this client's project's runs
+    (``None`` ⇒ ``config.project``). The orchestrator runs this on startup; on a
+    shared broker, without the filter project A's restart would flip ALL
+    projects' in-flight runs (incl. B's healthy ones) back to queued. Default
+    ``""`` matches every run (single-tenant byte-compatible).
 
     A row is ``running`` here only because a worker died mid-execution (crash,
     watchdog hard-exit, or an operator fleet-restart) without marking its node
@@ -141,6 +212,9 @@ def reenqueue_running_for_resume() -> int:
     node-failure path (``node_executor`` mark_failed + outbox), not here.
 
     Plain-SQL port of ai_leads' ``queries.reenqueue_running_for_resume``."""
+    if project is None:
+        from queue_workflows.config import get_config
+        project = get_config().project or ""
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -151,8 +225,10 @@ def reenqueue_running_for_resume() -> int:
                 queued_at = now(),
                 updated_at = now()
             WHERE status = 'running'
+              AND project = %s
             RETURNING id
             """,
+            (project,),
         )
         return len(cur.fetchall())
 

@@ -65,7 +65,7 @@ def _put_heartbeat(host: str, queue: str, *, last_seen_age_s: float) -> None:
             INSERT INTO worker_heartbeats
                 (host_label, queue, concurrency, last_seen, known_models)
             VALUES (%s, %s, 1, now() - make_interval(secs => %s), '{}')
-            ON CONFLICT (host_label, queue) DO UPDATE
+            ON CONFLICT (host_label, queue, project) DO UPDATE
                 SET last_seen = EXCLUDED.last_seen
             """,
             (host, queue, float(last_seen_age_s)),

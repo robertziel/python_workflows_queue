@@ -99,6 +99,17 @@ class EngineConfig:
     node_module_package: str = ""
     #: cgroup-attribution container-name prefix (hw_metrics per-container slice).
     container_prefix: str = "ai_leads-"
+    #: Tenant identity of THIS client on a SHARED broker Postgres (migration
+    #: 0017). One broker DB holds one cpu + one gpu (+ ingest) queue across all
+    #: projects; every queue record carries ``project`` and a client enqueues +
+    #: claims ONLY rows whose ``project`` matches this value. Default ``""`` is the
+    #: single-tenant sentinel: every row is ``''`` and the claim filter
+    #: ``project=''`` matches them all, so a single-Postgres-per-project deploy is
+    #: byte-compatible with no host wiring. Distinct from :attr:`db_namespace`,
+    #: which *isolates* tenants on a shared redis/mongo (they can't see each
+    #: other); ``project`` *pools* them into one pg queue with a filter — the
+    #: inverse. Set via ``configure(project="ai_leads")``.
+    project: str = ""
     #: OBSERVED LLM-server capability this worker advertises in its heartbeat
     #: (migration 0014) — which server types this HOST can actually run. The host
     #: sets it once at startup (ai_leads → from the vllm-sidecar-rendered env), and
