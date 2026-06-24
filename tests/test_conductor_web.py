@@ -96,6 +96,12 @@ def test_server_answers_http_get():
             assert False, "expected 404"
         except urllib.error.HTTPError as e:
             assert e.code == 404
+        # ?project= selects the '' single-tenant sentinel (keep_blank_values),
+        # NOT the broker-wide 'all projects' view.
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/?project=", timeout=5) as r:
+            empty_body = r.read().decode("utf-8")
+        assert "project = (default)" in empty_body
+        assert "· all projects" not in empty_body
     finally:
         httpd.shutdown()
         httpd.server_close()

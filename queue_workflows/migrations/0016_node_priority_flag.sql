@@ -9,4 +9,4 @@
 -- reload is the accepted cost of "run this next"). DEFAULT FALSE so every
 -- existing + freshly-written row keeps today's behaviour with no backfill.
 ALTER TABLE workflow_node_jobs
-    ADD COLUMN is_priority BOOLEAN NOT NULL DEFAULT FALSE;
+    ADD COLUMN IF NOT EXISTS is_priority BOOLEAN NOT NULL DEFAULT FALSE;

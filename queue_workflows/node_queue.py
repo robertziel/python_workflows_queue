@@ -703,6 +703,15 @@ def reclaim_expired_ingest_leases() -> list[dict[str, Any]]:
     priority to the front — the status flip fires the ``ingest_job_ready``
     NOTIFY so an idle worker picks it straight back up. Returns the
     reclaimed rows' id / task_name / queue.
+
+    INTENTIONALLY broker-wide (NOT project-scoped, unlike the other 0017 sweeps):
+    lease-reclaim is a pure status-driven recovery (running→queued by lapsed
+    lease) that reads no project state and leaves each row's ``project`` tag
+    intact — so a re-queued row is still claimed only by its OWN project's worker
+    (exact-match claim). Running it broker-wide makes any orchestrator a recovery
+    backstop for any project's orphaned lease, which is strictly safer on a shared
+    broker than requiring each project's orchestrator to be up. Concurrent reclaims
+    are idempotent (WHERE status='running').
     """
     with connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -725,6 +734,14 @@ def reclaim_expired_ingest_leases() -> list[dict[str, Any]]:
 def reclaim_expired_leases() -> list[dict[str, Any]]:
     """Re-queue ``running`` rows whose lease has lapsed — UNLESS the
     parent run is no longer active.
+
+    INTENTIONALLY broker-wide (NOT project-scoped, unlike the other 0017 sweeps):
+    a pure status-driven recovery that leaves each row's ``project`` tag intact,
+    so a re-queued row is still claimed only by its OWN project's worker. Running
+    it broker-wide makes any orchestrator a recovery backstop for any project's
+    orphaned lease on a shared broker — strictly safer than per-project-only
+    reclaim. Idempotent under concurrency (the CASE-on-target ``WHERE
+    j.status='running'``).
 
     A live worker renews its lease while running, so a lapsed lease
     means the owner died or wedged. Two outcomes depending on the

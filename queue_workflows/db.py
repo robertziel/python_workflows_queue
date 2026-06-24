@@ -682,11 +682,36 @@ def bootstrap(
     backend (``migrations/`` for Postgres, ``migrations_sqlite/`` for SQLite). A
     host applies its domain chain by calling this a SECOND time with its own dir
     + ``schema_version``.
+
+    CONCURRENCY-SAFE on Postgres: a ``pg_advisory_xact_lock`` (keyed on the
+    version table) serializes concurrent bootstraps, so MANY processes calling it
+    on the SAME database — e.g. every project's orchestrator booting against one
+    shared broker after a new migration ships — is safe: the lock holder applies
+    the pending chain and commits; every waiter then re-reads the ledger inside
+    the lock and finds nothing to do. The lock is acquired **FIRST** — before even
+    ``CREATE TABLE IF NOT EXISTS`` (which itself races at the pg catalog) and the
+    ``applied`` read — so each waiter's read reflects whatever the winner
+    committed (do NOT reorder this).
+
+    On SQLite the advisory lock is a no-op and bootstrap is NOT concurrency-safe
+    across PROCESSES (the per-process shared connection + RLock serialize only
+    threads; the SQLite migrations use bare ``ADD COLUMN``). That's fine for its
+    intended use: SQLite is a single-machine deploy and only the orchestrator
+    bootstraps (claim workers/scheduler call :func:`wait_for_schema`, never
+    bootstrap), so concurrent SQLite bootstrap does not arise in normal operation.
     """
     _check_identifier(version_table)
     mdir = migrations_dir or _engine_migrations_dir()
     with connection() as conn:
         with conn.cursor() as cur:
+            if not _engine_is_sqlite():
+                # Serialize concurrent bootstraps on one DB — acquired FIRST, even
+                # before CREATE TABLE (concurrent ``CREATE TABLE IF NOT EXISTS``
+                # itself races at the pg catalog level). Held until COMMIT; a
+                # racing bootstrap blocks here, then the ``applied`` read below
+                # reflects whatever the winner committed (so it skips, not double-
+                # applies / collides on the ledger PK).
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (version_table,))
             cur.execute(
                 f"CREATE TABLE IF NOT EXISTS {version_table} ("
                 "  version INTEGER PRIMARY KEY,"

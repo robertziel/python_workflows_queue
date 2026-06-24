@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`queue-broker` console + `queue-conductor-web` — operate the consolidated,
+  one-queue-for-all-projects broker.** `queue-broker` stands up / owns the shared
+  broker schema independently of any one project (`db.bootstrap` on the broker
+  DSN, idempotent) and `--status` prints the consolidated per-project queue depth;
+  pointing every project's processes at the same DSN with
+  `configure(project="X", db_url_env=BROKER)` then yields ONE shared cpu/gpu
+  (+ ingest) queue, each client scoped to its own rows (see *Standing up the
+  broker* in `docs/multitenant_broker.md`; proven end-to-end in
+  `tests/test_broker_consolidation.py`). `queue-conductor-web`
+  (`queue_workflows_conductor.web`) is a read-only, stdlib-only (no JS) operator
+  web view of that consolidated queue + fleet, with a `?project=` filter —
+  light-themed to match the existing fleet dashboard; `node_queue.list_projects()`
+  backs the filter.
 - **Multi-tenant broker — one shared queue across all projects (migration
   0017).** A `project` tenant tag now rides every queue record
   (`workflow_runs`, `workflow_node_jobs`, `ingest_jobs`, `worker_heartbeats`) so

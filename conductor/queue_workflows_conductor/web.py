@@ -233,7 +233,9 @@ class ConductorWebHandler(BaseHTTPRequestHandler):
         if parsed.path not in ("/", "/index.html"):
             self._send(404, "<h1>404</h1>")
             return
-        q = urllib.parse.parse_qs(parsed.query)
+        # keep_blank_values so the single-tenant sentinel project '' is a real,
+        # selectable filter (?project=) and not silently dropped to the all view.
+        q = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         project = q["project"][0] if "project" in q else None
         try:
             self._send(200, render_dashboard(project, stale_after_s=self.stale_after_s))

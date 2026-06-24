@@ -89,6 +89,43 @@ existing single-tenant deploys unchanged. Mixing a configured client with `""`
 rows in the same DB is a misconfiguration — a `""` client would see only `""`
 rows, a configured client only its own.
 
+### Standing up THE broker (one queue for all projects)
+
+Consolidation is a **config flip**, not new code. Three steps:
+
+```bash
+# 1. Stand up the shared broker schema ONCE (idempotent), against the broker DSN.
+#    `queue-broker` is the explicit "own the migration chain" entry point. You do
+#    NOT strictly have to run it first: db.bootstrap() takes a Postgres advisory
+#    lock, so every project's orchestrator can also boot against the shared broker
+#    concurrently and safely — the lock serializes, and a late bootstrap that
+#    finds the chain already applied is a no-op. queue-broker just makes the
+#    "bootstrap once, independent of any app" step explicit + inspectable.
+BROKER_DSN=postgresql://…/broker   queue-broker
+```
+
+```python
+# 2. Point EVERY process of EVERY project at that broker + name the project.
+#    (orchestrator, claim workers, scheduler — all of them.)
+queue_workflows.configure(project="ai_leads",   db_url_env="BROKER_DSN")
+queue_workflows.configure(project="pic_to_3d",  db_url_env="BROKER_DSN")
+# … each then enqueues + claims ONLY its own project's rows on the ONE shared
+#   cpu/gpu (+ ingest) queue. Cross-project isolation is enforced by the engine
+#   (exact-match-always; proven in tests/test_broker_consolidation.py).
+```
+
+```bash
+# 3. Watch the CONSOLIDATED queue across all projects.
+BROKER_DSN=…   queue-broker --status      # schema version + per-project depth
+BROKER_DSN=…   queue-conductor-web         # the web view, filterable by project
+```
+
+That is the whole consolidation: one broker DB, one cpu + one gpu queue, every
+record tagged with `project`, each client scoped to its own — the headline of
+this design. (Migrating the *existing* per-project deploys onto the broker is the
+operational **Cutover** below — it backfills each app's in-flight rows to its
+project tag and repoints its env at `BROKER_DSN`.)
+
 ### Cutover — adopting a project name on an existing deploy
 
 Migration 0017 backfills every existing row to `project=''`. Because claiming is

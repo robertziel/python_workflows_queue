@@ -36,6 +36,7 @@ mongodb = ["pymongo>=4.4"]         # the 'mongodb' StorageBackend (needs a repli
 test = ["pytest", "pytest-cov", "redis>=5", "pymongo>=4.4"]
 
 [project.scripts]
+queue-broker         = "queue_workflows.broker:main"         # stand up / inspect THE shared broker (one queue, all projects)
 queue-claim-worker   = "queue_workflows.claim_worker:main"   # generic CLIs (used standalone / other projects)
 queue-scheduler      = "queue_workflows.scheduler:main"
 queue-orchestrator   = "queue_workflows.orchestrator:main"
