@@ -2,8 +2,10 @@
 
 `queue_workflows` is a Postgres-as-queue engine, but the **whole engine** can run
 against a single **SQLite file** — a local, daemon-less, low-RAM/low-disk deploy
-with no separate database server — selected entirely in config. The Postgres path
-is unchanged and byte-identical; SQLite is additive and opt-in.
+with no separate database server — selected entirely in config. **As of v1.0.0
+SQLite is the DEFAULT** (`configure()` with no `db_backend` ⇒ sqlite); the
+Postgres path is unchanged and byte-identical but now opt-in via
+`configure(db_backend="pg")`.
 
 > Why SQLite for a local box: Postgres needs a running daemon (tens–hundreds of MB
 > RAM) and tuning; SQLite is an embedded file (≈0 daemon, a few MB), trivially
@@ -30,8 +32,8 @@ MYAPP_DB_URL=/var/lib/myapp/queue.db queue-orchestrator     # applies migrations
 MYAPP_DB_URL=/var/lib/myapp/queue.db queue-claim-worker --queue=cpu
 ```
 
-`configure(db_backend=...)` selects the engine's **relational** store: `"pg"`
-(default) or `"sqlite"`. (`"redis"`/`"mongodb"` select the separate *flat-queue*
+`configure(db_backend=...)` selects the engine's **relational** store: `"sqlite"`
+(default) or `"pg"`. (`"redis"`/`"mongodb"` select the separate *flat-queue*
 `StorageBackend` SPI — see `storage_backends.md` — and do **not** host the
 relational DAG engine.)
 

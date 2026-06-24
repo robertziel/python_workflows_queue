@@ -269,6 +269,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--port", type=int, default=8787)
     p.add_argument("--stale-after", type=float, default=30.0,
                    help="seconds before a worker heartbeat is 'stale' (default 30)")
+    p.add_argument("--db-backend", default=None,
+                   help="store: pg | sqlite | redis | mongodb (default from "
+                   "QUEUE_WORKFLOWS_DB_BACKEND). A Postgres fleet needs "
+                   "--db-backend pg — the library default is now sqlite (v1.0.0).")
+    p.add_argument("--db-url-env", default=None,
+                   help="env var holding the DSN / SQLite path (default: configured)")
     args = p.parse_args(argv)
+    from queue_workflows_conductor.conductor import _configure_backend
+    _configure_backend(args.db_backend, args.db_url_env)
     serve(args.host, args.port, stale_after_s=args.stale_after)
     return 0

@@ -8,17 +8,18 @@ enqueues/claims only its own project's rows. This console is the explicit
 "bootstrap the broker once, then point every project at it" entry point — the
 thing that makes *one consolidated queue for all projects* a config flip:
 
-    # 1. stand up the broker schema once (idempotent), against the broker DSN:
-    BROKER_DSN=postgresql://…/broker  queue-broker
+    # 1. stand up the broker schema once (idempotent). A pg broker needs
+    #    --db-backend pg (the library default is sqlite as of v1.0.0):
+    BROKER_DSN=postgresql://…/broker  queue-broker --db-backend pg --db-url-env BROKER_DSN
 
     # 2. every process of every project points at that broker + names itself:
-    #    queue_workflows.configure(project="ai_leads",  db_url_env="BROKER_DSN")
-    #    queue_workflows.configure(project="pic_to_3d",  db_url_env="BROKER_DSN")
+    #    configure(project="ai_leads",  db_backend="pg", db_url_env="BROKER_DSN")
+    #    configure(project="pic_to_3d", db_backend="pg", db_url_env="BROKER_DSN")
     #    … each enqueues/claims ONLY its own project's rows on the shared queue.
 
     # 3. watch the consolidated queue across all projects:
-    BROKER_DSN=…  queue-broker --status        # per-project breakdown
-    BROKER_DSN=…  queue-conductor-web           # the web view
+    BROKER_DSN=…  queue-broker --db-backend pg --db-url-env BROKER_DSN --status
+    BROKER_DSN=…  queue-conductor-web --db-backend pg --db-url-env BROKER_DSN
 
 This is the orchestrator's ``db.bootstrap`` step made an explicit, inspectable
 entry point. You needn't run it before the projects: ``db.bootstrap`` takes a
@@ -70,6 +71,13 @@ def main(argv: list[str] | None = None) -> int:
         "projects). Default: bootstrap the broker schema (idempotent).",
     )
     parser.add_argument(
+        "--db-backend", default=None,
+        help="broker store: pg | sqlite | redis | mongodb (default: the "
+        f"configured {_config.get_config().db_backend}, from "
+        "QUEUE_WORKFLOWS_DB_BACKEND). A Postgres broker needs --db-backend pg — "
+        "the library default is now sqlite (v1.0.0).",
+    )
+    parser.add_argument(
         "--db-url-env", default=None,
         help="env var holding the broker DSN (default: the configured "
         f"{_config.get_config().db_url_env}).",
@@ -80,9 +88,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    cfg_kwargs = {}
+    if args.db_backend:
+        cfg_kwargs["db_backend"] = args.db_backend
     if args.db_url_env:
+        cfg_kwargs["db_url_env"] = args.db_url_env
+    if cfg_kwargs:
         import queue_workflows
-        queue_workflows.configure(db_url_env=args.db_url_env)
+        queue_workflows.configure(**cfg_kwargs)
 
     try:
         if args.status:

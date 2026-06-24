@@ -9,7 +9,7 @@ build-backend = "hatchling.build"
 # so renaming the dist would break it for zero benefit. The split is still real:
 # the conductor ships as the separate `queue-workflows-conductor` distribution.
 name = "queue_workflows"
-version = "0.5.0"
+version = "1.0.0"
 description = "broker_parrot — Postgres-as-queue workflow engine (CLIENT / per-project data plane): SKIP LOCKED claim, lease reclaim, DAG dispatch, GPU warm-model cache. Import package `queue_workflows`. The conductor (control plane) ships as the separate queue-workflows-conductor distribution."
 readme = "README.md"
 requires-python = ">=3.10"

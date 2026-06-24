@@ -8,7 +8,7 @@ same durable-queue semantics can run on Redis or MongoDB.
 
 ```python
 import queue_workflows
-queue_workflows.configure(db_backend="redis")          # or "mongodb", or "pg" (default)
+queue_workflows.configure(db_backend="redis")          # or "mongodb" / "pg" / "sqlite" (default)
 from queue_workflows.backends import get_backend
 be = get_backend()                                      # bound to config.db_namespace
 jid = be.enqueue("cpu", {"task": "render"})
@@ -74,7 +74,7 @@ server are isolated.
 
 | `configure(...)` key | env (default) | meaning |
 |---|---|---|
-| `db_backend` | — | `"pg"` (default) / `"redis"` / `"mongodb"` (aliases `postgres`, `mongo`) |
+| `db_backend` | `QUEUE_WORKFLOWS_DB_BACKEND` (`sqlite`) | `"sqlite"` (default) / `"pg"` / `"redis"` / `"mongodb"` (aliases `postgres`, `mongo`) |
 | `db_namespace` | — | tenant scope on a shared server (`""` ⇒ `"default"`) |
 | — | `QUEUE_WORKFLOWS_REDIS_URL` | redis DSN (`redis_url_env` renames it) |
 | — | `QUEUE_WORKFLOWS_MONGO_URL` | mongo DSN, incl. `?replicaSet=…` / `directConnection=true` |

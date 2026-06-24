@@ -41,6 +41,26 @@ from queue_workflows import node_queue
 log = logging.getLogger("queue_workflows_conductor.conductor")
 
 
+def _configure_backend(db_backend: str | None, db_url_env: str | None) -> None:
+    """Apply the operator's backend / DSN selection to the engine config.
+
+    The conductor scripts are run STANDALONE by an operator (no host
+    ``configure()``), so they must self-select the store. Since the library
+    default flipped to ``sqlite`` (v1.0.0), a Postgres fleet view needs an
+    explicit ``--db-backend pg`` (or ``QUEUE_WORKFLOWS_DB_BACKEND=pg``), else the
+    pg DSN is read as a SQLite path. Shared by ``queue-conductor`` and
+    ``queue-conductor-web``."""
+    import queue_workflows
+
+    kwargs = {}
+    if db_backend:
+        kwargs["db_backend"] = db_backend
+    if db_url_env:
+        kwargs["db_url_env"] = db_url_env
+    if kwargs:
+        queue_workflows.configure(**kwargs)
+
+
 def render_fleet(rows: list[dict[str, Any]], *, as_json: bool = False) -> str:
     """Render the ``fleet_snapshot`` rows for an operator.
 
@@ -102,8 +122,19 @@ def main(argv: list[str] | None = None) -> int:
         "--json", action="store_true",
         help="emit a JSON array instead of a table",
     )
+    parser.add_argument(
+        "--db-backend", default=None,
+        help="store: pg | sqlite | redis | mongodb (default from "
+        "QUEUE_WORKFLOWS_DB_BACKEND). A Postgres fleet needs --db-backend pg — "
+        "the library default is now sqlite (v1.0.0).",
+    )
+    parser.add_argument(
+        "--db-url-env", default=None,
+        help="env var holding the DSN / SQLite path (default: configured)",
+    )
     args = parser.parse_args(argv)
 
+    _configure_backend(args.db_backend, args.db_url_env)
     rows = node_queue.fleet_snapshot(stale_after_s=args.stale_after)
     if args.queue:
         rows = [r for r in rows if r["queue"] == args.queue]

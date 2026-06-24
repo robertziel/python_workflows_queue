@@ -26,9 +26,24 @@ from queue_workflows import dispatcher, node_pool, node_queue, run_store
 # ── import + configure surface ─────────────────────────────────────────────
 
 
+def test_default_backend_is_sqlite(monkeypatch):
+    """v1.0.0 BREAKING: the raw default db_backend flipped pg → sqlite (the one
+    intentionally non-byte-compat default). Checked on a FRESH EngineConfig
+    because conftest configures the global singleton's backend explicitly. The
+    raw default reads QUEUE_WORKFLOWS_DB_BACKEND, so delenv it first — else a pg
+    shop that exports the documented opt-in fails this spuriously."""
+    monkeypatch.delenv("QUEUE_WORKFLOWS_DB_BACKEND", raising=False)
+    from queue_workflows.config import EngineConfig
+    assert EngineConfig().db_backend == "sqlite"
+    # the byte-compat env-name defaults are unchanged — only db_backend flipped.
+    assert EngineConfig().db_url_env == "AI_LEADS_DB_URL"
+    assert EngineConfig().container_prefix == "ai_leads-"
+
+
 def test_import_and_configure_with_safe_defaults():
     cfg = queue_workflows.configure()  # no args — all defaults
-    # Defaults keep ai_leads byte-compat env names.
+    # Defaults keep ai_leads byte-compat ENV NAMES (the db_backend default is
+    # sqlite now — see test_default_backend_is_sqlite).
     assert cfg.db_url_env  # set by conftest to the test env
     assert cfg.container_prefix == "ai_leads-"
     # Safe defaults: empty video set, no node package, no-op registrar.

@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The engine was extracted from the **`ai_leads`** stack (its "Phase 6") so the ~35 sibling projects in that stack can share one DRY source instead of each carrying a copy. `ai_leads` is the origin and first consumer; it lives in a separate repo (not a sibling of this checkout). A **second consumer** — a non-DAG forecast service — drove the v0.2.0 multi-tenant-ingest generalization (host-defined ingest queues + per-job args; see *Two job families* below), so treat "host" as **≥2 distinct apps**, not just `ai_leads`, when generalizing.
 
-This explains a pattern you'll see everywhere: defaults are **`ai_leads`-byte-compatible** so the live deploy needs zero `.env` changes at cutover — the DSN env var defaults to `AI_LEADS_DB_URL`, `container_prefix` to `"ai_leads-"`, runtime knobs are `AI_LEADS_*`, and tests honor `AI_LEADS_DISABLE_*` gates. **These are configurable defaults, not couplings.** The package imports *nothing* from any host application (enforced by `tests/test_no_ai_leads_import.py`); a consumer overrides the names via `queue_workflows.configure(db_url_env=..., container_prefix=..., …)`. When adding a new tunable, follow the same shape: read an env *name* off `EngineConfig`, default it to the `ai_leads` name.
+This explains a pattern you'll see everywhere: defaults are **`ai_leads`-byte-compatible** so the live deploy needs zero `.env` changes at cutover — the DSN env var defaults to `AI_LEADS_DB_URL`, `container_prefix` to `"ai_leads-"`, runtime knobs are `AI_LEADS_*`, and tests honor `AI_LEADS_DISABLE_*` gates. **These are configurable defaults, not couplings.** **The ONE deliberate exception (v1.0.0, BREAKING): `db_backend` now defaults to `"sqlite"`, not `"pg"`** — the friendliest zero-config default for a reusable library, so a Postgres consumer must opt in with `configure(db_backend="pg")` **or** `export QUEUE_WORKFLOWS_DB_BACKEND=pg` (the env knob also reaches the standalone console scripts — `queue-broker`, the conductor — which have no host `configure()`; they also take `--db-backend pg`). Else its `AI_LEADS_DB_URL` pg DSN is read as a SQLite path. Every other default stays byte-compat. The package imports *nothing* from any host application (enforced by `tests/test_no_ai_leads_import.py`); a consumer overrides the names via `queue_workflows.configure(db_url_env=..., container_prefix=..., …)`. When adding a new tunable, follow the same shape: read an env *name* off `EngineConfig`, default it to the `ai_leads` name.
 
 ## Commands
 
@@ -119,14 +119,17 @@ Everything domain-specific is an **injected hook** on a process-wide `EngineConf
 ### Pluggable storage backends (the `db_backend` seam — additive, v0.3.0)
 
 Beyond the host hooks, the **storage layer itself** is selectable:
-`configure(db_backend="pg"|"redis"|"mongodb")` resolves a `StorageBackend`
-(`queue_workflows/backends/`, **one provider per file**) — a generic durable-queue
-SPI (enqueue / claim-exactly-once / lease+reclaim / idempotent terminals / the
-**atomic outbox** `complete_with_event`/`fail_with_event` / wake / heartbeat /
-ON-OFF control). It is **additive and opt-in**: `pg` (default) is byte-compatible
-and the legacy engine modules still talk to Postgres directly — selecting
-redis/mongo does **not** re-home the orchestrator/worker (a later milestone), and
-the redis/pymongo drivers import lazily so a pg-only deploy needs neither. Two
+`configure(db_backend="sqlite"|"pg"|"redis"|"mongodb")`. `sqlite` (**default**,
+v1.0.0) and `pg` are the two **relational** engine backends (they run the full
+DAG engine via the dialect seam, `queue_workflows/dialect.py`); `redis`/`mongodb`
+resolve a `StorageBackend` (`queue_workflows/backends/`, **one provider per
+file**) — a generic durable-queue SPI (enqueue / claim-exactly-once /
+lease+reclaim / idempotent terminals / the **atomic outbox**
+`complete_with_event`/`fail_with_event` / wake / heartbeat / ON-OFF control). The
+SPI is **additive and opt-in**: the legacy engine modules talk to the relational
+store directly — selecting redis/mongo does **not** re-home the orchestrator/worker
+(a later milestone), and the redis/pymongo drivers import lazily so a
+sqlite/pg-only deploy needs neither. Two
 invariants make it honest: the port leaks **no** driver object (no
 cursor/pipeline/session in any signature — the anti-leakage rule), and every
 backend is **namespace-bound** so two tenants on one redis/mongo server can't see

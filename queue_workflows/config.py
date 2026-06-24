@@ -48,6 +48,34 @@ from typing import Any, Callable
 # rendered ``.env`` on the live fleet is unchanged at the cutover.
 
 
+#: Backend aliases for the QUEUE_WORKFLOWS_DB_BACKEND env knob. Mirrors
+#: ``backends._BACKEND_ALIASES`` (+ the relational ``sqlite``/``pg``), inlined so
+#: ``config`` stays a leaf — importing ``backends`` here would cycle (it imports
+#: ``config.get_config``). ``configure()`` re-validates against the registry.
+_DB_BACKEND_ALIASES = {
+    "sqlite": "sqlite", "pg": "pg", "postgres": "pg", "postgresql": "pg",
+    "redis": "redis", "mongo": "mongodb", "mongodb": "mongodb",
+}
+
+
+def _default_db_backend() -> str:
+    """Default ``db_backend``, read from ``QUEUE_WORKFLOWS_DB_BACKEND`` (the env
+    knob that reaches the standalone console scripts) and **validated +
+    normalized** — so a typo or stale alias fails loudly here instead of silently
+    mis-routing (e.g. ``"Sqlite"`` → pg, or ``"mongo"`` → pg instead of the mongo
+    SPI). Unset ⇒ ``"sqlite"`` (the v1.0.0 default)."""
+    raw = os.environ.get("QUEUE_WORKFLOWS_DB_BACKEND")
+    if not raw:
+        return "sqlite"
+    norm = _DB_BACKEND_ALIASES.get(raw)
+    if norm is None:
+        raise ValueError(
+            f"QUEUE_WORKFLOWS_DB_BACKEND={raw!r} is not a known backend "
+            f"(valid: {sorted(set(_DB_BACKEND_ALIASES))})"
+        )
+    return norm
+
+
 @dataclass
 class EngineConfig:
     """Process-wide engine configuration. One instance lives in this module
@@ -120,12 +148,24 @@ class EngineConfig:
     llm_servers_available: list[str] = field(default_factory=lambda: ["ollama"])
 
     # ── storage backend selection (pluggable DB type) ──────────────────────────
-    #: Which provider the StorageBackend SPI (``queue_workflows.backends``)
-    #: resolves to: ``"pg"`` (default — Postgres, byte-compat), ``"redis"``, or
-    #: ``"mongodb"``. The legacy engine modules always use Postgres directly; this
-    #: only selects the backend the generic durable-queue SPI hands out. Validated
-    #: against the backend registry by ``configure()``.
-    db_backend: str = "pg"
+    #: Which relational engine / SPI provider the store resolves to:
+    #: ``"sqlite"`` (**default** — a daemon-less local file, the friendliest
+    #: zero-config default for a reusable library) or ``"pg"`` (Postgres) for the
+    #: full DAG engine; ``"redis"`` / ``"mongodb"`` select the flat-queue
+    #: StorageBackend SPI instead. ``"sqlite"``/``"pg"`` go through the dialect
+    #: seam; the others are validated against the backend registry by
+    #: ``configure()``.
+    #:
+    #: **BREAKING (v1.0.0):** the default was ``"pg"`` through v0.x. It is now
+    #: ``"sqlite"`` — this is the ONE intentionally non-``ai_leads``-byte-compat
+    #: default. A Postgres consumer (ai_leads + siblings) MUST opt in, either with
+    #: ``configure(db_backend="pg")`` OR by exporting ``QUEUE_WORKFLOWS_DB_BACKEND=pg``
+    #: (the env knob, read here) — the latter is the "one line at startup" that
+    #: also reaches the standalone console scripts (``queue-broker``, the
+    #: conductor, …) which have no host ``configure()`` call. Without it, an
+    #: ``AI_LEADS_DB_URL`` pg DSN is read as a SQLite path. Every other default
+    #: stays byte-compat.
+    db_backend: str = field(default_factory=_default_db_backend)
     #: Logical namespace isolating THIS tenant's jobs on a SHARED redis/mongodb
     #: server — every key/collection is scoped by it, so two apps pointed at one
     #: server can't claim or read each other's jobs (the multi-tenant data-leakage

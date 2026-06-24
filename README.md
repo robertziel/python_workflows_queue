@@ -104,7 +104,10 @@ People often ask how this relates to [NVIDIA Triton Inference Server](https://do
 
 ## Installation
 
-Requires **Python 3.10+** and **Postgres 14+**. The only hard runtime dependency is `psycopg`.
+Requires **Python 3.10+**. As of **v1.0.0 the default backend is SQLite** — a
+daemon-less local file, zero server to run — so the only hard runtime dependency
+is `psycopg` (used by the SQLite *and* Postgres paths). For a Postgres deployment
+(**14+**), opt in with `configure(db_backend="pg")`.
 
 Not on PyPI yet — install straight from GitHub:
 
@@ -435,6 +438,7 @@ def _pipeline_schema(name: str) -> dict:
 def init() -> None:
     # 1. configure the engine (every key is optional)
     queue_workflows.configure(
+        db_backend="pg",                    # v1.0.0: default is now "sqlite" — opt in for Postgres
         db_url_env="MYAPP_DB_URL",          # env var holding the Postgres DSN
         node_module_package="myapp.nodes",  # "greet" -> myapp.nodes.greet
         container_prefix="myapp-",          # cgroup attribution for hw_metrics
@@ -559,6 +563,7 @@ Two job families share the engine: DAG **node‑jobs** (`workflow_node_jobs`, th
 
 ```python
 queue_workflows.configure(
+    db_backend="pg",                # v1.0.0: opt in for Postgres (default is now "sqlite")
     db_url_env="MY_DB_URL",
     ingest_queues=frozenset({"ingest", "hydro", "hydraulic", "corrdiff"}),  # NOT cpu/gpu (reserved for the DAG path)
     ingest_default_budget_s=3600,                                           # watchdog budget for these queues
@@ -591,11 +596,11 @@ node_queue.ingest_snapshot()   # {"queues": {q: {queued, running, completed, fai
 
 ## 🗄️ Pluggable storage backends — `pg` · `redis` · `mongodb`
 
-Postgres is the engine — but the **queue store is selectable** (since v0.3.0). `redis` and `mongodb` are **opt‑in** providers that reproduce the *same durable‑queue contract* Postgres gives you: **claim exactly‑once, lease/reclaim, idempotent terminals, an atomic outbox, and per‑namespace tenant isolation**. Selecting `pg` (the default) imports **nothing** new and changes nothing.
+Postgres is the engine — but the **queue store is selectable** (since v0.3.0). `redis` and `mongodb` are **opt‑in** providers that reproduce the *same durable‑queue contract* Postgres gives you: **claim exactly‑once, lease/reclaim, idempotent terminals, an atomic outbox, and per‑namespace tenant isolation**. Selecting `pg` or `sqlite` (the two relational engine backends) imports **nothing** new.
 
 ```python
 import queue_workflows
-queue_workflows.configure(db_backend="redis")        # or "mongodb" / "pg" (default)
+queue_workflows.configure(db_backend="redis")        # or "mongodb" / "pg" / "sqlite" (default)
 
 from queue_workflows.backends import get_backend
 be = get_backend()                                    # bound to your configured namespace

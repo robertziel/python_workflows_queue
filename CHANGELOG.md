@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING (v1.0.0): the default `db_backend` is now `"sqlite"`, not `"pg"`.**
+  A no-config `import queue_workflows; configure()` now runs the full engine on a
+  daemon-less local SQLite file — the friendliest zero-config default for a
+  reusable library. This is the ONE intentionally non-`ai_leads`-byte-compat
+  default; every other default (env names, `container_prefix`, runtime knobs) is
+  unchanged. **A Postgres consumer (ai_leads + the ~35 siblings) MUST now opt in:**
+  `configure(db_backend="pg")` in the host's startup, **or** export
+  `QUEUE_WORKFLOWS_DB_BACKEND=pg` (a new env knob that also reaches the standalone
+  console scripts — `queue-broker`, `queue-conductor`, `queue-conductor-web` —
+  which have no host `configure()`; those also accept `--db-backend pg`).
+  Otherwise its `AI_LEADS_DB_URL` Postgres DSN is interpreted as a SQLite file
+  path. The version is bumped to `1.0.0` to mark the breaking default.
+
 ### Added
+- `QUEUE_WORKFLOWS_DB_BACKEND` env var + `--db-backend` flag on `queue-broker` /
+  `queue-conductor` / `queue-conductor-web` — let an operator point the standalone
+  scripts at Postgres (or any backend) without a host `configure()` call (needed
+  after the sqlite-default flip above).
 - **`queue-broker` console + `queue-conductor-web` — operate the consolidated,
   one-queue-for-all-projects broker.** `queue-broker` stands up / owns the shared
   broker schema independently of any one project (`db.bootstrap` on the broker

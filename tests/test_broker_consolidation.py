@@ -109,6 +109,39 @@ def test_queue_broker_bootstraps_and_reports(capsys):
     assert "broker schema version" in out2 and "projects on this broker" in out2
 
 
+def test_db_backend_env_var_drives_default(monkeypatch):
+    """The QUEUE_WORKFLOWS_DB_BACKEND env knob lets a Postgres operator point the
+    standalone console scripts (queue-broker/conductor) at pg without a host
+    configure() — the uniform fix for the v1.0.0 sqlite-default flip. The env
+    value is validated + normalized exactly like configure() (no silent mis-route)."""
+    import pytest as _pytest
+    from queue_workflows.config import EngineConfig
+    monkeypatch.setenv("QUEUE_WORKFLOWS_DB_BACKEND", "pg")
+    assert EngineConfig().db_backend == "pg"
+    monkeypatch.setenv("QUEUE_WORKFLOWS_DB_BACKEND", "postgres")   # alias normalizes
+    assert EngineConfig().db_backend == "pg"
+    monkeypatch.setenv("QUEUE_WORKFLOWS_DB_BACKEND", "mongo")      # NOT silently pg
+    assert EngineConfig().db_backend == "mongodb"
+    monkeypatch.setenv("QUEUE_WORKFLOWS_DB_BACKEND", "garbage")    # junk fails loudly
+    with _pytest.raises(ValueError):
+        EngineConfig()
+    monkeypatch.delenv("QUEUE_WORKFLOWS_DB_BACKEND", raising=False)
+    assert EngineConfig().db_backend == "sqlite"   # unset → the new default
+
+
+@pytest.mark.pg_only
+def test_queue_broker_db_backend_flag_selects_pg():
+    """REGRESSION LOCK (v1.0.0): with the default now sqlite, `queue-broker` against
+    a Postgres broker MUST select pg via --db-backend, else it reads the pg DSN as
+    a SQLite path (the audit-reproduced break). Simulate the operator: start from
+    the sqlite default, run broker.main with --db-backend pg, assert it bootstraps
+    on pg (rc 0) and the engine is configured pg — not a conftest false-green."""
+    queue_workflows.configure(db_backend="sqlite")   # the new default
+    rc = broker.main(["--db-backend", "pg", "--status"])
+    assert rc == 0
+    assert queue_workflows.get_config().db_backend == "pg"
+
+
 @pytest.mark.pg_only
 def test_concurrent_bootstrap_on_shared_broker_is_safe():
     """The recipe points EVERY project's orchestrator at one broker; each calls
@@ -126,7 +159,7 @@ def test_concurrent_bootstrap_on_shared_broker_is_safe():
     os.environ["QW_CONCURRENT_BOOT_DSN"] = urllib.parse.urlunparse(
         parsed._replace(path="/" + fresh))
     db.close_pool()
-    queue_workflows.configure(db_url_env="QW_CONCURRENT_BOOT_DSN")
+    queue_workflows.configure(db_backend="pg", db_url_env="QW_CONCURRENT_BOOT_DSN")
     errors: list = []
     barrier = threading.Barrier(5)
 
@@ -147,6 +180,6 @@ def test_concurrent_bootstrap_on_shared_broker_is_safe():
         assert db.current_schema_version() >= 17     # applied the full chain once
     finally:
         db.close_pool()
-        queue_workflows.configure(db_url_env="QUEUE_WORKFLOWS_TEST_DB_URL")
+        queue_workflows.configure(db_backend="pg", db_url_env="QUEUE_WORKFLOWS_TEST_DB_URL")
         with psycopg.connect(maint, autocommit=True) as c:
             c.execute(f"DROP DATABASE IF EXISTS {fresh}")

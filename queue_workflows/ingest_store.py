@@ -13,8 +13,8 @@ silently move ingest work off ``ingest_jobs`` and break every existing pg deploy
 
 So this facade switches on ``config.db_backend``:
 
-* ``pg`` (default) → delegates to the existing ``node_queue.*ingest*`` functions
-  against ``ingest_jobs`` — **byte-identical** to today.
+* ``pg`` / ``sqlite`` (relational; sqlite is the v1.0.0 default) → delegates to the
+  existing ``node_queue.*ingest*`` functions against ``ingest_jobs``.
 * ``redis`` / ``mongodb`` → maps the ingest job onto the StorageBackend SPI
   (``payload = {task_name, reason, args}``), so the ingest family can run on a
   non-PG backend with no ``ingest_jobs`` table at all.

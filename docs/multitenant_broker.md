@@ -95,29 +95,31 @@ Consolidation is a **config flip**, not new code. Three steps:
 
 ```bash
 # 1. Stand up the shared broker schema ONCE (idempotent), against the broker DSN.
+#    A shared multi-host broker is Postgres, so pass `--db-backend pg` (the
+#    library default is `sqlite` as of v1.0.0) — or export QUEUE_WORKFLOWS_DB_BACKEND=pg.
 #    `queue-broker` is the explicit "own the migration chain" entry point. You do
 #    NOT strictly have to run it first: db.bootstrap() takes a Postgres advisory
 #    lock, so every project's orchestrator can also boot against the shared broker
 #    concurrently and safely — the lock serializes, and a late bootstrap that
-#    finds the chain already applied is a no-op. queue-broker just makes the
-#    "bootstrap once, independent of any app" step explicit + inspectable.
-BROKER_DSN=postgresql://…/broker   queue-broker
+#    finds the chain already applied is a no-op.
+BROKER_DSN=postgresql://…/broker   queue-broker --db-backend pg --db-url-env BROKER_DSN
 ```
 
 ```python
 # 2. Point EVERY process of EVERY project at that broker + name the project.
-#    (orchestrator, claim workers, scheduler — all of them.)
-queue_workflows.configure(project="ai_leads",   db_url_env="BROKER_DSN")
-queue_workflows.configure(project="pic_to_3d",  db_url_env="BROKER_DSN")
+#    (orchestrator, claim workers, scheduler — all of them.) db_backend="pg" is
+#    REQUIRED now (the default flipped to sqlite in v1.0.0).
+queue_workflows.configure(project="ai_leads",   db_backend="pg", db_url_env="BROKER_DSN")
+queue_workflows.configure(project="pic_to_3d",  db_backend="pg", db_url_env="BROKER_DSN")
 # … each then enqueues + claims ONLY its own project's rows on the ONE shared
 #   cpu/gpu (+ ingest) queue. Cross-project isolation is enforced by the engine
 #   (exact-match-always; proven in tests/test_broker_consolidation.py).
 ```
 
 ```bash
-# 3. Watch the CONSOLIDATED queue across all projects.
-BROKER_DSN=…   queue-broker --status      # schema version + per-project depth
-BROKER_DSN=…   queue-conductor-web         # the web view, filterable by project
+# 3. Watch the CONSOLIDATED queue across all projects (pg broker → --db-backend pg).
+BROKER_DSN=…  queue-broker --db-backend pg --db-url-env BROKER_DSN --status
+BROKER_DSN=…  queue-conductor-web --db-backend pg --db-url-env BROKER_DSN  # web view, by project
 ```
 
 That is the whole consolidation: one broker DB, one cpu + one gpu queue, every

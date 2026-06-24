@@ -69,6 +69,18 @@ def test_project_filter_scopes_the_view():
     assert "box1" in alpha and "box1" not in beta
 
 
+def test_conductor_backend_flag_selects_store():
+    """The standalone conductor scripts (queue-conductor / queue-conductor-web) have
+    no host configure(), so they self-select the store via --db-backend. With the
+    v1.0.0 sqlite default, a Postgres fleet view needs --db-backend pg, else the pg
+    DSN is read as a SQLite path. Lock the shared helper."""
+    from queue_workflows_conductor.conductor import _configure_backend
+    _configure_backend("sqlite", None)
+    assert queue_workflows.get_config().db_backend == "sqlite"
+    _configure_backend("pg", None)
+    assert queue_workflows.get_config().db_backend == "pg"
+
+
 def test_render_is_escaped(monkeypatch):
     # a hostile project/model value must not break out of the HTML
     node_queue.upsert_worker_heartbeat(

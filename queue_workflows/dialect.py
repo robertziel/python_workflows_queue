@@ -7,9 +7,9 @@ single SQLite file (a local, RAM/disk-light deploy with no daemon) WITHOUT
 forking every module, the divergent fragments are produced by a process-wide
 :class:`Dialect` selected from ``config.db_backend``:
 
-* ``db_backend="pg"`` (default) → :class:`PgDialect` — emits **exactly** the SQL
+* ``db_backend="pg"``            → :class:`PgDialect` — emits **exactly** the SQL
   the engine has always used, so the live Postgres deploy is byte-identical.
-* ``db_backend="sqlite"``        → :class:`SqliteDialect` — the SQLite renderings.
+* ``db_backend="sqlite"`` (default, v1.0.0) → :class:`SqliteDialect` — the SQLite renderings.
 
 ``redis``/``mongodb`` select the *flat-queue* ``StorageBackend`` SPI
 (``backends/``) and do NOT host the relational DAG engine — so for the engine's

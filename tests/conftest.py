@@ -76,7 +76,9 @@ if _SQLITE_MODE:
 else:
     _TEST_DB_URL = _resolve_test_db_url()
     # Point the engine at the test DSN BEFORE any engine module reads it.
-    queue_workflows.configure(db_url_env=_TEST_DB_ENV)
+    # db_backend="pg" is now EXPLICIT — the default flipped to "sqlite" (v1.0.0),
+    # so a pg test run must opt in or it would read the pg DSN as a sqlite path.
+    queue_workflows.configure(db_backend="pg", db_url_env=_TEST_DB_ENV)
 
 import psycopg  # noqa: E402
 
@@ -157,7 +159,8 @@ def _reset_engine_config() -> Iterator[None]:
     if _SQLITE_MODE:
         queue_workflows.configure(db_backend="sqlite", db_url_env=_SQLITE_ENV)
     else:
-        queue_workflows.configure(db_url_env=_TEST_DB_ENV)
+        # explicit pg — reset_for_tests() restored the new "sqlite" default.
+        queue_workflows.configure(db_backend="pg", db_url_env=_TEST_DB_ENV)
 
 
 def pytest_configure(config):
