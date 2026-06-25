@@ -39,8 +39,8 @@ htmlcov/
 *.swp
 
 # ── Claude / agent-generated journals + tooling (operator-confirmed) ──────────
-worklog/                       # Claude work journals — operational, not library docs
-docs/fleet_cutover_runbook.md  # host-specific fleet runbook, not a library reference
+worklog/
+docs/fleet_cutover_runbook.md
 # Claude Workflow scripts + session dirs (they live in ~/.claude — never commit these)
 .claude/
 **/workflows/scripts/
