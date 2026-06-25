@@ -41,6 +41,7 @@ Orchestrate model jobs across the machines you already own — keep each model w
 - [Example implementation](#example-implementation)
 - [Turning workers on/off](#️-turning-workers-onoff--the-operator-control-plane)
 - [Host-defined queues + ingest jobs](#️-host-defined-queues--parametrised-ingest-jobs-multi-tenant)
+- [One broker for many projects](#-one-broker-for-many-projects--the-project-tenant-tag)
 - [Pluggable storage backends](#️-pluggable-storage-backends--pg--redis--mongodb)
 - [LLM backends (ollama / vLLM)](#-llm-backends--per-machine-ollama--vllm-with-an-idle-supervisor)
 - [Migrations](#️-migrations)
@@ -591,6 +592,31 @@ node_queue.ingest_snapshot()   # {"queues": {q: {queued, running, completed, fai
 ```
 
 > ℹ️ `cpu`/`gpu` stay **reserved** for the DAG node path; custom ingest queues require migration version 8 (which moved the queue allow‑list from a DB `CHECK` to host‑side validation and added the `args` column).
+
+---
+
+## 🏢 One broker for many projects — the `project` tenant tag
+
+The flip side of host‑defined queues: instead of running **one Postgres per app**, pool **several apps onto one shared "broker" database** and tell them apart with a `project` tag (migration `0017`). Each client claims **only** rows whose `project` matches its own — exact match, in the same `SKIP LOCKED` statement — so two projects on one DB never see each other's work, yet a single operator dashboard sees the whole fleet at once.
+
+```python
+# app A — one shared BROKER_DSN, distinct tags
+queue_workflows.configure(project="forecast", db_backend="pg", db_url_env="BROKER_DSN")
+# app B — same database, different tag
+queue_workflows.configure(project="render3d", db_backend="pg", db_url_env="BROKER_DSN")
+```
+
+```
+            ┌──────────────── one Postgres "broker" ────────────────┐
+  app A  ──▶ │  project='forecast'  rows  ◀──  app A's workers       │
+  app B  ──▶ │  project='render3d'  rows  ◀──  app B's workers       │
+            └────────────────────────────────────────────────────────┘
+                   one queue surface · per‑project isolation
+```
+
+- **Set it once per process:** `configure(project="<name>")`, **or** export `QUEUE_WORKFLOWS_PROJECT=<name>` — the env knob also reaches entry points that hand‑roll their own `configure()` (standalone worker scripts, console tooling), so every process of a multi‑process app shares one tag without threading it through each script.
+- **Default `""`** keeps existing single‑tenant deploys byte‑identical — pooling is opt‑in.
+- This is the **inverse** of `db_namespace` (redis/mongo): namespaces *isolate* tenants who can't see each other; `project` *pools* them into one queue you filter. Full recipe + cutover landmines in [`docs/multitenant_broker.md`](docs/multitenant_broker.md).
 
 ---
 

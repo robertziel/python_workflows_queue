@@ -52,20 +52,27 @@ until the budget expires.
 
 ---
 
-## The two watchdogs side by side
+## The three daemon watchdogs side by side
 
-| | **`Watchdog`** (budget) | **`StallWatchdog`** (no-progress) |
-|---|---|---|
-| Trips on | `elapsed ≥ budget_s` | `now − last_beat ≥ stall_timeout_s` **AND** GPU idle **AND** RAM static |
-| Deadline | fixed at `start()` | resets on every `beat()` (and on a suspected-but-unconfirmed stall) |
-| Armed | at `start()` | on the **first** `beat()` (inert before) |
-| Fed by | nothing (pure clock) | node `status_callback`, one beat per diffusion step |
-| Confirmation | none | on timeout, samples `gpu_health` GPU util + RAM ([§](#gating-the-no-progress-trip-on-the-physical-signal)) |
-| Scope | every cpu/gpu/ingest job | **opt-in** non-video gpu nodes (declare `status_callback`) |
-| On trip | **re-queue + retry** (under cap), else `failed` → `os._exit(75)` | same, → `os._exit(76)` |
-| Recovery | immediate re-queue (run stays alive) | same |
+| | **`Watchdog`** (budget) | **`StallWatchdog`** (no-progress) | **`GpuHealthWatchdog`** (health) |
+|---|---|---|---|
+| Trips on | `elapsed ≥ budget_s` | `now − last_beat ≥ stall_timeout_s` **AND** GPU idle **AND** RAM static | every `interval_s` (300 s): GPU idle **AND** RAM static across the window |
+| Deadline | fixed at `start()` | resets on every `beat()` (and on a suspected-but-unconfirmed stall) | periodic; 20-min `load_grace_s` first window |
+| Armed | at `start()` | on the **first** `beat()` (inert before) | at `start()` (under the load grace) |
+| Fed by | nothing (pure clock) | node `status_callback`, one beat per diffusion step | nothing — samples `gpu_health` directly |
+| Confirmation | none | on timeout, samples `gpu_health` GPU util + RAM ([§](#gating-the-no-progress-trip-on-the-physical-signal)) | it *is* the physical-signal sampler |
+| Scope | every **cpu + ingest** job (gpu is health-policed, not wall-clock-capped) | **opt-in** non-video gpu nodes (declare `status_callback`) | every gpu job |
+| On trip | **re-queue + retry** (under cap), else `failed` → `os._exit(75)` | same, → `os._exit(76)` | same, → `os._exit(78)` |
+| Recovery | immediate re-queue (run stays alive) | same | same |
 
-All three watchdogs also **clear the worker's `current_model` busy-ghost** before
+Two **state-watcher** threads sit alongside these daemon watchdogs (same hard-exit
+contract, distinct codes so the cause is readable from the exit status):
+`JobStatusWatcher` → `os._exit(77)` (the `running` row was cancelled/reassigned out
+from under this worker — self-kill to avoid a double-run) and `WorkerControlWatcher`
+→ `os._exit(79)` (operator ON/OFF hard-stop; see [`worker_control.md`](worker_control.md)).
+**Full exit-code map: `75` budget · `76` stall · `77` job-status · `78` gpu-health · `79` worker-control.**
+
+All three daemon watchdogs also **clear the worker's `current_model` busy-ghost** before
 the hard-exit so a killed worker doesn't keep inflating the GPU-busy gauge — see
 [Don't leave a busy ghost](#dont-leave-a-busy-ghost).
 

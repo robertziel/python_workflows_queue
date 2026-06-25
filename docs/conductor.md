@@ -16,12 +16,22 @@ client stays deployable on its own.
 > The split is purely about *packaging + deployment*. The client's import name and distribution name are
 > both `queue_workflows`, so adding the conductor changes nothing for existing consumers.
 
+## The `queue-conductor-web` view
+
+`queue-conductor-web --db-backend pg --db-url-env <DSN_ENV>` serves a read-only HTML view of one shared
+broker: the reserved `cpu`/`gpu` DAG queues, the host-defined ingest queues, and every reporting worker —
+each tagged by `project`, with a per-project filter, so a single broker shows the whole consolidated fleet
+at once.
+
+![The conductor web view — one shared cpu/gpu queue plus host-defined ingest queues across all projects on one broker, with a workers table carrying a per-worker project column and a per-project filter](conductor-web-ui.png)
+
 ## Observed state — `fleet_snapshot()`
 
 Every claim worker continuously upserts its capacity into `worker_heartbeats`
-(`node_queue.upsert_worker_heartbeat`). **`node_queue.fleet_snapshot(*, stale_after_s=30.0)`** returns
-that observed per-`(host, queue)` fleet as a list of rows, each carrying the worker's advertised
-capability plus two derived flags:
+(`node_queue.upsert_worker_heartbeat`). **`node_queue.fleet_snapshot(*, stale_after_s=30.0, project=None)`**
+returns that observed per-`(host, queue)` fleet as a list of rows, each carrying the worker's advertised
+capability plus two derived flags. Pass `project="<name>"` to scope the snapshot to a single tenant on a
+shared multi-project broker (migration 0017); `project=None` (the default) returns every project's workers:
 
 | field | meaning |
 |---|---|

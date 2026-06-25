@@ -84,8 +84,14 @@ reason about:
 ### Deployment requirement
 
 A host wires `configure(project="<name>")` **once at startup for every process**
-of that project (orchestrator, claim workers, scheduler). The default `""` keeps
-existing single-tenant deploys unchanged. Mixing a configured client with `""`
+of that project (orchestrator, claim workers, scheduler) — **or** exports
+`QUEUE_WORKFLOWS_PROJECT=<name>`, the env knob that also reaches entrypoints which
+hand-roll their own `configure()` (standalone worker scripts, console tooling) and
+so never pass `project=`. It mirrors `QUEUE_WORKFLOWS_DB_BACKEND`; an explicit
+`configure(project=…)` still wins, and unset ⇒ `""`. (Tip for multi-process apps:
+set the env once in the deploy so *every* process — including secondary scripts on
+other hosts — shares the tag, instead of threading it through each entry point.)
+The default `""` keeps existing single-tenant deploys unchanged. Mixing a configured client with `""`
 rows in the same DB is a misconfiguration — a `""` client would see only `""`
 rows, a configured client only its own.
 

@@ -104,8 +104,9 @@ from the SQLite migrations.
 dialect seam, the full migration chain (bootstrap to v17 + downgrade roundtrip),
 and the core queue round-trips — cpu enqueue→claim→complete, gpu claim with
 warm-model affinity + capability gating, ingest enqueue→claim→complete, heartbeat
-upsert + `fleet_snapshot`, and the unassignable sweep. The Postgres suite stays
-green (byte-identical pg path).
+upsert + `fleet_snapshot`, the unassignable sweep, and **multi-tenant `project`
+pooling** (the 0017 tenant tag + exact-match claim works on SQLite too). The
+Postgres suite stays green (byte-identical pg path).
 
 **Remaining before the engine is fully SQLite-complete** (tracked in
 `worklog/sqlite-engine-port.md`):
