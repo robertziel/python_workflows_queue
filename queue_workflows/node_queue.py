@@ -1441,11 +1441,15 @@ def count_unprocessed_dispatch_events() -> int:
 # connection and is BEST-EFFORT — it swallows every error so an event-write blip
 # can never fail the load-bearing claim / terminal / watchdog path.
 
-#: The migration-0011 CHECK set, mirrored here so a bad type fails loudly in
-#: Python (before the surrounding txn aborts on the DB CHECK).
+#: The migration-0011 CHECK set (+ ``unassignable`` from 0015), mirrored here so a
+#: bad type fails loudly in Python (before the surrounding txn aborts on the DB CHECK).
+#: MUST stay in sync with the ``workflow_node_events_type_check`` DB CHECK — drift
+#: silently drops events (``record_node_event`` swallows the ValueError best-effort);
+#: guarded by ``tests/test_invariant_node_event_types.py``.
 NODE_EVENT_TYPES = frozenset({
     "claimed", "model_load_start", "model_load_done", "progress_beat",
     "stall_suspected", "stall_trip", "gpu_health_trip", "budget_trip",
+    "unassignable",  # 0015 — the capacity sweep's red-flag (node_pool._sweep_unassignable_jobs)
     "requeued", "reassigned", "lease_renew", "completed", "failed",
     "cancelled", "error",
 })

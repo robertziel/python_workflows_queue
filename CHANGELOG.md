@@ -21,7 +21,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Otherwise its `AI_LEADS_DB_URL` Postgres DSN is interpreted as a SQLite file
   path. The version is bumped to `1.0.0` to mark the breaking default.
 
+### Fixed
+- **`workflow_node_events` `unassignable` events now persist.** `'unassignable'` (the
+  capacity sweep's red-flag, migration 0015) was in the `workflow_node_events_type_check`
+  DB CHECK and emitted by `node_pool._sweep_unassignable_jobs`, but was missing from
+  `node_queue.NODE_EVENT_TYPES` — so `record_node_event` raised on it and (being
+  best-effort) swallowed the error, silently dropping the forensic event despite the
+  CHECK allowing it. Added it to the frozenset; new `tests/test_invariant_node_event_types.py`
+  asserts the frozenset and the DB CHECK can never drift again.
+
 ### Added
+- **API + DB-schema reference docs** — `docs/client_api.md` (the `queue_workflows` client
+  SDK: `configure()`, every hook, enqueue/state/introspection, worker-control, telemetry,
+  console scripts), `docs/broker_api.md` (the broker contract: tables, NOTIFY channels, the
+  `SKIP LOCKED` claim + lease/reclaim, the durable outbox, the `StorageBackend` SPI, the
+  conductor HTTP API), and per-column schema tables for both backends —
+  `docs/broker_db_schema.md` (Postgres) + `docs/client_db_schema.md` (SQLite) — introspected
+  from the live broker + a freshly-bootstrapped SQLite DB.
 - **Centralized hardware telemetry on the broker — `config.metrics_db_url_env` +
   `queue_workflows.hw_feed.HwFeed`.** hw-metrics now publish to + are read from a
   configurable **metrics DSN** (the shared broker) instead of each project's own DB,
