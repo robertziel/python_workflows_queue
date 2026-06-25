@@ -1,8 +1,8 @@
 """One queue, all 3 projects, via the CLIENT LIBRARY — end-to-end + isolation.
 
 The headline guarantee of the consolidation, proven at the *full lifecycle* level
-(not just the queue primitives): three real projects — ai_leads, pic_to_3d,
-lm_content_generator — each wired ONLY through the public client API
+(not just the queue primitives): three real projects — ai_leads, alpha,
+beta — each wired ONLY through the public client API
 (``configure(project=…)`` + the workflow/node hooks + ``dispatcher.start_run`` +
 ``ClaimWorker`` + ``NodePool``) share ONE broker database and each runs a
 node-mode run to completion, while a project's worker claims ONLY its own jobs.
@@ -30,7 +30,7 @@ from queue_workflows.claim_worker import ClaimWorker
 from queue_workflows.db import connection
 from tests._helpers import force_lease, make_run, row
 
-PROJECTS = ["ai_leads", "pic_to_3d", "lm_content_generator"]
+PROJECTS = ["ai_leads", "alpha", "beta"]
 
 # ── shared client wiring (one fake workflow + node, used by every project) ──
 _RAN: list[str] = []  # the project each worker was configured as when it executed
@@ -92,19 +92,19 @@ def test_three_projects_one_broker_full_lifecycle():
     assert {r["project"] for r in rows} == set(PROJECTS)
     assert all(r["queue"] == "cpu" and r["n"] == 1 for r in rows)
 
-    # 2) ISOLATION: ai_leads' worker runs ONLY ai_leads' job; pic_to_3d &
-    #    lm_content_generator jobs stay queued (the worker never claimed them).
+    # 2) ISOLATION: ai_leads' worker runs ONLY ai_leads' job; alpha &
+    #    beta jobs stay queued (the worker never claimed them).
     assert _client_drain_queue("ai_leads") == 1
     assert _RAN == ["ai_leads"]                                   # only ai_leads ran
     by_project = {p: node_queue.list_jobs_for_run(runs[p])[0] for p in PROJECTS}
     assert by_project["ai_leads"]["status"] == "completed"
     assert by_project["ai_leads"]["project"] == "ai_leads"
-    assert by_project["pic_to_3d"]["status"] == "queued"          # untouched
-    assert by_project["lm_content_generator"]["status"] == "queued"
+    assert by_project["alpha"]["status"] == "queued"          # untouched
+    assert by_project["beta"]["status"] == "queued"
 
     # 3) the other two projects' workers each run their own job.
-    assert _client_drain_queue("pic_to_3d") == 1
-    assert _client_drain_queue("lm_content_generator") == 1
+    assert _client_drain_queue("alpha") == 1
+    assert _client_drain_queue("beta") == 1
     assert set(_RAN) == set(PROJECTS)                             # all 3 executed
     for p in PROJECTS:
         job = node_queue.list_jobs_for_run(runs[p])[0]
@@ -175,7 +175,7 @@ def test_reclaim_preserves_project_tag_on_shared_broker():
     a_job = node_queue.enqueue_node_job(run_id=make_run(), node_id="a",
                                         node_module="m", queue="cpu")
     force_lease(a_job, expires_in_s=-30)              # running + expired lease
-    queue_workflows.configure(project="pic_to_3d")
+    queue_workflows.configure(project="alpha")
     b_job = node_queue.enqueue_node_job(run_id=make_run(), node_id="b",
                                         node_module="m", queue="cpu")
 
@@ -184,10 +184,10 @@ def test_reclaim_preserves_project_tag_on_shared_broker():
     assert row(a_job)["status"] == "queued"
     assert row(a_job)["project"] == "ai_leads"        # TAG PRESERVED
 
-    # pic_to_3d's worker claims ONLY its own job, never the re-queued ai_leads orphan
-    got = node_queue.claim_next_cpu_job(0, host="pic-w", project="pic_to_3d")
+    # alpha's worker claims ONLY its own job, never the re-queued ai_leads orphan
+    got = node_queue.claim_next_cpu_job(0, host="alpha-w", project="alpha")
     assert got["id"] == b_job
-    assert node_queue.claim_next_cpu_job(0, host="pic-w", project="pic_to_3d") is None
+    assert node_queue.claim_next_cpu_job(0, host="alpha-w", project="alpha") is None
     assert row(a_job)["status"] == "queued"           # still waiting for ai_leads
 
 
@@ -198,10 +198,10 @@ def test_no_cross_project_claim_on_shared_queue():
     _wire_client_hooks()
     runs = {p: _client_enqueue_run(p) for p in PROJECTS}
     # a worker for a project with NO jobs claims nothing (no cross-tenant theft).
-    queue_workflows.configure(project="lm_content_generator")
+    queue_workflows.configure(project="beta")
     w = ClaimWorker(queue="cpu", host="lm-cpu")
     assert w.run_once() is True                       # its own job
     assert w.run_once() is False                      # empty for it now
-    # ai_leads & pic_to_3d jobs are still queued — lm's worker never touched them.
+    # ai_leads & alpha jobs are still queued — lm's worker never touched them.
     assert node_queue.list_jobs_for_run(runs["ai_leads"])[0]["status"] == "queued"
-    assert node_queue.list_jobs_for_run(runs["pic_to_3d"])[0]["status"] == "queued"
+    assert node_queue.list_jobs_for_run(runs["alpha"])[0]["status"] == "queued"

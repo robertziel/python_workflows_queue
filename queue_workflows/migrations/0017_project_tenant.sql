@@ -35,7 +35,7 @@ ALTER TABLE worker_heartbeats
 
 -- ── worker_heartbeats identity now includes project ────────────────────────
 -- A shared broker can run two projects' workers on the same machine
--- (``host_label``) + queue (e.g. spark2 runs both ai_leads' and pic_to_3d's gpu
+-- (``host_label``) + queue (e.g. host-a runs both ai_leads' and alpha's gpu
 -- client). The old PK ``(host_label, queue)`` would make the second client's
 -- upsert CLOBBER the first's heartbeat. The tenant tag disambiguates them, so
 -- the worker identity becomes ``(host_label, queue, project)``. Drop-then-add

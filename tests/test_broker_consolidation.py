@@ -68,41 +68,41 @@ def _drain(project: str, queue: str) -> list[str]:
 
 def test_two_projects_share_one_broker_one_queue():
     a = set(_client_enqueue("ai_leads", cpu=3, gpu=2))
-    b = set(_client_enqueue("pic_to_3d", cpu=1, gpu=1))
+    b = set(_client_enqueue("alpha", cpu=1, gpu=1))
 
     # ONE shared table holds BOTH projects' jobs on the shared cpu/gpu queue.
     with connection() as c, c.cursor() as cur:
         cur.execute("SELECT COUNT(*) AS n FROM workflow_node_jobs")
-        assert cur.fetchone()["n"] == 7          # ai_leads 3+2 + pic_to_3d 1+1
+        assert cur.fetchone()["n"] == 7          # ai_leads 3+2 + alpha 1+1
         cur.execute("SELECT DISTINCT project FROM workflow_node_jobs ORDER BY project")
-        assert [r["project"] for r in cur.fetchall()] == ["ai_leads", "pic_to_3d"]
+        assert [r["project"] for r in cur.fetchall()] == ["ai_leads", "alpha"]
 
     # broker-wide view sees BOTH; per-project scopes to one.
     assert node_queue.snapshot()["counts"].get("cpu_queued") == 4   # 3 + 1
     assert node_queue.snapshot(project="ai_leads")["counts"].get("cpu_queued") == 3
-    assert node_queue.snapshot(project="pic_to_3d")["counts"].get("cpu_queued") == 1
-    assert set(node_queue.list_projects()) >= {"ai_leads", "pic_to_3d"}
+    assert node_queue.snapshot(project="alpha")["counts"].get("cpu_queued") == 1
+    assert set(node_queue.list_projects()) >= {"ai_leads", "alpha"}
 
     # each project's worker claims ONLY its own rows off the shared queue.
     a_cpu = set(_drain("ai_leads", "cpu"))
-    b_cpu = set(_drain("pic_to_3d", "cpu"))
+    b_cpu = set(_drain("alpha", "cpu"))
     assert a_cpu == {i for i in a if node_queue.get_node_job(i)["queue"] == "cpu"}
     assert b_cpu == {i for i in b if node_queue.get_node_job(i)["queue"] == "cpu"}
     assert a_cpu.isdisjoint(b_cpu)               # no cross-tenant claim
-    # ai_leads draining gpu never grabs pic_to_3d's gpu row, and vice versa
+    # ai_leads draining gpu never grabs alpha's gpu row, and vice versa
     a_gpu = set(_drain("ai_leads", "gpu"))
     assert all(node_queue.get_node_job(i)["project"] == "ai_leads" for i in a_gpu)
 
 
 def test_queue_broker_bootstraps_and_reports(capsys):
     _client_enqueue("ai_leads", cpu=2)
-    _client_enqueue("pic_to_3d", gpu=1)
+    _client_enqueue("alpha", gpu=1)
     # default: bootstrap (idempotent on the already-migrated broker) + status
     rc = broker.main([])
     assert rc == 0
     out = capsys.readouterr().out
     assert "broker bootstrapped" in out
-    assert "ai_leads" in out and "pic_to_3d" in out      # consolidated view
+    assert "ai_leads" in out and "alpha" in out      # consolidated view
     # --status only
     assert broker.main(["--status"]) == 0
     out2 = capsys.readouterr().out

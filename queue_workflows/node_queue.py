@@ -1042,7 +1042,7 @@ def requeue_running_for_worker(
     Project-scoped (migration 0017): ``project`` defaults to this worker's
     ``config.project``. On a shared broker ``host_label`` is no longer globally
     unique (two projects' workers can share a machine + queue), so without the
-    project term an operator hard-stop of project A's worker on ``spark2/gpu``
+    project term an operator hard-stop of project A's worker on ``host-a/gpu``
     would also yank project B's running job there. The hard-stop runs inside the
     worker's own ``WorkerControlWatcher``, so the default ``config.project`` is
     exactly that worker's tenant.

@@ -14,7 +14,7 @@ thing that makes *one consolidated queue for all projects* a config flip:
 
     # 2. every process of every project points at that broker + names itself:
     #    configure(project="ai_leads",  db_backend="pg", db_url_env="BROKER_DSN")
-    #    configure(project="pic_to_3d", db_backend="pg", db_url_env="BROKER_DSN")
+    #    configure(project="alpha", db_backend="pg", db_url_env="BROKER_DSN")
     #    … each enqueues/claims ONLY its own project's rows on the shared queue.
 
     # 3. watch the consolidated queue across all projects:

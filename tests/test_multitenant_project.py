@@ -134,15 +134,15 @@ def test_config_project_is_implicit_tag_for_enqueue_and_claim():
 def test_two_projects_share_host_queue_without_heartbeat_clobber():
     # The shared broker can run two projects' gpu clients on the SAME machine.
     node_queue.upsert_worker_heartbeat(
-        host_label="spark2", queue="gpu", project="alpha", concurrency=1,
+        host_label="host-a", queue="gpu", project="alpha", concurrency=1,
     )
     node_queue.upsert_worker_heartbeat(
-        host_label="spark2", queue="gpu", project="beta", concurrency=2,
+        host_label="host-a", queue="gpu", project="beta", concurrency=2,
     )
     with connection() as c, c.cursor() as cur:
         cur.execute(
             "SELECT project, concurrency FROM worker_heartbeats "
-            "WHERE host_label='spark2' AND queue='gpu' ORDER BY project"
+            "WHERE host_label='host-a' AND queue='gpu' ORDER BY project"
         )
         rows = cur.fetchall()
     # Two distinct rows — neither clobbered the other (old PK would have).
@@ -236,7 +236,7 @@ def test_input_listener_claim_is_project_scoped():
 
 
 def test_requeue_running_for_worker_is_project_scoped():
-    # Two projects' workers share host_label 'spark2' + gpu, one running job each.
+    # Two projects' workers share host_label 'host-a' + gpu, one running job each.
     a = node_queue.enqueue_node_job(
         run_id=_run("alpha"), node_id="g", node_module="x", queue="gpu",
         required_model="m", project="alpha",
@@ -247,13 +247,13 @@ def test_requeue_running_for_worker_is_project_scoped():
     )
     with connection() as c, c.cursor() as cur:
         cur.execute(
-            "UPDATE workflow_node_jobs SET status='running', claimed_by='spark2', "
+            "UPDATE workflow_node_jobs SET status='running', claimed_by='host-a', "
             "lease_expires_at = now() + interval '600 seconds' WHERE id IN (%s, %s)",
             (a, b),
         )
         c.commit()
-    # Hard-stop alpha's worker on spark2/gpu re-queues ONLY alpha's running job.
-    n = node_queue.requeue_running_for_worker("spark2", "gpu", project="alpha")
+    # Hard-stop alpha's worker on host-a/gpu re-queues ONLY alpha's running job.
+    n = node_queue.requeue_running_for_worker("host-a", "gpu", project="alpha")
     assert n == 1
     assert node_queue.get_node_job(a)["status"] == "queued"
     assert node_queue.get_node_job(b)["status"] == "running"  # beta untouched

@@ -16,15 +16,15 @@ filtering, the queue living on the **broker** side, with the broker telling each
 ```
                  Broker  =  ONE shared Postgres
         workflow_node_jobs(queue=gpu, project=ai_leads, …)
-        workflow_node_jobs(queue=gpu, project=pic_to_3d, …)
+        workflow_node_jobs(queue=gpu, project=alpha, …)
         ingest_jobs(queue=fetch, project=ai_leads, …)
-        worker_heartbeats(host_label=spark2, queue=gpu, project=ai_leads, …)
-        worker_heartbeats(host_label=spark2, queue=gpu, project=pic_to_3d, …)
+        worker_heartbeats(host_label=host-a, queue=gpu, project=ai_leads, …)
+        worker_heartbeats(host_label=host-a, queue=gpu, project=alpha, …)
                               │
             LISTEN/NOTIFY + worker_control (project-scoped)
                               │
         ┌─────────────────┬──┴──────────────┬─────────────────┐
-   [ai_leads client]  [pic_to_3d client]  [lm_cg client]   …each holds its
+   [ai_leads client]  [alpha client]  [beta client]   …each holds its
     orchestrator +      orchestrator +      orchestrator +   OWN code, claims
     cpu/gpu workers     cpu/gpu workers     cpu/gpu workers   ONLY its project's
                                                               rows.
@@ -116,7 +116,7 @@ BROKER_DSN=postgresql://…/broker   queue-broker --db-backend pg --db-url-env B
 #    (orchestrator, claim workers, scheduler — all of them.) db_backend="pg" is
 #    REQUIRED now (the default flipped to sqlite in v1.0.0).
 queue_workflows.configure(project="ai_leads",   db_backend="pg", db_url_env="BROKER_DSN")
-queue_workflows.configure(project="pic_to_3d",  db_backend="pg", db_url_env="BROKER_DSN")
+queue_workflows.configure(project="alpha",  db_backend="pg", db_url_env="BROKER_DSN")
 # … each then enqueues + claims ONLY its own project's rows on the ONE shared
 #   cpu/gpu (+ ingest) queue. Cross-project isolation is enforced by the engine
 #   (exact-match-always; proven in tests/test_broker_consolidation.py).
