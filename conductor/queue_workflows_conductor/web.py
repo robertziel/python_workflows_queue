@@ -167,7 +167,7 @@ def _fleet_table(fleet: list[dict[str, Any]], *, controls: dict | None = None,
     )
 
 
-# ── live hardware panel (cpu / gpu / ram from the broker's hw_metrics stream) ──
+# ── live hardware panel — moving time-series sparklines (cpu/gpu/ram) ──────────
 
 def _fmt_pct(p: Any) -> str:
     try:
@@ -183,47 +183,84 @@ def _gb(mb: Any) -> str:
         return "—"
 
 
-def _bar(pct: Any) -> str:
-    """A no-JS CSS usage bar for a 0–100 percentage (length = usage; no alarm colour
-    — high GPU% is *good*, it means the box is working)."""
+def _clampf(v: Any) -> float:
     try:
-        p = max(0.0, min(100.0, float(pct)))
+        return max(0.0, min(100.0, float(v)))
     except (TypeError, ValueError):
-        p = 0.0
-    return f'<div class="bar"><i style="width:{p:.0f}%"></i></div>'
+        return 0.0
 
 
-def _hw_panel(hw: dict[str, Any] | None) -> str:
-    """Live per-host hardware cards (CPU% / per-GPU% + VRAM / RAM) from the broker's
-    ``hw_metrics`` stream via :class:`HwFeed`. Pure — given the latest-sample-per-host
-    dict (``{host: {cpu_percent, ram_used_mb, ram_total_mb, gpus:[…], stale}}``)."""
-    if not hw:
+def _spark(values: list[Any], *, color: str = "#0969da") -> str:
+    """A no-JS inline-SVG moving sparkline for a 0–100 series — oldest on the LEFT,
+    newest on the RIGHT, so the dotted line scrolls left as the page meta-refreshes.
+    ``None`` ⇒ 0. Fixed 120×28 viewBox so the dots stay round (no aspect stretch)."""
+    n = len(values)
+    if n == 0:
+        return '<svg class="spark" viewBox="0 0 120 28" width="120" height="28"></svg>'
+    W, H = 120.0, 28.0
+    step = (W / (n - 1)) if n > 1 else 0.0
+    pts = [((i * step) if n > 1 else W, H - (_clampf(v) / 100.0) * H)
+           for i, v in enumerate(values)]
+    poly = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+    dots = "".join(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="1.5"/>' for x, y in pts)
+    lx, ly = pts[-1]
+    return (f'<svg class="spark" viewBox="0 0 120 28" width="120" height="28" '
+            f'style="color:{color}">'
+            f'<polyline points="{poly}" fill="none" stroke="currentColor" '
+            f'stroke-width="1.1" opacity=".4"/>'
+            f'<g fill="currentColor" opacity=".5">{dots}</g>'
+            f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="2.6" fill="currentColor"/></svg>')
+
+
+def _ram_pct(s: dict[str, Any]) -> Any:
+    u, t = s.get("ram_used_mb"), s.get("ram_total_mb")
+    return (100.0 * float(u) / float(t)) if (u and t) else None
+
+
+def _gpu_max(s: dict[str, Any]) -> Any:
+    uses = [g.get("use_pct") for g in (s.get("gpus") or [])
+            if g.get("use_pct") is not None]
+    return max(uses) if uses else None
+
+
+def _hw_row(label: str, series: list[Any], cur: Any, sub: str, color: str) -> str:
+    return (f'<div class="hwrow"><span class="hwk">{_esc(label)}</span>'
+            f"{_spark(series, color=color)}"
+            f'<span class="hwv">{_fmt_pct(cur)}'
+            f'{(" <em>" + _esc(sub) + "</em>") if sub else ""}</span></div>')
+
+
+def _hw_panel(history: dict[str, list[dict[str, Any]]] | None) -> str:
+    """Per-host hardware cards with **moving time-series sparklines** (CPU% / GPU% /
+    RAM%) from the broker's ``hw_metrics`` stream via :meth:`HwFeed.history_by_host`.
+    Pure — given ``{host: [sample, …]}`` (oldest→newest); the newest sample is the
+    rightmost point, so each meta-refresh scrolls the dotted line left over time."""
+    if not history:
         return ('<p class="muted">no hardware telemetry yet — the conductor reads the '
                 "broker’s <code>hw_metrics</code> stream (a Postgres broker whose "
                 "gpu workers publish per-host cpu/gpu/ram).</p>")
     cards = []
-    for host in sorted(hw):
-        s = hw[host] or {}
-        stale = bool(s.get("stale"))
-        cpu = s.get("cpu_percent")
-        ram_u, ram_t = s.get("ram_used_mb"), s.get("ram_total_mb")
-        ram_pct = (100.0 * float(ram_u) / float(ram_t)) if (ram_u and ram_t) else None
-        gpus = s.get("gpus") or []
-        rows = ['<div class="hwrow"><span class="hwk">CPU</span>'
-                f'{_bar(cpu)}<span class="hwv">{_fmt_pct(cpu)}</span></div>']
-        for g in gpus:
-            use, vu, vt = g.get("use_pct"), g.get("vram_used_mb"), g.get("vram_total_mb")
-            vram = f"{_gb(vu)}/{_gb(vt)} GB" if (vu is not None and vt) else "—"
-            rows.append(
-                f'<div class="hwrow"><span class="hwk">GPU{_esc(g.get("id"))}</span>'
-                f'{_bar(use)}<span class="hwv">{_fmt_pct(use)} '
-                f'<em>{_esc(vram)}</em></span></div>')
-        if not gpus:
-            rows.append('<div class="hwrow"><span class="hwk">GPU</span>'
-                        '<span class="hwv muted">none</span></div>')
-        rows.append('<div class="hwrow"><span class="hwk">RAM</span>'
-                    f'{_bar(ram_pct)}<span class="hwv">{_fmt_pct(ram_pct)} '
-                    f'<em>{_gb(ram_u)}/{_gb(ram_t)} GB</em></span></div>')
+    for host in sorted(history):
+        samples = history[host] or []
+        if not samples:
+            continue
+        latest = samples[-1] or {}
+        stale = bool(latest.get("stale"))
+        gpus = latest.get("gpus") or []
+        vu = sum(int(g.get("vram_used_mb") or 0) for g in gpus) or None
+        vt = sum(int(g.get("vram_total_mb") or 0) for g in gpus) or None
+        gpu_sub = (f"{_gb(vu)}/{_gb(vt)} GB" if (vu and vt)
+                   else ("none" if not gpus else ""))
+        glabel = f"GPU×{len(gpus)}" if len(gpus) > 1 else "GPU"
+        ram_u, ram_t = latest.get("ram_used_mb"), latest.get("ram_total_mb")
+        rows = [
+            _hw_row("CPU", [s.get("cpu_percent") for s in samples],
+                    latest.get("cpu_percent"), "", "#0969da"),
+            _hw_row(glabel, [_gpu_max(s) for s in samples],
+                    _gpu_max(latest), gpu_sub, "#1a7f37"),
+            _hw_row("RAM", [_ram_pct(s) for s in samples],
+                    _ram_pct(latest), f"{_gb(ram_u)}/{_gb(ram_t)} GB", "#9a6700"),
+        ]
         tag = ('<em class="stale">stale</em>' if stale
                else '<em class="live">live</em>')
         cards.append(f'<div class="card hw{" stale" if stale else ""}">'
@@ -393,19 +430,18 @@ form.ctl button:hover{background:#eef1f4}
 .card.hw.stale{opacity:.55}
 .card.hw h3 em{font-style:normal;font-weight:600;font-size:11px}
 .card.hw h3 em.live{color:#1a7f37}.card.hw h3 em.stale{color:#9a6700}
-.hwrow{display:flex;align-items:center;gap:9px;margin:7px 0}
-.hwk{width:44px;font-size:11px;color:#656d76;font-weight:600;flex:none}
-.hwv{font-size:12px;min-width:96px;text-align:right;flex:none;
- font-variant-numeric:tabular-nums}
-.hwv em{color:#848d97;font-style:normal;font-size:11px}
-.bar{flex:1;background:#eaeef2;border-radius:4px;height:8px;overflow:hidden}
-.bar>i{display:block;height:100%;background:#0969da;border-radius:4px}
+.hwrow{display:flex;align-items:center;gap:10px;margin:8px 0}
+.hwk{width:46px;font-size:11px;color:#656d76;font-weight:600;flex:none}
+.spark{width:120px;height:28px;flex:none;background:#f6f8fa;border-radius:5px;
+ border:1px solid #eaeef2;display:block}
+.hwv{flex:1;font-size:12px;text-align:right;font-variant-numeric:tabular-nums}
+.hwv em{color:#848d97;font-style:normal;font-size:11px;margin-left:4px}
 """
 
 
 def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0,
                      view: str = "all", writes_enabled: bool = False,
-                     hw: dict[str, Any] | None = None) -> str:
+                     hw_history: dict[str, Any] | None = None) -> str:
     """Render the full dashboard HTML for ``project`` (``None`` ⇒ all projects).
     ``view`` selects the Recent-activity tab: ``all`` | ``retries`` (Sidekiq's
     Retries — node-jobs with ``watchdog_retries>0``) | ``dead`` (failed jobs).
@@ -444,7 +480,7 @@ def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0,
   <h2>Overview</h2>
   {_stat_strip(counts, ingest, fleet, projects)}
   <h2>Hardware — live fleet (cpu · gpu · ram)</h2>
-  {_hw_panel(hw)}
+  {_hw_panel(hw_history)}
   <h2>Queues — shared cpu / gpu</h2>
   <div class="cards">{_queue_card('cpu', counts)}{_queue_card('gpu', counts)}</div>
   <h2>Ingest queues</h2>
@@ -599,11 +635,11 @@ class ConductorWebHandler(BaseHTTPRequestHandler):
             return
         project = q["project"][0] if "project" in q else None
         view = q.get("view", ["all"])[0]
-        hw = _HW_FEED.latest_by_host() if _HW_FEED is not None else None
+        hw_history = _HW_FEED.history_by_host() if _HW_FEED is not None else None
         try:
             self._send(200, render_dashboard(project, stale_after_s=self.stale_after_s,
                                              view=view, writes_enabled=self.writes_enabled,
-                                             hw=hw))
+                                             hw_history=hw_history))
         except Exception as exc:  # noqa: BLE001 — a DB blip must not kill the server
             self._send(500, render_error(exc))
 

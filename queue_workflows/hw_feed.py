@@ -30,6 +30,7 @@ import json
 import logging
 import threading
 import time
+from collections import deque
 from typing import Any
 
 from queue_workflows.hw_metrics import NOTIFY_CHANNEL, metrics_dsn
@@ -47,10 +48,13 @@ class HwFeed:
     tests. ``stale_after_s`` marks a host's last sample stale once telemetry
     stops arriving (the sampler emits ~every 5 s)."""
 
-    def __init__(self, *, stale_after_s: float = 15.0, dsn: str | None = None):
+    def __init__(self, *, stale_after_s: float = 15.0, history: int = 90,
+                 dsn: str | None = None):
         self.stale_after_s = float(stale_after_s)
+        self._history_n = max(2, int(history))
         self._dsn = dsn
         self._latest: dict[str, dict[str, Any]] = {}   # host -> {"sample":…, "at": ts}
+        self._hist: dict[str, deque] = {}              # host -> deque[(sample, at)]
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -79,6 +83,18 @@ class HwFeed:
                 for host, rec in self._latest.items()
             }
 
+    def history_by_host(self) -> dict[str, list[dict[str, Any]]]:
+        """The recent sample history per host (oldest→newest, up to ``history``
+        samples), each augmented with a ``stale`` flag — powers a moving time-series
+        sparkline. ``{}`` until the first sample arrives."""
+        now = time.time()
+        with self._lock:
+            return {
+                host: [{**s, "stale": (now - at) > self.stale_after_s}
+                       for (s, at) in buf]
+                for host, buf in self._hist.items()
+            }
+
     # ── internals ────────────────────────────────────────────────────────────
     def _store(self, payload: str) -> None:
         try:
@@ -86,8 +102,13 @@ class HwFeed:
         except Exception:
             return
         host = str(sample.get("host") or "?")
+        now = time.time()
         with self._lock:
-            self._latest[host] = {"sample": sample, "at": time.time()}
+            self._latest[host] = {"sample": sample, "at": now}
+            buf = self._hist.get(host)
+            if buf is None:
+                buf = self._hist[host] = deque(maxlen=self._history_n)
+            buf.append((sample, now))
 
     def _run(self) -> None:
         import psycopg

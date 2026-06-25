@@ -1,6 +1,6 @@
-"""queue-conductor-web live Hardware panel — per-host cpu/gpu/ram from the broker's
-``hw_metrics`` stream. The panel render is pure (given the latest-sample-per-host dict),
-so most of this needs no server and no DB.
+"""queue-conductor-web live Hardware panel — moving time-series sparklines (cpu/gpu/ram)
+from the broker's hw_metrics HISTORY. The panel render is pure (given the per-host history
+dict ``{host: [sample, …]}`` oldest→newest), so most of this needs no server and no DB.
 """
 
 from __future__ import annotations
@@ -8,28 +8,30 @@ from __future__ import annotations
 from queue_workflows_conductor import web
 
 
-def test_hw_panel_renders_per_host_cpu_gpu_ram():
-    hw = {
-        "host-a": {
-            "cpu_percent": 37.4, "ram_used_mb": 25600, "ram_total_mb": 128000,
-            "gpus": [{"id": 0, "use_pct": 88, "vram_used_mb": 18432, "vram_total_mb": 24576}],
-            "stale": False,
-        },
-        "host-b": {
-            "cpu_percent": 5.0, "ram_used_mb": 4096, "ram_total_mb": 64000,
-            "gpus": [], "stale": True,
-        },
+def test_hw_panel_renders_sparklines_and_current_values():
+    history = {
+        "host-a": [
+            {"cpu_percent": 20.0, "ram_used_mb": 20000, "ram_total_mb": 128000,
+             "gpus": [{"id": 0, "use_pct": 40, "vram_used_mb": 8000, "vram_total_mb": 24576}],
+             "stale": False},
+            {"cpu_percent": 37.4, "ram_used_mb": 25600, "ram_total_mb": 128000,
+             "gpus": [{"id": 0, "use_pct": 88, "vram_used_mb": 18432, "vram_total_mb": 24576}],
+             "stale": False},
+        ],
+        "host-b": [
+            {"cpu_percent": 5.0, "ram_used_mb": 4096, "ram_total_mb": 64000,
+             "gpus": [], "stale": True},
+        ],
     }
-    out = web._hw_panel(hw)
-    # both hosts present
+    out = web._hw_panel(history)
     assert "host-a" in out and "host-b" in out
-    # GPU usage rendered (the whole point of this panel) + the no-JS CSS bar
-    assert "GPU0" in out and "88%" in out
-    assert 'class="bar"' in out and "width:88%" in out
-    # CPU% rendered (rounded), VRAM shown in GB (18432/24576 MB -> 18/24 GB)
-    assert "37%" in out
-    assert "18/24 GB" in out
-    # stale host flagged; a no-gpu host shows 'none'
+    # MOVING sparkline = inline SVG with a dotted polyline (no JS)
+    assert "<svg" in out and "<polyline" in out and "<circle" in out
+    # 2-point series spans the left (x=0.0) and right (x=120.0) edges
+    assert "0.0," in out and "120.0," in out
+    # CURRENT values come from the LATEST sample: cpu 37%, gpu 88%, summed VRAM 18/24 GB
+    assert "37%" in out and "88%" in out and "18/24 GB" in out
+    # stale host flagged; no-gpu host shows 'none'
     assert "stale" in out and "none" in out
 
 
@@ -38,31 +40,30 @@ def test_hw_panel_empty_is_graceful():
     assert "no hardware telemetry" in web._hw_panel({})
 
 
-def test_hw_panel_tolerates_missing_fields():
-    # None/absent fields must not raise (a sampler with no GPU probe, partial RAM, etc.)
-    out = web._hw_panel({"h": {"cpu_percent": None, "ram_used_mb": None,
-                               "ram_total_mb": None, "gpus": None, "stale": False}})
-    assert "h" in out and "—" in out  # graceful dashes, no crash
+def test_hw_panel_tolerates_missing_fields_and_single_point():
+    out = web._hw_panel({"h": [{"cpu_percent": None, "ram_used_mb": None,
+                                "ram_total_mb": None, "gpus": None, "stale": False}]})
+    assert "h" in out and "<svg" in out and "—" in out  # graceful dashes, no crash
 
 
-def test_bar_clamps_and_formats():
-    assert "width:0%" in web._bar(None)
-    assert "width:0%" in web._bar(-5)
-    assert "width:100%" in web._bar(140)
-    assert "width:50%" in web._bar(50)
+def test_spark_oldest_left_newest_right():
+    svg = web._spark([10, 50, 90])
+    assert "<polyline" in svg and "120.0," in svg  # newest point at the right edge
+    assert 'r="2.6"' in svg                        # the emphasised newest dot
+    # empty series → an empty svg with no polyline
+    assert "<svg" in web._spark([]) and "polyline" not in web._spark([])
 
 
-def test_dashboard_includes_hw_section_and_panel():
-    # render_dashboard does DB I/O for the other sections (conftest's test DB), but the
-    # Hardware section + panel are driven purely by the hw= arg.
-    out = web.render_dashboard(None, hw={
-        "host-z": {"cpu_percent": 12.0, "ram_used_mb": 1024, "ram_total_mb": 8192,
-                   "gpus": [{"id": 0, "use_pct": 73, "vram_used_mb": 1000, "vram_total_mb": 2000}],
-                   "stale": False},
+def test_dashboard_includes_hw_section_and_sparkline():
+    out = web.render_dashboard(None, hw_history={
+        "host-z": [
+            {"cpu_percent": 12.0, "ram_used_mb": 1024, "ram_total_mb": 8192,
+             "gpus": [{"id": 0, "use_pct": 73, "vram_used_mb": 1000, "vram_total_mb": 2000}],
+             "stale": False},
+        ],
     })
     assert "Hardware — live fleet" in out
-    assert "host-z" in out and "73%" in out
+    assert "host-z" in out and "73%" in out and "<svg" in out
 
-    # with no hw, the section still renders with the graceful empty note
-    out2 = web.render_dashboard(None, hw=None)
+    out2 = web.render_dashboard(None, hw_history=None)
     assert "Hardware — live fleet" in out2 and "no hardware telemetry" in out2

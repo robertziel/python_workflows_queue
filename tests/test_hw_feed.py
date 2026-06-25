@@ -47,3 +47,25 @@ def test_hwfeed_receives_broadcast():
         assert "cpu" in hosts[host] and "host" in hosts[host]
     finally:
         feed.stop()
+
+
+def test_hwfeed_keeps_capped_history():
+    """HwFeed.history_by_host() accumulates a per-host ring buffer (oldest→newest),
+    capped at ``history`` — the time-series the conductor sparkline renders."""
+    feed = HwFeed(stale_after_s=60, history=4, dsn=db_url()).start()
+    try:
+        hist: dict = {}
+        for _ in range(60):
+            hw_metrics._broadcast({"cpu": {"pct": 12}, "gpus": []})
+            time.sleep(0.1)
+            hist = feed.history_by_host()
+            if hist and len(next(iter(hist.values()))) >= 4:
+                break
+        assert hist, "HwFeed accumulated no history"
+        host = next(iter(hist))
+        series = hist[host]
+        assert 1 <= len(series) <= 4              # capped at history=4
+        assert series[-1]["stale"] is False       # newest is fresh
+        assert all("cpu" in s for s in series)    # each entry is a full sample
+    finally:
+        feed.stop()
