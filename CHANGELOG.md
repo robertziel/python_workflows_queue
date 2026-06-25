@@ -31,6 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asserts the frozenset and the DB CHECK can never drift again.
 
 ### Added
+- **`queue-conductor-web` — live Hardware panel (CPU / GPU / RAM).** The conductor now
+  shows per-host hardware usage from the broker's `hw_metrics` stream — it starts one
+  background `HwFeed` (pg-only; the `LISTEN`/`NOTIFY` stream) and renders per-host cards
+  with no-JS CSS bars for CPU%, each GPU's utilization% + VRAM, and RAM. So the operator
+  sees **fleet-wide GPU usage** in the conductor like the project dashboards do, even for
+  hosts whose queue lives in a different DB (hw is fleet-wide, queue state is per-project).
+  Graceful empty state when no telemetry / non-pg; opt out with `--no-hw`.
 - **API + DB-schema reference docs** — `docs/client_api.md` (the `queue_workflows` client
   SDK: `configure()`, every hook, enqueue/state/introspection, worker-control, telemetry,
   console scripts), `docs/broker_api.md` (the broker contract: tables, NOTIFY channels, the

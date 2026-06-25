@@ -44,6 +44,11 @@ from queue_workflows import node_queue
 
 REFRESH_S = 5  # client-side meta refresh (no JS)
 
+# One process-wide background hw feed (started in serve() for a pg broker). The
+# conductor is request-response, but hw_metrics is a persistent LISTEN stream — so a
+# single daemon HwFeed holds the latest sample per host and each request reads it.
+_HW_FEED: Any = None
+
 
 # ── pure render (testable without a server) ─────────────────────────────────
 
@@ -160,6 +165,70 @@ def _fleet_table(fleet: list[dict[str, Any]], *, controls: dict | None = None,
         f"<th>model</th><th>status</th>{ctlth}</tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
     )
+
+
+# ── live hardware panel (cpu / gpu / ram from the broker's hw_metrics stream) ──
+
+def _fmt_pct(p: Any) -> str:
+    try:
+        return f"{float(p):.0f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _gb(mb: Any) -> str:
+    try:
+        return f"{float(mb) / 1024:.0f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _bar(pct: Any) -> str:
+    """A no-JS CSS usage bar for a 0–100 percentage (length = usage; no alarm colour
+    — high GPU% is *good*, it means the box is working)."""
+    try:
+        p = max(0.0, min(100.0, float(pct)))
+    except (TypeError, ValueError):
+        p = 0.0
+    return f'<div class="bar"><i style="width:{p:.0f}%"></i></div>'
+
+
+def _hw_panel(hw: dict[str, Any] | None) -> str:
+    """Live per-host hardware cards (CPU% / per-GPU% + VRAM / RAM) from the broker's
+    ``hw_metrics`` stream via :class:`HwFeed`. Pure — given the latest-sample-per-host
+    dict (``{host: {cpu_percent, ram_used_mb, ram_total_mb, gpus:[…], stale}}``)."""
+    if not hw:
+        return ('<p class="muted">no hardware telemetry yet — the conductor reads the '
+                "broker’s <code>hw_metrics</code> stream (a Postgres broker whose "
+                "gpu workers publish per-host cpu/gpu/ram).</p>")
+    cards = []
+    for host in sorted(hw):
+        s = hw[host] or {}
+        stale = bool(s.get("stale"))
+        cpu = s.get("cpu_percent")
+        ram_u, ram_t = s.get("ram_used_mb"), s.get("ram_total_mb")
+        ram_pct = (100.0 * float(ram_u) / float(ram_t)) if (ram_u and ram_t) else None
+        gpus = s.get("gpus") or []
+        rows = ['<div class="hwrow"><span class="hwk">CPU</span>'
+                f'{_bar(cpu)}<span class="hwv">{_fmt_pct(cpu)}</span></div>']
+        for g in gpus:
+            use, vu, vt = g.get("use_pct"), g.get("vram_used_mb"), g.get("vram_total_mb")
+            vram = f"{_gb(vu)}/{_gb(vt)} GB" if (vu is not None and vt) else "—"
+            rows.append(
+                f'<div class="hwrow"><span class="hwk">GPU{_esc(g.get("id"))}</span>'
+                f'{_bar(use)}<span class="hwv">{_fmt_pct(use)} '
+                f'<em>{_esc(vram)}</em></span></div>')
+        if not gpus:
+            rows.append('<div class="hwrow"><span class="hwk">GPU</span>'
+                        '<span class="hwv muted">none</span></div>')
+        rows.append('<div class="hwrow"><span class="hwk">RAM</span>'
+                    f'{_bar(ram_pct)}<span class="hwv">{_fmt_pct(ram_pct)} '
+                    f'<em>{_gb(ram_u)}/{_gb(ram_t)} GB</em></span></div>')
+        tag = ('<em class="stale">stale</em>' if stale
+               else '<em class="live">live</em>')
+        cards.append(f'<div class="card hw{" stale" if stale else ""}">'
+                     f"<h3>{_esc(host)} {tag}</h3>{''.join(rows)}</div>")
+    return '<div class="cards">' + "".join(cards) + "</div>"
 
 
 # ── Sidekiq-inspired pieces (a KPI strip + status badges + a recent-activity feed)
@@ -319,11 +388,24 @@ form.ctl button{font-size:11px;padding:3px 11px;border:1px solid #d0d7de;border-
 form.ctl button:hover{background:#eef1f4}
 .state{font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px}
 .state.on{background:#dafbe1;color:#0a5a2a}.state.off{background:#ffebe9;color:#a40e26}
+/* live hardware panel (cpu/gpu/ram bars, no JS) */
+.card.hw{min-width:300px}
+.card.hw.stale{opacity:.55}
+.card.hw h3 em{font-style:normal;font-weight:600;font-size:11px}
+.card.hw h3 em.live{color:#1a7f37}.card.hw h3 em.stale{color:#9a6700}
+.hwrow{display:flex;align-items:center;gap:9px;margin:7px 0}
+.hwk{width:44px;font-size:11px;color:#656d76;font-weight:600;flex:none}
+.hwv{font-size:12px;min-width:96px;text-align:right;flex:none;
+ font-variant-numeric:tabular-nums}
+.hwv em{color:#848d97;font-style:normal;font-size:11px}
+.bar{flex:1;background:#eaeef2;border-radius:4px;height:8px;overflow:hidden}
+.bar>i{display:block;height:100%;background:#0969da;border-radius:4px}
 """
 
 
 def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0,
-                     view: str = "all", writes_enabled: bool = False) -> str:
+                     view: str = "all", writes_enabled: bool = False,
+                     hw: dict[str, Any] | None = None) -> str:
     """Render the full dashboard HTML for ``project`` (``None`` ⇒ all projects).
     ``view`` selects the Recent-activity tab: ``all`` | ``retries`` (Sidekiq's
     Retries — node-jobs with ``watchdog_retries>0``) | ``dead`` (failed jobs).
@@ -361,6 +443,8 @@ def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0,
 <main>
   <h2>Overview</h2>
   {_stat_strip(counts, ingest, fleet, projects)}
+  <h2>Hardware — live fleet (cpu · gpu · ram)</h2>
+  {_hw_panel(hw)}
   <h2>Queues — shared cpu / gpu</h2>
   <div class="cards">{_queue_card('cpu', counts)}{_queue_card('gpu', counts)}</div>
   <h2>Ingest queues</h2>
@@ -515,9 +599,11 @@ class ConductorWebHandler(BaseHTTPRequestHandler):
             return
         project = q["project"][0] if "project" in q else None
         view = q.get("view", ["all"])[0]
+        hw = _HW_FEED.latest_by_host() if _HW_FEED is not None else None
         try:
             self._send(200, render_dashboard(project, stale_after_s=self.stale_after_s,
-                                             view=view, writes_enabled=self.writes_enabled))
+                                             view=view, writes_enabled=self.writes_enabled,
+                                             hw=hw))
         except Exception as exc:  # noqa: BLE001 — a DB blip must not kill the server
             self._send(500, render_error(exc))
 
@@ -575,10 +661,29 @@ class ConductorWebHandler(BaseHTTPRequestHandler):
         pass
 
 
+def _start_hw_feed(stale_after_s: float) -> Any:
+    """Start ONE background HwFeed against the broker's ``hw_metrics`` stream — but only
+    for a Postgres metrics DSN (``LISTEN``/``NOTIFY`` is pg-only; a sqlite/redis/mongo
+    conductor has no hw stream). Never fatal: any failure ⇒ ``None`` ⇒ the panel shows a
+    graceful 'no telemetry' note."""
+    try:
+        from queue_workflows.hw_feed import HwFeed
+        from queue_workflows.hw_metrics import metrics_dsn
+        dsn = metrics_dsn()
+        if not dsn or not dsn.startswith(("postgres://", "postgresql://")):
+            return None
+        return HwFeed(stale_after_s=stale_after_s).start()
+    except Exception:
+        return None
+
+
 def serve(host: str = "127.0.0.1", port: int = 8787, *, stale_after_s: float = 30.0,
-          writes_enabled: bool = False) -> None:
+          writes_enabled: bool = False, enable_hw: bool = True) -> None:
     ConductorWebHandler.stale_after_s = stale_after_s
     ConductorWebHandler.writes_enabled = writes_enabled
+    global _HW_FEED
+    if enable_hw:
+        _HW_FEED = _start_hw_feed(stale_after_s)
     httpd = ThreadingHTTPServer((host, port), ConductorWebHandler)
     mode = "READ+WRITE" if writes_enabled else "read-only"
     print(f"queue-conductor-web serving on http://{host}:{port} ({mode})  (Ctrl-C to stop)")
@@ -610,9 +715,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--enable-writes", action="store_true",
                    help="opt in to operator write actions (worker ON/OFF + re-queue). "
                    "Default OFF — the view is read-only.")
+    p.add_argument("--no-hw", action="store_true",
+                   help="disable the live Hardware panel (don't start the hw_metrics "
+                   "feed). Default ON for a Postgres broker.")
     args = p.parse_args(argv)
     from queue_workflows_conductor.conductor import _configure_backend
     _configure_backend(args.db_backend, args.db_url_env)
     serve(args.host, args.port, stale_after_s=args.stale_after,
-          writes_enabled=args.enable_writes)
+          writes_enabled=args.enable_writes, enable_hw=not args.no_hw)
     return 0
