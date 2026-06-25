@@ -25,10 +25,10 @@ def test_hw_panel_renders_sparklines_and_current_values():
     }
     out = web._hw_panel(history)
     assert "host-a" in out and "host-b" in out
-    # MOVING sparkline = inline SVG with a dotted polyline (no JS)
-    assert "<svg" in out and "<polyline" in out and "<circle" in out
+    # MOVING DOTTED graph = inline SVG with dots, NO connecting polyline (no JS)
+    assert "<svg" in out and "<circle" in out and "polyline" not in out
     # 2-point series spans the left (x=0.0) and right (x=120.0) edges
-    assert "0.0," in out and "120.0," in out
+    assert 'cx="0.0"' in out and 'cx="120.0"' in out
     # CURRENT values come from the LATEST sample: cpu 37%, gpu 88%, summed VRAM 18/24 GB
     assert "37%" in out and "88%" in out and "18/24 GB" in out
     # stale host flagged; no-gpu host shows 'none'
@@ -46,12 +46,13 @@ def test_hw_panel_tolerates_missing_fields_and_single_point():
     assert "h" in out and "<svg" in out and "—" in out  # graceful dashes, no crash
 
 
-def test_spark_oldest_left_newest_right():
+def test_spark_dotted_oldest_left_newest_right():
     svg = web._spark([10, 50, 90])
-    assert "<polyline" in svg and "120.0," in svg  # newest point at the right edge
-    assert 'r="2.6"' in svg                        # the emphasised newest dot
-    # empty series → an empty svg with no polyline
-    assert "<svg" in web._spark([]) and "polyline" not in web._spark([])
+    assert "<circle" in svg and 'cx="120.0"' in svg  # newest dot at the right edge
+    assert 'r="2.2"' in svg                          # the emphasised newest dot
+    assert "polyline" not in svg                     # DOTTED: no connecting line
+    # empty series → an empty svg with no dots
+    assert "<svg" in web._spark([]) and "circle" not in web._spark([])
 
 
 def test_dashboard_includes_hw_section_and_sparkline():

@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path. The version is bumped to `1.0.0` to mark the breaking default.
 
 ### Fixed
+- **`queue-conductor-web` no longer serves a stale (cached) page.** The live dashboard
+  (5 s meta-refresh) now sends `Cache-Control: no-store, no-cache, must-revalidate` +
+  `Pragma: no-cache` + `Expires: 0` on every response, so a browser or upstream proxy
+  can't show cached fleet/queue/hw state.
 - **`workflow_node_events` `unassignable` events now persist.** `'unassignable'` (the
   capacity sweep's red-flag, migration 0015) was in the `workflow_node_events_type_check`
   DB CHECK and emitted by `node_pool._sweep_unassignable_jobs`, but was missing from
@@ -34,9 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`queue-conductor-web` — live Hardware panel (CPU / GPU / RAM).** The conductor now
   shows per-host hardware usage from the broker's `hw_metrics` stream — it starts one
   background `HwFeed` (pg-only; the `LISTEN`/`NOTIFY` stream, now keeping a per-host
-  **history** ring buffer) and renders per-host cards with **no-JS moving time-series
-  sparklines** (inline-SVG dotted lines, oldest-left/newest-right, that scroll left on
-  each meta-refresh) for CPU% / GPU utilization% / RAM%, plus the current values + VRAM.
+  **history** ring buffer) and renders per-host cards with a **no-JS moving DOTTED
+  time-series graph** (inline-SVG dots, one per sample, no connecting line — the
+  project-dashboard style; oldest-left/newest-right, scrolling left on each
+  meta-refresh) for CPU% / GPU utilization% / RAM%, plus the current values + VRAM.
   So the operator sees **fleet-wide GPU usage over time** in the conductor like the
   project dashboards do, even for hosts whose queue lives in a different DB (hw is
   fleet-wide, queue state is per-project). `HwFeed.history_by_host()` (additive) powers

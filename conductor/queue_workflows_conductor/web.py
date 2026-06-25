@@ -191,8 +191,9 @@ def _clampf(v: Any) -> float:
 
 
 def _spark(values: list[Any], *, color: str = "#0969da") -> str:
-    """A no-JS inline-SVG moving sparkline for a 0–100 series — oldest on the LEFT,
-    newest on the RIGHT, so the dotted line scrolls left as the page meta-refreshes.
+    """A no-JS inline-SVG **dotted** moving graph for a 0–100 series — one dot per
+    sample, NO connecting line (the project-dashboard style), oldest on the LEFT /
+    newest on the RIGHT, so the dotted band scrolls left as the page meta-refreshes.
     ``None`` ⇒ 0. Fixed 120×28 viewBox so the dots stay round (no aspect stretch)."""
     n = len(values)
     if n == 0:
@@ -201,15 +202,12 @@ def _spark(values: list[Any], *, color: str = "#0969da") -> str:
     step = (W / (n - 1)) if n > 1 else 0.0
     pts = [((i * step) if n > 1 else W, H - (_clampf(v) / 100.0) * H)
            for i, v in enumerate(values)]
-    poly = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
-    dots = "".join(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="1.5"/>' for x, y in pts)
+    dots = "".join(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="1.1"/>' for x, y in pts)
     lx, ly = pts[-1]
     return (f'<svg class="spark" viewBox="0 0 120 28" width="120" height="28" '
             f'style="color:{color}">'
-            f'<polyline points="{poly}" fill="none" stroke="currentColor" '
-            f'stroke-width="1.1" opacity=".4"/>'
-            f'<g fill="currentColor" opacity=".5">{dots}</g>'
-            f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="2.6" fill="currentColor"/></svg>')
+            f'<g fill="currentColor" opacity=".7">{dots}</g>'
+            f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="2.2" fill="currentColor"/></svg>')
 
 
 def _ram_pct(s: dict[str, Any]) -> Any:
@@ -432,8 +430,7 @@ form.ctl button:hover{background:#eef1f4}
 .card.hw h3 em.live{color:#1a7f37}.card.hw h3 em.stale{color:#9a6700}
 .hwrow{display:flex;align-items:center;gap:10px;margin:8px 0}
 .hwk{width:46px;font-size:11px;color:#656d76;font-weight:600;flex:none}
-.spark{width:120px;height:28px;flex:none;background:#f6f8fa;border-radius:5px;
- border:1px solid #eaeef2;display:block}
+.spark{width:120px;height:28px;flex:none;display:block}
 .hwv{flex:1;font-size:12px;text-align:right;font-variant-numeric:tabular-nums}
 .hwv em{color:#848d97;font-style:normal;font-size:11px;margin-left:4px}
 """
@@ -604,6 +601,11 @@ class ConductorWebHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
+        # Never cache: this is a live dashboard (5s meta-refresh) — a cached copy in
+        # the browser or an upstream proxy would show stale fleet/queue/hw state.
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.end_headers()
         self.wfile.write(payload)
 
