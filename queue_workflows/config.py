@@ -94,6 +94,15 @@ class EngineConfig:
 
     # ── env-var names ────────────────────────────────────────────────────────
     db_url_env: str = "AI_LEADS_DB_URL"
+    #: env var holding the DSN that hw-metrics telemetry is published to + read
+    #: from — the shared "broker" Postgres, so every project shows the SAME
+    #: fleet-wide hardware view instead of each sampling its own DB. ``None`` ⇒
+    #: fall back to :attr:`db_url_env` (so a project whose queue DB already IS the
+    #: broker needs no extra wiring; a project on its own queue DB sets this to the
+    #: broker DSN env). hw-metrics is NOTIFY-only + Postgres-only, so this is
+    #: always a pg DSN regardless of :attr:`db_backend`. See ``hw_metrics`` /
+    #: ``hw_feed``.
+    metrics_db_url_env: str | None = None
     host_label_env: str = "AI_LEADS_HOST_LABEL"
     host_priority_env: str = "AI_LEADS_GPU_CONSUMER_PRIORITY"
     #: env vars holding the per-machine LLM server ROOT URLs the backend factory

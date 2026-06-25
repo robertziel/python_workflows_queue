@@ -38,6 +38,7 @@ except Exception:  # pragma: no cover - optional
     psutil = None  # type: ignore
 
 from queue_workflows.cgroup_attribution import CgroupAttribution
+from queue_workflows.config import get_config
 from queue_workflows.db import connection
 
 log = logging.getLogger(__name__)
@@ -49,6 +50,25 @@ log = logging.getLogger(__name__)
 # forwards each payload to browser clients.
 SAMPLE_INTERVAL_S = 5.0
 NOTIFY_CHANNEL = "hw_metrics"
+
+
+def metrics_dsn() -> str | None:
+    """Resolve the DSN hw-metrics is published to + read from: ``config.
+    metrics_db_url_env`` if set (the shared broker), else ``config.db_url_env``
+    (a project whose queue DB already IS the broker). Returns the DSN string, or
+    ``None`` if the chosen env var is unset. hw-metrics is Postgres-only (NOTIFY),
+    so this is always a pg DSN. Shared by the publisher (:func:`_broadcast`) and
+    the reader (:class:`queue_workflows.hw_feed.HwFeed`) so both agree on target."""
+    cfg = get_config()
+    return os.environ.get(cfg.metrics_db_url_env or cfg.db_url_env)
+
+
+def _uses_dedicated_metrics_dsn() -> bool:
+    """True when hw-metrics targets a DSN distinct from the engine queue pool —
+    i.e. a non-broker queue DB plus an explicit ``metrics_db_url_env`` pointing at
+    the broker. Then the publisher opens its own connection instead of the pool."""
+    cfg = get_config()
+    return bool(cfg.metrics_db_url_env) and cfg.metrics_db_url_env != cfg.db_url_env
 
 
 def _host_label() -> str:
@@ -299,15 +319,31 @@ def _build_sample(attrib: CgroupAttribution | None = None) -> dict[str, Any]:
 
 def _broadcast(sample: dict[str, Any]) -> None:
     """Fire a Postgres NOTIFY with the JSON-encoded sample. No row stored.
-    Rails LISTEN picks it up and fans out to SSE clients. Carries a ``host``
-    field so the SSE indicator can attribute samples by source."""
+    Published to the METRICS DSN (the shared broker — see :func:`metrics_dsn`), so
+    every project shows the SAME fleet-wide hardware view; a consumer LISTENs via
+    :class:`queue_workflows.hw_feed.HwFeed`. Carries a ``host`` field so the feed
+    attributes samples by source."""
     payload = json.dumps({
         "sampled_at": _iso_now(),
         "host": _host_label(),
         **sample,
     })
-    with connection() as conn, conn.cursor() as cur:
-        cur.execute("SELECT pg_notify(%s, %s)", (NOTIFY_CHANNEL, payload))
+    if _uses_dedicated_metrics_dsn():
+        # queue DB is NOT the broker → open a short autocommit connection to the
+        # broker metrics DSN (the 5 s cadence makes connect-per-broadcast fine).
+        dsn = metrics_dsn()
+        if not dsn:
+            log.warning("[hw_metrics] metrics_db_url_env set but its env var is "
+                        "empty — hw sample not published")
+            return
+        import psycopg
+        with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_notify(%s, %s)", (NOTIFY_CHANNEL, payload))
+    else:
+        # queue DB IS the metrics target (a broker-consolidated or single-DB
+        # project) → reuse the engine pool, unchanged.
+        with connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_notify(%s, %s)", (NOTIFY_CHANNEL, payload))
 
 
 def _iso_now() -> str:

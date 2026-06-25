@@ -63,6 +63,7 @@ __all__ = [
 def configure(
     *,
     db_url_env: str | None = None,
+    metrics_db_url_env: str | None = None,
     video_model_ids: frozenset[str] | None = None,
     node_module_package: str | None = None,
     host_label_env: str | None = None,
@@ -91,6 +92,8 @@ def configure(
     with cfg._lock:
         if db_url_env is not None:
             cfg.db_url_env = db_url_env
+        if metrics_db_url_env is not None:
+            cfg.metrics_db_url_env = metrics_db_url_env
         if video_model_ids is not None:
             cfg.video_model_ids = frozenset(video_model_ids)
         if node_module_package is not None:

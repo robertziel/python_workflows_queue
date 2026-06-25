@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path. The version is bumped to `1.0.0` to mark the breaking default.
 
 ### Added
+- **Centralized hardware telemetry on the broker — `config.metrics_db_url_env` +
+  `queue_workflows.hw_feed.HwFeed`.** hw-metrics now publish to + are read from a
+  configurable **metrics DSN** (the shared broker) instead of each project's own DB,
+  so every project shows the SAME fleet-wide CPU/GPU/RAM view. `metrics_db_url_env`
+  defaults to `db_url_env` (a broker-consolidated project needs no extra wiring; a
+  project on its own queue DB sets it to the broker DSN env via
+  `configure(metrics_db_url_env=...)`). `HwFeed` is the reusable client-lib consumer
+  (a daemon `LISTEN hw_metrics` on a dedicated connection, latest-sample-per-host,
+  reconnect-with-backoff, never fatal) — each project imports it instead of carrying
+  its own `hw_listener`.
 - `QUEUE_WORKFLOWS_DB_BACKEND` env var + `--db-backend` flag on `queue-broker` /
   `queue-conductor` / `queue-conductor-web` — let an operator point the standalone
   scripts at Postgres (or any backend) without a host `configure()` call (needed
