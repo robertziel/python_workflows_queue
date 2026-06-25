@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `queue-conductor` / `queue-conductor-web` — let an operator point the standalone
   scripts at Postgres (or any backend) without a host `configure()` call (needed
   after the sqlite-default flip above).
+- `QUEUE_WORKFLOWS_PROJECT` env var — sets the multi-tenant `project` tag for
+  entrypoints that hand-roll their own `configure()` and never pass `project=`
+  (e.g. standalone worker scripts). Mirrors `QUEUE_WORKFLOWS_DB_BACKEND`; an
+  explicit `configure(project=...)` still wins, and unset ⇒ `""` (unchanged
+  single-tenant default). Lets every process of a multi-process app share one
+  project tag via the deploy env instead of threading it through each script.
 - **`queue-broker` console + `queue-conductor-web` — operate the consolidated,
   one-queue-for-all-projects broker.** `queue-broker` stands up / owns the shared
   broker schema independently of any one project (`db.bootstrap` on the broker

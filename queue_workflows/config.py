@@ -76,6 +76,14 @@ def _default_db_backend() -> str:
     return norm
 
 
+def _default_project() -> str:
+    """Default ``project``, read from ``QUEUE_WORKFLOWS_PROJECT`` (the env knob that
+    reaches entrypoints which don't go through a host ``configure(project=...)`` —
+    e.g. standalone scripts that hand-roll their own ``configure``). Unset ⇒ ``""``
+    (the single-tenant default). Mirrors ``QUEUE_WORKFLOWS_DB_BACKEND``."""
+    return os.environ.get("QUEUE_WORKFLOWS_PROJECT", "")
+
+
 @dataclass
 class EngineConfig:
     """Process-wide engine configuration. One instance lives in this module
@@ -136,8 +144,10 @@ class EngineConfig:
     #: byte-compatible with no host wiring. Distinct from :attr:`db_namespace`,
     #: which *isolates* tenants on a shared redis/mongo (they can't see each
     #: other); ``project`` *pools* them into one pg queue with a filter — the
-    #: inverse. Set via ``configure(project="ai_leads")``.
-    project: str = ""
+    #: inverse. Set via ``configure(project="ai_leads")`` OR by exporting
+    #: ``QUEUE_WORKFLOWS_PROJECT`` (the env knob, for entrypoints that hand-roll
+    #: their own ``configure`` and never pass ``project`` — e.g. standalone scripts).
+    project: str = field(default_factory=_default_project)
     #: OBSERVED LLM-server capability this worker advertises in its heartbeat
     #: (migration 0014) — which server types this HOST can actually run. The host
     #: sets it once at startup (ai_leads → from the vllm-sidecar-rendered env), and
