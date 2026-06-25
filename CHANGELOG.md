@@ -38,10 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`queue-conductor-web` — live Hardware panel (CPU / GPU / RAM).** The conductor now
   shows per-host hardware usage from the broker's `hw_metrics` stream — it starts one
   background `HwFeed` (pg-only; the `LISTEN`/`NOTIFY` stream, now keeping a per-host
-  **history** ring buffer) and renders per-host cards with a **no-JS moving DOTTED
-  time-series graph** (inline-SVG dots, one per sample, no connecting line — the
-  project-dashboard style; oldest-left/newest-right, scrolling left on each
-  meta-refresh) for CPU% / GPU utilization% / RAM%, plus the current values + VRAM.
+  **history** ring buffer) and renders per-host cards with a **no-JS btop-style dotted
+  graph** — a port of the project dashboards' `DotChart`: each sample is a column of
+  stacked dots whose lit count encodes the value and whose rows run a green→yellow→red
+  gradient by load; the newest column is right-anchored, so older columns scroll left on
+  each meta-refresh — for CPU% / GPU utilization% / RAM%, plus the current values + VRAM.
   So the operator sees **fleet-wide GPU usage over time** in the conductor like the
   project dashboards do, even for hosts whose queue lives in a different DB (hw is
   fleet-wide, queue state is per-project). `HwFeed.history_by_host()` (additive) powers

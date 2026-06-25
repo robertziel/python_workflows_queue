@@ -183,31 +183,59 @@ def _gb(mb: Any) -> str:
         return "—"
 
 
-def _clampf(v: Any) -> float:
-    try:
-        return max(0.0, min(100.0, float(v)))
-    except (TypeError, ValueError):
-        return 0.0
+# btop-style dot-chart colours — ported from ai_leads' frontend hwChart/colors.ts:
+# a value (0→green, 50→yellow, 100→red); each lit row of a column is coloured by its
+# height, so a busy column reads green→…→red bottom-to-top.
+_C_GREEN = (0x32, 0xD7, 0x4B)
+_C_YELLOW = (0xFF, 0x9F, 0x0A)
+_C_RED = (0xFF, 0x45, 0x3A)
+_NO_DATA = "rgba(27,31,36,.18)"   # light-theme muted dot for a null tick
 
 
-def _spark(values: list[Any], *, color: str = "#0969da") -> str:
-    """A no-JS inline-SVG **dotted** moving graph for a 0–100 series — one dot per
-    sample, NO connecting line (the project-dashboard style), oldest on the LEFT /
-    newest on the RIGHT, so the dotted band scrolls left as the page meta-refreshes.
-    ``None`` ⇒ 0. Fixed 120×28 viewBox so the dots stay round (no aspect stretch)."""
-    n = len(values)
-    if n == 0:
-        return '<svg class="spark" viewBox="0 0 120 28" width="120" height="28"></svg>'
-    W, H = 120.0, 28.0
-    step = (W / (n - 1)) if n > 1 else 0.0
-    pts = [((i * step) if n > 1 else W, H - (_clampf(v) / 100.0) * H)
-           for i, v in enumerate(values)]
-    dots = "".join(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="1.1"/>' for x, y in pts)
-    lx, ly = pts[-1]
-    return (f'<svg class="spark" viewBox="0 0 120 28" width="120" height="28" '
-            f'style="color:{color}">'
-            f'<g fill="currentColor" opacity=".7">{dots}</g>'
-            f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="2.2" fill="currentColor"/></svg>')
+def _color_for_value(v: float) -> str:
+    v = max(0.0, min(100.0, float(v)))
+    a, b, t = ((_C_GREEN, _C_YELLOW, v / 50.0) if v <= 50.0
+               else (_C_YELLOW, _C_RED, (v - 50.0) / 50.0))
+    return "#%02x%02x%02x" % tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+
+
+def _row_color(row_idx: int, rows: int) -> str:
+    return _color_for_value(100.0 if rows <= 1 else (row_idx / (rows - 1)) * 100.0)
+
+
+def _lit_rows(value: Any, rows: int) -> int:
+    if value is None:
+        return 0
+    c = max(0.0, min(100.0, float(value)))
+    return 0 if c == 0.0 else max(1, min(rows, round(c * rows / 100.0)))
+
+
+def _spark(values: list[Any], *, rows: int = 4, width: int = 120,
+           height: int = 24, capacity: int = 46) -> str:
+    """btop-style dotted column chart — a port of ai_leads' ``DotChart``: each sample is
+    a vertical COLUMN of stacked dots; lit count = ``round(value*rows/100)``; each row is
+    coloured by a green→yellow→red gradient (bottom→top). The newest column is anchored at
+    the RIGHT edge, so older columns scroll left on each meta-refresh; a ``None`` tick
+    renders one muted baseline dot."""
+    vals = list(values)[-capacity:]
+    n = capacity
+    col_step = width / (n - 1) if n > 1 else 0.0
+    row_step = height / rows if rows > 0 else float(height)
+    r = max(1.0, min(2.0, min(col_step, row_step) / 2.4))
+    first = n - len(vals)
+    out: list[str] = []
+    for i, v in enumerate(vals):
+        cx = (first + i) * col_step
+        if v is None:
+            out.append(f'<circle cx="{cx:.1f}" cy="{height - row_step / 2:.1f}" '
+                       f'r="{r:.2f}" fill="{_NO_DATA}"/>')
+            continue
+        for row_idx in range(_lit_rows(v, rows)):
+            cy = height - (row_idx + 0.5) * row_step
+            out.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.2f}" '
+                       f'fill="{_row_color(row_idx, rows)}"/>')
+    return (f'<svg class="spark" width="{width}" height="{height}" '
+            f'viewBox="0 0 {width} {height}">{"".join(out)}</svg>')
 
 
 def _ram_pct(s: dict[str, Any]) -> Any:
@@ -221,9 +249,9 @@ def _gpu_max(s: dict[str, Any]) -> Any:
     return max(uses) if uses else None
 
 
-def _hw_row(label: str, series: list[Any], cur: Any, sub: str, color: str) -> str:
+def _hw_row(label: str, series: list[Any], cur: Any, sub: str) -> str:
     return (f'<div class="hwrow"><span class="hwk">{_esc(label)}</span>'
-            f"{_spark(series, color=color)}"
+            f"{_spark(series)}"
             f'<span class="hwv">{_fmt_pct(cur)}'
             f'{(" <em>" + _esc(sub) + "</em>") if sub else ""}</span></div>')
 
@@ -253,11 +281,11 @@ def _hw_panel(history: dict[str, list[dict[str, Any]]] | None) -> str:
         ram_u, ram_t = latest.get("ram_used_mb"), latest.get("ram_total_mb")
         rows = [
             _hw_row("CPU", [s.get("cpu_percent") for s in samples],
-                    latest.get("cpu_percent"), "", "#0969da"),
+                    latest.get("cpu_percent"), ""),
             _hw_row(glabel, [_gpu_max(s) for s in samples],
-                    _gpu_max(latest), gpu_sub, "#1a7f37"),
+                    _gpu_max(latest), gpu_sub),
             _hw_row("RAM", [_ram_pct(s) for s in samples],
-                    _ram_pct(latest), f"{_gb(ram_u)}/{_gb(ram_t)} GB", "#9a6700"),
+                    _ram_pct(latest), f"{_gb(ram_u)}/{_gb(ram_t)} GB"),
         ]
         tag = ('<em class="stale">stale</em>' if stale
                else '<em class="live">live</em>')
@@ -430,7 +458,7 @@ form.ctl button:hover{background:#eef1f4}
 .card.hw h3 em.live{color:#1a7f37}.card.hw h3 em.stale{color:#9a6700}
 .hwrow{display:flex;align-items:center;gap:10px;margin:8px 0}
 .hwk{width:46px;font-size:11px;color:#656d76;font-weight:600;flex:none}
-.spark{width:120px;height:28px;flex:none;display:block}
+.spark{width:120px;height:24px;flex:none;display:block}
 .hwv{flex:1;font-size:12px;text-align:right;font-variant-numeric:tabular-nums}
 .hwv em{color:#848d97;font-style:normal;font-size:11px;margin-left:4px}
 """

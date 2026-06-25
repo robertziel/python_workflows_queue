@@ -25,10 +25,10 @@ def test_hw_panel_renders_sparklines_and_current_values():
     }
     out = web._hw_panel(history)
     assert "host-a" in out and "host-b" in out
-    # MOVING DOTTED graph = inline SVG with dots, NO connecting polyline (no JS)
+    # btop-style DOTTED column graph = inline SVG of dots, NO connecting polyline (no JS)
     assert "<svg" in out and "<circle" in out and "polyline" not in out
-    # 2-point series spans the left (x=0.0) and right (x=120.0) edges
-    assert 'cx="0.0"' in out and 'cx="120.0"' in out
+    # newest column is right-anchored at x=120.0
+    assert 'cx="120.0"' in out
     # CURRENT values come from the LATEST sample: cpu 37%, gpu 88%, summed VRAM 18/24 GB
     assert "37%" in out and "88%" in out and "18/24 GB" in out
     # stale host flagged; no-gpu host shows 'none'
@@ -46,12 +46,16 @@ def test_hw_panel_tolerates_missing_fields_and_single_point():
     assert "h" in out and "<svg" in out and "—" in out  # graceful dashes, no crash
 
 
-def test_spark_dotted_oldest_left_newest_right():
-    svg = web._spark([10, 50, 90])
-    assert "<circle" in svg and 'cx="120.0"' in svg  # newest dot at the right edge
-    assert 'r="2.2"' in svg                          # the emphasised newest dot
-    assert "polyline" not in svg                     # DOTTED: no connecting line
-    # empty series → an empty svg with no dots
+def test_spark_btop_columns():
+    # btop encoding: value → column height (lit dots = round(value*rows/100), rows=4),
+    # newest column anchored at the right (x=120.0), row 0 green via the gradient.
+    svg = web._spark([90])
+    assert "<circle" in svg and 'cx="120.0"' in svg
+    assert "polyline" not in svg                  # dots, not a connecting line
+    assert "#32d74b" in svg                        # bottom row green (the value gradient)
+    assert svg.count("<circle") >= 3               # 90% → ~4 lit dots
+    assert web._spark([1]).count("<circle") == 1   # tiny positive → at least 1 dot
+    assert web._spark([0]).count("<circle") == 0   # zero → empty column
     assert "<svg" in web._spark([]) and "circle" not in web._spark([])
 
 
