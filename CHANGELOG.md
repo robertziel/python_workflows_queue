@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `node_queue.list_node_events(job_id)` — read-only per-attempt event timeline for a
   node-job (the `workflow_node_events` log); `recent_jobs(..., min_retries=)` adds a
   retries filter (node-jobs over the threshold; ingest excluded).
+- **`queue-conductor-web --enable-writes`** — opt-in operator write actions (default
+  OFF / read-only): a per-(host,queue) **worker ON/OFF toggle**
+  (`worker_control.set_worker_control`) and **re-queue a running node-job**
+  (`requeue_job_for_retry`), over a POST/redirect/GET path (403 when disabled).
 - **`queue-broker` console + `queue-conductor-web` — operate the consolidated,
   one-queue-for-all-projects broker.** `queue-broker` stands up / owns the shared
   broker schema independently of any one project (`db.bootstrap` on the broker

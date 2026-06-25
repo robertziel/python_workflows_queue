@@ -11,10 +11,13 @@ a queue per project. Every panel takes a **project filter** (the headline change
 
 Design / scope, on purpose (mirrors the conductor's existing constraints):
 
-  * **READ-ONLY.** No park/resume/retry/cancel write controls — those, and the
-    multi-DB networked aggregator across many app DBs, are the human-gated build
-    noted in ``conductor.py``. This view is the conductor's existing single-DB
-    read scope, as HTML.
+  * **READ-ONLY by default; opt-in writes via ``--enable-writes``.** The default is
+    the pure single-DB read view. With ``--enable-writes`` it gains two gated
+    operator actions — worker ON/OFF (``worker_control.set_worker_control``) and
+    re-queue a running node-job (``node_queue.requeue_job_for_retry``) — over a
+    POST/redirect/GET path, and nothing else (no cancel/delete). The multi-DB
+    networked aggregator across many app DBs remains the human-gated build noted in
+    ``conductor.py``.
   * **Zero new runtime deps.** Pure stdlib ``http.server`` + server-rendered
     HTML (no web framework, no JS) — consistent with the library's "Postgres is
     the only hard dependency" ethos, and no JS means no client console errors.
@@ -105,9 +108,29 @@ def _ingest_cards(ing: dict[str, Any]) -> str:
     return "".join(out)
 
 
-def _fleet_table(fleet: list[dict[str, Any]]) -> str:
+def _control_cell(host: str, queue: str, control: dict[str, Any] | None) -> str:
+    """An ON/OFF toggle form (Sidekiq's quiet/stop) — only rendered when writes are
+    enabled. A worker absent from worker_controls is treated as ON."""
+    off = bool(control) and control.get("desired_state") == "off"
+    nxt = "on" if off else "off"
+    label = "OFF" if off else "ON"
+    btn = "turn on" if off else "turn off"
+    cls = "toggle off" if off else "toggle on"
+    return (
+        f'<form method="post" action="/control" class="ctl">'
+        f'<input type="hidden" name="host" value="{_esc(host)}">'
+        f'<input type="hidden" name="queue" value="{_esc(queue)}">'
+        f'<input type="hidden" name="desired_state" value="{nxt}">'
+        f'<span class="state {cls}">{label}</span>'
+        f'<button type="submit">{btn}</button></form>'
+    )
+
+
+def _fleet_table(fleet: list[dict[str, Any]], *, controls: dict | None = None,
+                 writes_enabled: bool = False) -> str:
     if not fleet:
         return '<p class="muted">no workers reporting</p>'
+    controls = controls or {}
     rows = []
     for w in fleet:
         if w.get("flagged_dead"):
@@ -116,20 +139,25 @@ def _fleet_table(fleet: list[dict[str, Any]]) -> str:
             status, scls = "stale", "stale"
         else:
             status, scls = "ok", "ok"
+        host, queue = w.get("host_label"), w.get("queue")
+        ctl = (f"<td>{_control_cell(host, queue, controls.get((host, queue)))}</td>"
+               if writes_enabled else "")
         rows.append(
             "<tr>"
-            f"<td>{_esc(w.get('host_label'))}</td>"
-            f"<td>{_esc(w.get('queue'))}</td>"
+            f"<td>{_esc(host)}</td>"
+            f"<td>{_esc(queue)}</td>"
             f"<td>{_esc(_proj_label(w.get('project') or ''))}</td>"
             f"<td>{_esc(w.get('concurrency'))}</td>"
             f"<td>{_esc(w.get('current_model') or '—')}</td>"
             f'<td class="st {scls}">{status}</td>'
+            f"{ctl}"
             "</tr>"
         )
+    ctlth = "<th>control</th>" if writes_enabled else ""
     return (
         '<table class="fleet"><thead><tr>'
         "<th>host</th><th>queue</th><th>project</th><th>conc</th>"
-        "<th>model</th><th>status</th></tr></thead>"
+        f"<th>model</th><th>status</th>{ctlth}</tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
     )
 
@@ -284,14 +312,22 @@ table.fleet a:hover{text-decoration:underline}
 .meta b{display:block;font-size:13px;margin-top:3px;word-break:break-all;font-weight:600}
 pre.err{background:#fff8f8;border:1px solid #ffcecb;border-radius:8px;padding:12px;
  color:#a40e26;font-size:12px;overflow:auto;white-space:pre-wrap}
+/* write-action controls (opt-in via --enable-writes) */
+form.ctl{display:inline-flex;align-items:center;gap:8px;margin:0}
+form.ctl button{font-size:11px;padding:3px 11px;border:1px solid #d0d7de;border-radius:6px;
+ background:#f6f8fa;color:#24292f;cursor:pointer}
+form.ctl button:hover{background:#eef1f4}
+.state{font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px}
+.state.on{background:#dafbe1;color:#0a5a2a}.state.off{background:#ffebe9;color:#a40e26}
 """
 
 
 def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0,
-                     view: str = "all") -> str:
+                     view: str = "all", writes_enabled: bool = False) -> str:
     """Render the full dashboard HTML for ``project`` (``None`` ⇒ all projects).
     ``view`` selects the Recent-activity tab: ``all`` | ``retries`` (Sidekiq's
     Retries — node-jobs with ``watchdog_retries>0``) | ``dead`` (failed jobs).
+    ``writes_enabled`` (opt-in) renders the per-worker ON/OFF toggles.
     Pure — fetches the engine snapshots and returns a complete HTML document."""
     snap = node_queue.snapshot(project=project)
     ingest = node_queue.ingest_snapshot(project=project)
@@ -303,6 +339,12 @@ def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0,
     else:
         view, recent = "all", node_queue.recent_jobs(project=project, limit=25)
     projects = node_queue.list_projects()
+    controls: dict = {}
+    if writes_enabled:
+        from queue_workflows import worker_control
+        controls = {(w.get("host_label"), w.get("queue")):
+                    worker_control.get_worker_control(w.get("host_label"), w.get("queue"))
+                    for w in fleet}
     counts = snap.get("counts", {})
     scope = "all projects" if project is None else f"project = {_proj_label(project)}"
     body = f"""<!doctype html><html lang="en"><head>
@@ -326,7 +368,7 @@ def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0,
   <h2>Recent activity {_recent_tabs(view, project)}</h2>
   {_recent_table(recent)}
   <h2>Fleet — workers</h2>
-  {_fleet_table(fleet)}
+  {_fleet_table(fleet, controls=controls, writes_enabled=writes_enabled)}
 </main>
 <footer>read-only · single-DB · auto-refresh {REFRESH_S}s · queue-conductor-web</footer>
 </body></html>"""
@@ -367,13 +409,21 @@ _EV_CLS = {"claimed": "r", "completed": "c", "failed": "x", "cancelled": "n",
 
 
 def render_job(job: dict[str, Any], events: list[dict[str, Any]],
-               *, kind: str = "node") -> str:
+               *, kind: str = "node", writes_enabled: bool = False) -> str:
     """Job-detail page: the job's metadata + (for a node-job) its per-attempt
     ``workflow_node_events`` timeline — broker_parrot's forensic history, richer
-    than Sidekiq's per-job retry list."""
+    than Sidekiq's per-job retry list. ``writes_enabled`` shows a re-queue control
+    for a running node-job (Sidekiq's retry)."""
     name = job.get("node_id") or job.get("task_name") or job.get("id")
     err = (f'<h2>Error</h2><pre class="err">{_esc(job.get("error"))}</pre>'
            if job.get("error") else "")
+    requeue = ""
+    if writes_enabled and kind == "node" and job.get("status") == "running":
+        requeue = (
+            '<form method="post" action="/requeue" class="ctl" style="margin-top:10px">'
+            f'<input type="hidden" name="job_id" value="{_esc(job.get("id"))}">'
+            '<button type="submit">re-queue (retry on a fresh worker)</button></form>'
+        )
     if events:
         rows = "".join(
             "<tr>"
@@ -402,6 +452,7 @@ def render_job(job: dict[str, Any], events: list[dict[str, Any]],
 <main>
   <h2>Job <em style="text-transform:none;font-weight:400;color:#848d97">· {_esc(job.get("id"))}</em></h2>
   {_job_meta(job)}
+  {requeue}
   {err}
   <h2>Event timeline <em style="text-transform:none;font-weight:400;color:#848d97">· workflow_node_events (per attempt)</em></h2>
   {timeline}
@@ -426,6 +477,7 @@ def render_error(exc: BaseException) -> str:
 class ConductorWebHandler(BaseHTTPRequestHandler):
     server_version = "queue-conductor-web/0.1"
     stale_after_s = 30.0
+    writes_enabled = False  # opt-in (--enable-writes); default keeps the view read-only
 
     def _send(self, code: int, body: str) -> None:
         payload = body.encode("utf-8")
@@ -453,7 +505,8 @@ class ConductorWebHandler(BaseHTTPRequestHandler):
                 if job is None:
                     self._send(404, "<h1>404 — no such job</h1>")
                     return
-                self._send(200, render_job(job, events, kind=kind))
+                self._send(200, render_job(job, events, kind=kind,
+                                           writes_enabled=self.writes_enabled))
             except Exception as exc:  # noqa: BLE001 — a DB blip must not kill the server
                 self._send(500, render_error(exc))
             return
@@ -463,18 +516,72 @@ class ConductorWebHandler(BaseHTTPRequestHandler):
         project = q["project"][0] if "project" in q else None
         view = q.get("view", ["all"])[0]
         try:
-            self._send(200, render_dashboard(project, stale_after_s=self.stale_after_s, view=view))
+            self._send(200, render_dashboard(project, stale_after_s=self.stale_after_s,
+                                             view=view, writes_enabled=self.writes_enabled))
         except Exception as exc:  # noqa: BLE001 — a DB blip must not kill the server
             self._send(500, render_error(exc))
+
+    def do_POST(self) -> None:  # noqa: N802
+        """Gated write path (opt-in via --enable-writes). Two operator actions —
+        worker ON/OFF (worker_control) + re-queue a running node-job — then a
+        303 redirect back (POST/redirect/GET). 403 when writes are disabled."""
+        if not self.writes_enabled:
+            self._send(403, "<h1>403 — writes disabled (start with --enable-writes)</h1>")
+            return
+        # CSRF guard: a browser cross-site form POST carries an Origin that won't
+        # match our Host — reject it. A request with no Origin (curl / same-origin
+        # form) is allowed. Cheap defence so enabling writes + binding 0.0.0.0 can't
+        # be driven by another tab the operator has open.
+        origin = self.headers.get("Origin")
+        if origin and urllib.parse.urlparse(origin).netloc != self.headers.get("Host", ""):
+            self._send(403, "<h1>403 — cross-origin POST rejected</h1>")
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        form = urllib.parse.parse_qs(
+            self.rfile.read(length).decode("utf-8") if length else "",
+            keep_blank_values=True,
+        )
+
+        def f(k: str, d: str = "") -> str:
+            return form.get(k, [d])[0]
+
+        try:
+            if parsed.path == "/control":
+                from queue_workflows import worker_control
+                worker_control.set_worker_control(
+                    f("host"), f("queue"), desired_state=f("desired_state"),
+                    requested_by="conductor-web",
+                )
+            elif parsed.path == "/requeue":
+                node_queue.requeue_job_for_retry(f("job_id"))
+            else:
+                self._send(404, "<h1>404</h1>")
+                return
+        except Exception as exc:  # noqa: BLE001 — a bad write must not kill the server
+            self._send(500, render_error(exc))
+            return
+        # redirect back within THIS origin only (no open-redirect): keep just the
+        # Referer's path+query, never its scheme/host.
+        ref = urllib.parse.urlparse(self.headers.get("Referer") or "/")
+        dest = ref.path + (("?" + ref.query) if ref.query else "")
+        if not dest.startswith("/"):
+            dest = "/"
+        self.send_response(303)
+        self.send_header("Location", dest)
+        self.end_headers()
 
     def log_message(self, *args: object) -> None:  # silence default stderr spam
         pass
 
 
-def serve(host: str = "127.0.0.1", port: int = 8787, *, stale_after_s: float = 30.0) -> None:
+def serve(host: str = "127.0.0.1", port: int = 8787, *, stale_after_s: float = 30.0,
+          writes_enabled: bool = False) -> None:
     ConductorWebHandler.stale_after_s = stale_after_s
+    ConductorWebHandler.writes_enabled = writes_enabled
     httpd = ThreadingHTTPServer((host, port), ConductorWebHandler)
-    print(f"queue-conductor-web serving on http://{host}:{port}  (Ctrl-C to stop)")
+    mode = "READ+WRITE" if writes_enabled else "read-only"
+    print(f"queue-conductor-web serving on http://{host}:{port} ({mode})  (Ctrl-C to stop)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -500,8 +607,12 @@ def main(argv: list[str] | None = None) -> int:
                    "--db-backend pg — the library default is now sqlite (v1.0.0).")
     p.add_argument("--db-url-env", default=None,
                    help="env var holding the DSN / SQLite path (default: configured)")
+    p.add_argument("--enable-writes", action="store_true",
+                   help="opt in to operator write actions (worker ON/OFF + re-queue). "
+                   "Default OFF — the view is read-only.")
     args = p.parse_args(argv)
     from queue_workflows_conductor.conductor import _configure_backend
     _configure_backend(args.db_backend, args.db_url_env)
-    serve(args.host, args.port, stale_after_s=args.stale_after)
+    serve(args.host, args.port, stale_after_s=args.stale_after,
+          writes_enabled=args.enable_writes)
     return 0

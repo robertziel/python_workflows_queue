@@ -168,6 +168,58 @@ def test_dashboard_tabs_and_views():
     assert web.render_dashboard(None, view="bogus").count("Recent activity") == 1
 
 
+def test_writes_opt_in_renders_toggles():
+    """Read-only by default; --enable-writes (writes_enabled) adds the per-worker
+    ON/OFF toggle column."""
+    _seed()
+    assert "<th>control</th>" not in web.render_dashboard(None)
+    on = web.render_dashboard(None, writes_enabled=True)
+    assert "<th>control</th>" in on and 'action="/control"' in on
+
+
+def test_write_actions_post_path():
+    """do_POST is gated: 403 when disabled; with writes enabled, POST /control
+    writes worker_controls (Sidekiq's quiet/stop)."""
+    import threading
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    from queue_workflows import worker_control
+
+    data = urllib.parse.urlencode(
+        {"host": "h1", "queue": "cpu", "desired_state": "off"}).encode()
+    web.ConductorWebHandler.writes_enabled = False
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), web.ConductorWebHandler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        try:  # disabled → 403
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/control", data=data, timeout=5)
+            assert False, "expected 403 when writes disabled"
+        except urllib.error.HTTPError as e:
+            assert e.code == 403
+        web.ConductorWebHandler.writes_enabled = True  # opt in
+        # CSRF guard: a cross-origin POST is rejected even with writes enabled
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/control", data=data,
+                headers={"Origin": "http://evil.example"}, method="POST")
+            urllib.request.urlopen(req, timeout=5)
+            assert False, "expected 403 for cross-origin POST"
+        except urllib.error.HTTPError as e:
+            assert e.code == 403
+        # same-origin (no Origin header) POST → the write lands
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/control", data=data, timeout=5)
+        ctl = worker_control.get_worker_control("h1", "cpu")
+        assert ctl is not None and ctl["desired_state"] == "off"
+    finally:
+        web.ConductorWebHandler.writes_enabled = False  # don't leak to other tests
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_render_is_escaped(monkeypatch):
     # a hostile project/model value must not break out of the HTML
     node_queue.upsert_worker_heartbeat(
