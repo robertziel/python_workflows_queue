@@ -82,7 +82,7 @@ def test_conductor_backend_flag_selects_store():
 
 
 def test_recent_jobs_unifies_node_and_ingest():
-    """The Sidekiq-style activity feed primitive: one list across BOTH job
+    """The job-dashboard-style activity feed primitive: one list across BOTH job
     families, project-aware, with the unified lifecycle shape."""
     _seed()
     jobs = node_queue.recent_jobs(limit=50)
@@ -102,7 +102,7 @@ def test_recent_jobs_unifies_node_and_ingest():
 
 
 def test_dashboard_has_overview_strip_and_recent_activity():
-    """The Sidekiq-inspired additions render: the KPI overview strip + the
+    """The job-dashboard-inspired additions render: the KPI overview strip + the
     recent-activity feed with status badges."""
     _seed()
     html = web.render_dashboard(None)
@@ -111,13 +111,13 @@ def test_dashboard_has_overview_strip_and_recent_activity():
         assert kpi in html
     assert "Recent activity" in html
     assert 'class="kpi' in html      # the KPI strip
-    assert 'class="badge' in html    # Sidekiq-style status pills
+    assert 'class="badge' in html    # job-dashboard-style status pills
     assert "noop" in html            # the ingest job appears in the feed
 
 
 def test_list_node_events_and_job_detail_render():
     """The job-detail timeline: list_node_events returns the per-attempt log and
-    render_job shows the metadata + the events (our differentiator over Sidekiq)."""
+    render_job shows the metadata + the events (our differentiator over a plain job dashboard)."""
     rid = _run("alpha")
     jid = node_queue.enqueue_node_job(run_id=rid, node_id="nd", node_module="m",
                                       queue="gpu", project="alpha")
@@ -136,7 +136,7 @@ def test_list_node_events_and_job_detail_render():
 
 
 def test_recent_jobs_retries_filter():
-    """min_retries ⇒ Sidekiq's Retries view: node-jobs over the threshold only;
+    """min_retries ⇒ a job dashboard's Retries view: node-jobs over the threshold only;
     ingest jobs (no retry counter) drop out."""
     rid = _run("alpha")
     node_queue.enqueue_node_job(run_id=rid, node_id="clean", node_module="m",
@@ -155,7 +155,7 @@ def test_recent_jobs_retries_filter():
 
 
 def test_dashboard_tabs_and_views():
-    """The Recent-activity feed gains Sidekiq All/Retries/Dead tabs; the view
+    """The Recent-activity feed gains job-dashboard-style All/Retries/Dead tabs; the view
     param scopes the feed and marks the active tab."""
     _seed()
     html = web.render_dashboard(None, view="all")
@@ -179,7 +179,7 @@ def test_writes_opt_in_renders_toggles():
 
 def test_write_actions_post_path():
     """do_POST is gated: 403 when disabled; with writes enabled, POST /control
-    writes worker_controls (Sidekiq's quiet/stop)."""
+    writes worker_controls (park/resume)."""
     import threading
     import urllib.error
     import urllib.parse

@@ -77,13 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `node_queue.recent_jobs(*, project=None, status=None, limit=40)` — a read-only
   recent-activity feed unifying DAG node-jobs and ingest jobs into one newest-first
   list (kind / name / queue / status / project / worker / timing / retries / error),
-  project- and status-aware, dialect-portable. Powers a Sidekiq-style activity view.
-- **`queue-conductor-web` — Sidekiq-inspired dashboard:** an Overview KPI strip
+  project- and status-aware, dialect-portable. Powers a job-dashboard-style activity view.
+- **`queue-conductor-web` — job-queue ops dashboard:** an Overview KPI strip
   (Busy / Enqueued / Processed / Failed / Workers / Projects, summed across node +
   ingest) and a Recent-activity feed with status badges + a retries column + "x ago"
   timing — every panel project-filter-aware, still read-only / stdlib-HTML / no-JS.
   Plus a **`/job/<id>` detail page** (metadata grid + the per-attempt
-  `workflow_node_events` timeline) reachable from the feed, and Sidekiq-style
+  `workflow_node_events` timeline) reachable from the feed, and job-dashboard-style
   **All / Retries / Dead tabs** on the feed (`?view=`).
 - `node_queue.list_node_events(job_id)` — read-only per-attempt event timeline for a
   node-job (the `workflow_node_events` log); `recent_jobs(..., min_retries=)` adds a

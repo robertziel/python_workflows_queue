@@ -114,7 +114,7 @@ def _ingest_cards(ing: dict[str, Any]) -> str:
 
 
 def _control_cell(host: str, queue: str, control: dict[str, Any] | None) -> str:
-    """An ON/OFF toggle form (Sidekiq's quiet/stop) — only rendered when writes are
+    """An ON/OFF toggle form (park/resume) — only rendered when writes are
     enabled. A worker absent from worker_controls is treated as ON."""
     off = bool(control) and control.get("desired_state") == "off"
     nxt = "on" if off else "off"
@@ -294,10 +294,10 @@ def _hw_panel(history: dict[str, list[dict[str, Any]]] | None) -> str:
     return '<div class="cards">' + "".join(cards) + "</div>"
 
 
-# ── Sidekiq-inspired pieces (a KPI strip + status badges + a recent-activity feed)
+# ── job-dashboard-inspired pieces (a KPI strip + status badges + a recent-activity feed)
 
 def _ago(dt: Any) -> str:
-    """Compact relative age (Sidekiq shows 'x ago'). Tolerant of naive/aware/None."""
+    """Compact relative age (job dashboards show 'x ago'). Tolerant of naive/aware/None."""
     if dt is None:
         return "—"
     try:
@@ -328,7 +328,7 @@ def _badge(status: Any) -> str:
 
 def _stat_strip(counts: dict[str, int], ingest: dict[str, Any],
                 fleet: list[dict[str, Any]], projects: list[str]) -> str:
-    """Sidekiq-style overview: big-number KPIs summed across node + ingest queues."""
+    """job-dashboard-style overview: big-number KPIs summed across node + ingest queues."""
     tot = {"running": 0, "queued": 0, "completed": 0, "failed": 0}
     for k, n in (counts or {}).items():            # node-job counts: 'cpu_completed' …
         for s in tot:
@@ -348,7 +348,7 @@ def _stat_strip(counts: dict[str, int], ingest: dict[str, Any],
 
 
 def _recent_table(jobs: list[dict[str, Any]]) -> str:
-    """Sidekiq-style recent-activity feed across both job families (node + ingest)."""
+    """job-dashboard-style recent-activity feed across both job families (node + ingest)."""
     if not jobs:
         return '<p class="muted">no recent jobs</p>'
     rows = []
@@ -411,7 +411,7 @@ table.fleet{border-collapse:collapse;width:100%;font-size:13px;background:#fff;
 .st.ok{color:#1a7f37}.st.stale{color:#9a6700}.st.dead{color:#d1242f;font-weight:700}
 .muted{color:#656d76}
 footer{color:#848d97;font-size:11px;padding:18px 22px;border-top:1px solid #d8dee4}
-/* Sidekiq-style KPI strip */
+/* job-dashboard-style KPI strip */
 .kpis{display:flex;flex-wrap:wrap;gap:12px;margin:0 0 8px}
 .kpi{background:#fff;border:1px solid #d0d7de;border-radius:9px;padding:12px 20px;
  min-width:104px;box-shadow:0 1px 0 rgba(27,31,36,.04)}
@@ -433,7 +433,7 @@ footer{color:#848d97;font-size:11px;padding:18px 22px;border-top:1px solid #d8de
 td.warn{color:#9a6700;font-weight:700}
 table.fleet a{color:#0969da;text-decoration:none}
 table.fleet a:hover{text-decoration:underline}
-/* Sidekiq-style All/Retries/Dead tabs on the activity feed */
+/* job-dashboard-style All/Retries/Dead tabs on the activity feed */
 .tabs{font-size:12px;font-weight:400;text-transform:none;letter-spacing:0;margin-left:10px}
 .tabs .tab{padding:3px 11px;border-radius:12px;color:#57606a;text-decoration:none}
 .tabs .tab.active{background:#0969da;color:#fff}
@@ -468,7 +468,7 @@ def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0,
                      view: str = "all", writes_enabled: bool = False,
                      hw_history: dict[str, Any] | None = None) -> str:
     """Render the full dashboard HTML for ``project`` (``None`` ⇒ all projects).
-    ``view`` selects the Recent-activity tab: ``all`` | ``retries`` (Sidekiq's
+    ``view`` selects the Recent-activity tab: ``all`` | ``retries`` (a job dashboard's
     Retries — node-jobs with ``watchdog_retries>0``) | ``dead`` (failed jobs).
     ``writes_enabled`` (opt-in) renders the per-worker ON/OFF toggles.
     Pure — fetches the engine snapshots and returns a complete HTML document."""
@@ -521,7 +521,7 @@ def render_dashboard(project: str | None = None, *, stale_after_s: float = 30.0,
 
 
 def _recent_tabs(view: str, project: str | None) -> str:
-    """Sidekiq-style All / Retries / Dead tabs for the activity feed (preserves
+    """job-dashboard-style All / Retries / Dead tabs for the activity feed (preserves
     the active project filter)."""
     suffix = "" if project is None else "&project=" + urllib.parse.quote(project)
     out = []
@@ -557,8 +557,8 @@ def render_job(job: dict[str, Any], events: list[dict[str, Any]],
                *, kind: str = "node", writes_enabled: bool = False) -> str:
     """Job-detail page: the job's metadata + (for a node-job) its per-attempt
     ``workflow_node_events`` timeline — broker_parrot's forensic history, richer
-    than Sidekiq's per-job retry list. ``writes_enabled`` shows a re-queue control
-    for a running node-job (Sidekiq's retry)."""
+    than a job dashboard's per-job retry list. ``writes_enabled`` shows a re-queue control
+    for a running node-job (a job dashboard's retry)."""
     name = job.get("node_id") or job.get("task_name") or job.get("id")
     err = (f'<h2>Error</h2><pre class="err">{_esc(job.get("error"))}</pre>'
            if job.get("error") else "")

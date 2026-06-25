@@ -1936,7 +1936,7 @@ def recent_jobs(
     """Read-only recent-activity feed across BOTH job families — DAG node-jobs
     (``workflow_node_jobs``) and standalone ingest jobs (``ingest_jobs``) — unified
     into one list, newest-first by ``COALESCE(finished_at, started_at, created_at)``.
-    The read model a Sidekiq-style "recent activity / retries / dead" view consumes.
+    The read model a job-dashboard-style "recent activity / retries / dead" view consumes.
 
     Each row carries a ``kind`` (``'node'`` | ``'ingest'``) and a ``name`` (the
     node id / task name) plus the common lifecycle columns — ``queue``, ``status``,
